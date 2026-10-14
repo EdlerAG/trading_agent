@@ -1,12 +1,13 @@
 import time
 from datetime import datetime, timezone
 import numpy as np
-import ccxt
 
 import config
 from exchange import (
     get_exchange,
     get_current_position_status,
+    safe_amount_to_precision,
+    safe_price_to_precision,
     emergency_close_all,
     check_slippage_and_spread,
     check_funding_rate_risk,
@@ -22,6 +23,9 @@ LAST_RESET_DATE = None
 def check_circuit_breaker(total_equity: float):
     """Circuit Breaker: зупиняє торгівлю при денній просадці >= MAX_DAILY_LOSS_PCT."""
     global DAILY_STARTING_BALANCE, LAST_RESET_DATE
+    if total_equity <= 0.0:
+        return
+
     today = datetime.now(timezone.utc).date()
 
     if LAST_RESET_DATE != today or DAILY_STARTING_BALANCE is None:
@@ -43,6 +47,21 @@ def check_circuit_breaker(total_equity: float):
             )
             send_telegram_alert(alert_msg)
             config.logger.warning(alert_msg)
+
+
+def _cancel_existing_stop_orders(exchange):
+    """Скасовує лише старі стоп-ордери (включно з тригерними)."""
+    try:
+        open_orders = exchange.fetch_open_orders(config.SYMBOL)
+        for order in open_orders:
+            o_type = str(order.get('type') or '').lower()
+            if o_type in ['stop_market', 'stop', 'take_profit_market']:
+                try:
+                    exchange.cancel_order(order['id'], config.SYMBOL)
+                except Exception:
+                    pass
+    except Exception as e:
+        config.logger.warning(f"Помилка перевірки відкритих стоп-ордерів: {e}")
 
 
 def monitor_breakeven_protection(exchange, current_btc: float, current_price: float, current_atr: float):
@@ -70,16 +89,12 @@ def monitor_breakeven_protection(exchange, current_btc: float, current_price: fl
 
     if should_trigger:
         try:
-            be_price = float(exchange.price_to_precision(config.SYMBOL, raw_be))
-            pos_amount = float(exchange.amount_to_precision(config.SYMBOL, abs(current_btc)))
+            be_price = safe_price_to_precision(exchange, raw_be)
+            pos_amount = safe_amount_to_precision(exchange, abs(current_btc))
+            if pos_amount <= 0.0 or be_price <= 0.0:
+                return
 
-            open_orders = exchange.fetch_open_orders(config.SYMBOL)
-            for order in open_orders:
-                if str(order.get('type')).lower() in ['stop_market', 'stop']:
-                    try:
-                        exchange.cancel_order(order['id'], config.SYMBOL)
-                    except Exception:
-                        pass
+            _cancel_existing_stop_orders(exchange)
 
             exchange.create_order(
                 symbol=config.SYMBOL,
@@ -104,15 +119,20 @@ def monitor_breakeven_protection(exchange, current_btc: float, current_price: fl
                 f"• Покриває ціну входу та біржові комісії. Верхня межа прибутку відкрита!"
             )
             send_telegram_alert(msg)
-            config.logger.info(f"Страховий SL успішно перенесено в безубиток (${be_price:.1f}).")
+            config.logger.info(f"Страховий SL успішно перенесено в беззбиток (${be_price:.1f}).")
         except Exception as e:
             config.logger.error(f"Помилка оновлення Breakeven ордера: {e}")
 
 
 def sync_orders_and_position(exchange):
-    """Синхронізація біржового стану з локальним станом бота та БД."""
+    """
+    Синхронізація біржового стану з локальним станом бота та БД.
+    Повертає: (current_btc, usdt_balance, entry_price, unrealized_pnl, is_ok)
+    """
     try:
-        current_btc, usdt_balance, entry_price, unrealized_pnl = get_current_position_status(exchange)
+        current_btc, usdt_balance, entry_price, unrealized_pnl = get_current_position_status(
+            exchange, raise_on_error=True
+        )
         open_orders = exchange.fetch_open_orders(config.SYMBOL)
 
         if abs(current_btc) < config.MIN_TRADE_BTC:
@@ -166,15 +186,16 @@ def sync_orders_and_position(exchange):
             if getattr(config, 'INITIAL_TRADE_AMOUNT', 0.0) == 0.0:
                 config.INITIAL_TRADE_AMOUNT = abs(current_btc)
 
-        return current_btc, usdt_balance, entry_price, unrealized_pnl
+        return current_btc, usdt_balance, entry_price, unrealized_pnl, True
 
     except Exception as e:
-        config.logger.error(f"Помилка синхронізації: {e}")
-        return 0.0, 0.0, 0.0, 0.0
+        config.logger.error(f"Помилка синхронізації з біржею (тимчасовий збій мережі): {e}")
+        return 0.0, 0.0, 0.0, 0.0, False
 
 
 def execute_rebalance(target_position: float, current_price: float, current_atr: float,
-                      signal_val: float = 0.0, telemetry: dict = None):
+                      signal_val: float = 0.0, telemetry: dict = None,
+                      synced_state: tuple = None):
     """
     Виконавчий модуль QuantCore V7.8 Ultra:
     - підтримує цільову позицію від 0.0x до 1.50x (згідно з RISK_PROFILE)
@@ -194,7 +215,14 @@ def execute_rebalance(target_position: float, current_price: float, current_atr:
                 save_bot_state(telemetry)
                 return
 
-        current_btc, usdt_balance, entry_p, un_pnl = sync_orders_and_position(exchange)
+        if synced_state is not None:
+            current_btc, usdt_balance, entry_p, un_pnl = synced_state
+        else:
+            current_btc, usdt_balance, entry_p, un_pnl, is_ok = sync_orders_and_position(exchange)
+            if not is_ok:
+                save_bot_state(telemetry)
+                return
+
         total_equity = max(0.0, usdt_balance + un_pnl)
         check_circuit_breaker(total_equity)
 
@@ -211,7 +239,10 @@ def execute_rebalance(target_position: float, current_price: float, current_atr:
         current_pos_norm = (current_btc * current_price) / total_equity if total_equity > 0 else 0.0
 
         is_closing_to_cash = abs(target_position) < config.CASH_ZONE_THRESHOLD
-        is_opening_from_cash = abs(current_pos_norm) < config.CASH_ZONE_THRESHOLD and abs(target_position) >= config.CASH_ZONE_THRESHOLD
+        is_opening_from_cash = (
+            abs(current_pos_norm) < config.CASH_ZONE_THRESHOLD
+            and abs(target_position) >= config.CASH_ZONE_THRESHOLD
+        )
         is_flip = (current_pos_norm * target_position) < 0.0
         action_diff = abs(target_position - current_pos_norm)
 
@@ -222,14 +253,19 @@ def execute_rebalance(target_position: float, current_price: float, current_atr:
             )
             return
 
+        # Безпечний розрахунок target_btc без виклику amount_to_precision(0.0)
         target_usdt = total_equity * target_position
         target_btc_raw = target_usdt / current_price
-        target_btc = float(exchange.amount_to_precision(config.SYMBOL, abs(target_btc_raw)))
-        if target_position < 0:
-            target_btc = -target_btc
+        min_trade = config.MIN_TRADE_BTC
+
+        if is_closing_to_cash or abs(target_btc_raw) < min_trade:
+            target_btc = 0.0
+        else:
+            target_btc = safe_amount_to_precision(exchange, abs(target_btc_raw))
+            if target_position < 0:
+                target_btc = -target_btc
 
         diff_btc = target_btc - current_btc
-        min_trade = config.MIN_TRADE_BTC
 
         if is_closing_to_cash:
             if abs(current_btc) >= min_trade:
@@ -257,16 +293,16 @@ def execute_rebalance(target_position: float, current_price: float, current_atr:
                     send_telegram_alert(f"⚠️ Вхід відкладено: високий Funding Rate ({fund_rate*100:.4f}%).")
                     return
 
-        try:
-            exchange.cancel_all_orders(config.SYMBOL)
-        except Exception:
-            pass
-
         realized_pnl_est = 0.0
         note_label = f"QuantCore Entry ({target_position:+.2f}x)"
         if is_closing_to_cash:
             realized_pnl_est = un_pnl
             note_label = "Exit to Cash (100% USDT)"
+            # Скасовуємо існуючі ордери перед повним виходом у кеш
+            try:
+                exchange.cancel_all_orders(config.SYMBOL)
+            except Exception:
+                pass
         elif abs(target_btc) > abs(current_btc) and abs(current_btc) >= min_trade:
             note_label = f"Conviction Dip-Boost ({target_position:+.2f}x)"
 
@@ -294,7 +330,7 @@ def execute_rebalance(target_position: float, current_price: float, current_atr:
             else:
                 config.TRADE_ENTRY_PRICE = exec_price
 
-            total_amount = float(exchange.amount_to_precision(config.SYMBOL, abs(new_btc)))
+            total_amount = safe_amount_to_precision(exchange, abs(new_btc))
             sl_mult = getattr(config, "EMERGENCY_SL_ATR_MULT", 3.5)
             sl_dist = sl_mult * current_atr
 
@@ -305,10 +341,12 @@ def execute_rebalance(target_position: float, current_price: float, current_atr:
                 raw_sl = (exec_price * (1.0 - config.BREAKEVEN_BUFFER_PCT)) if config.IS_BREAKEVEN_TRIGGERED else (exec_price + sl_dist)
                 close_side = 'buy'
 
-            sl_price = float(exchange.price_to_precision(config.SYMBOL, raw_sl))
+            sl_price = safe_price_to_precision(exchange, raw_sl)
             config.ACTIVE_SL_PRICE = sl_price
             save_bot_state(telemetry)
 
+            # Спочатку знімаємо старий SL (якщо це був добір), і одразу ставимо новий на весь об'єм
+            _cancel_existing_stop_orders(exchange)
             try:
                 exchange.create_order(
                     symbol=config.SYMBOL,
@@ -330,7 +368,7 @@ def execute_rebalance(target_position: float, current_price: float, current_atr:
                 f"⚡ <b>QuantCore V7.8 Ultra: Ордер виконано!</b>\n"
                 f"═══════════════════════\n"
                 f"• <b>Операція:</b> {note_label}\n"
-                f"• <b>Напрямок:</b> {planned_side.upper()} {icon} (<code>{order_res['amount']} BTC</code>)\n"
+                f"• <b>Напрямок:</b> {planned_side.upper()} {icon} (<code>{order_res['amount']:.4f} BTC</code>)\n"
                 f"• <b>Експозиція:</b> <b>{target_position:+.2f}x</b> (Разом: <code>{new_btc:+.3f} BTC</code>)\n"
                 f"• <b>Сигнал ядра:</b> <code>{signal_val:+.3f}</code> (Поріг: <code>+{config.ENTER_LONG_TH:.2f}</code>)\n"
                 f"• <b>Середня ціна входу:</b> <code>${exec_price:,.1f}</code>\n"
@@ -340,6 +378,10 @@ def execute_rebalance(target_position: float, current_price: float, current_atr:
             send_telegram_alert(msg)
 
         else:
+            try:
+                exchange.cancel_all_orders(config.SYMBOL)
+            except Exception:
+                pass
             config.TRADE_ENTRY_PRICE = 0.0
             config.TRADE_CANDLES_COUNT = 0
             config.IS_BREAKEVEN_TRIGGERED = False

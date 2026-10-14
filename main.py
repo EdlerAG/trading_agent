@@ -1,6 +1,7 @@
 import os
 import gc
 import time
+import json
 import joblib
 import threading
 import traceback
@@ -30,6 +31,23 @@ def safe_send_telegram(message: str):
         send_telegram_alert(message)
     except Exception as e:
         config.logger.warning(f"Не вдалося надіслати сповіщення в Telegram: {e}")
+
+
+def _clear_force_step_flag():
+    """Атомарно скидає прапорець force_step у bot_state.json."""
+    if not os.path.exists(config.STATE_FILE):
+        return
+    try:
+        with open(config.STATE_FILE, "r", encoding="utf-8") as f:
+            st = json.load(f)
+        if st.get("force_step"):
+            st["force_step"] = False
+            tmp = config.STATE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(st, f, indent=2)
+            os.replace(tmp, config.STATE_FILE)
+    except Exception:
+        pass
 
 
 def check_daily_maintenance():
@@ -65,12 +83,10 @@ def run_trading_step(bundle: dict, force_recalc: bool = False):
     global LAST_PROCESSED_CANDLE_TS
     t0 = time.time()
 
-    # Синхронізуємо можливі зміни налаштувань із Веб-Дашборду чи Telegram
     disk_state = load_bot_state()
     if disk_state.get("force_step"):
         force_recalc = True
-        disk_state["force_step"] = False
-        save_bot_state()
+        _clear_force_step_flag()
 
     if config.IS_PAUSED:
         if config.PAUSE_UNTIL:
@@ -105,7 +121,11 @@ def run_trading_step(bundle: dict, force_recalc: bool = False):
         return
 
     exchange = get_exchange()
-    current_btc, usdt_balance, entry_price, unrealized_pnl_usd = sync_orders_and_position(exchange)
+    current_btc, usdt_balance, entry_price, unrealized_pnl_usd, is_sync_ok = sync_orders_and_position(exchange)
+    if not is_sync_ok or usdt_balance <= 0.0:
+        config.logger.warning("⚠️ Не вдалося отримати актуальний баланс з біржі. Повтор на наступній ітерації.")
+        return
+
     current_price = float(raw_df['close'].iloc[-1])
 
     total_equity = max(10.0, usdt_balance + unrealized_pnl_usd)
@@ -147,7 +167,8 @@ def run_trading_step(bundle: dict, force_recalc: bool = False):
         current_price=current_price,
         current_atr=current_atr,
         signal_val=signal_val,
-        telemetry=telemetry
+        telemetry=telemetry,
+        synced_state=(current_btc, usdt_balance, entry_price, unrealized_pnl_usd)
     )
 
     LAST_PROCESSED_CANDLE_TS = candle_ts

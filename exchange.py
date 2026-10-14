@@ -39,21 +39,54 @@ def get_exchange():
                 pass
 
             _EXCHANGE_INSTANCE = exchange
-            config.logger.info(f"✅ Підключення до Binance Futures встановлено (One-Way Mode, Leverage {getattr(config, 'EXCHANGE_LEVERAGE', 2)}x).")
+            config.logger.info(
+                f"✅ Підключення до Binance Futures встановлено "
+                f"(One-Way Mode, Leverage {getattr(config, 'EXCHANGE_LEVERAGE', 2)}x)."
+            )
         except Exception as e:
             config.logger.error(f"❌ Фатальна помилка ініціалізації CCXT: {e}")
             raise
     return _EXCHANGE_INSTANCE
 
 
-def get_current_position_status(exchange=None):
-    """Повертає актуальний біржовий стан: (current_btc, usdt_balance, entry_price, unrealized_pnl)"""
+def safe_amount_to_precision(exchange, amount: float) -> float:
+    """Безпечне округлення об'єму BTC без помилки CCXT при значенні < 0.0001."""
+    raw = abs(float(amount))
+    min_prec = getattr(config, "MIN_PRECISION_BTC", 0.0001)
+    if raw < min_prec:
+        return 0.0
+    try:
+        return float(exchange.amount_to_precision(config.SYMBOL, raw))
+    except Exception:
+        return round(raw, 4)
+
+
+def safe_price_to_precision(exchange, price: float) -> float:
+    """Безпечне округлення ціни BTC."""
+    raw = float(price)
+    if raw <= 0.0:
+        return 0.0
+    try:
+        return float(exchange.price_to_precision(config.SYMBOL, raw))
+    except Exception:
+        return round(raw, 1)
+
+
+def get_current_position_status(exchange=None, raise_on_error: bool = False):
+    """
+    Повертає актуальний біржовий стан: (current_btc, usdt_balance, entry_price, unrealized_pnl).
+    Якщо raise_on_error=True, прокидає виняток при обриві зв'язку, щоб не скинути ордери.
+    """
     if exchange is None:
         exchange = get_exchange()
 
     try:
         balance = exchange.fetch_balance()
-        usdt_balance = float(balance.get('total', {}).get('USDT') or balance.get('free', {}).get('USDT') or 0.0)
+        usdt_balance = float(
+            balance.get('total', {}).get('USDT')
+            or balance.get('free', {}).get('USDT')
+            or 0.0
+        )
 
         positions = exchange.fetch_positions([config.SYMBOL])
 
@@ -78,6 +111,8 @@ def get_current_position_status(exchange=None):
 
     except Exception as e:
         config.logger.error(f"Помилка отримання статусу позиції: {e}")
+        if raise_on_error:
+            raise
         return 0.0, 0.0, 0.0, 0.0
 
 
@@ -130,7 +165,11 @@ def fetch_historical_candles(limit=None):
                 if raw_tail:
                     tail_df = _klines_to_df(raw_tail)
                     combined = pd.concat([_CANDLES_CACHE_DF, tail_df], ignore_index=True)
-                    combined = combined.drop_duplicates(subset=['open_ms'], keep='last').sort_values('open_ms').reset_index(drop=True)
+                    combined = (
+                        combined.drop_duplicates(subset=['open_ms'], keep='last')
+                        .sort_values('open_ms')
+                        .reset_index(drop=True)
+                    )
                     if len(combined) > target_limit:
                         combined = combined.iloc[-target_limit:].reset_index(drop=True)
                     _CANDLES_CACHE_DF = combined
@@ -223,14 +262,14 @@ def check_funding_rate_risk():
 def execute_smart_order(target_delta_btc: float, realized_pnl_est: float = 0.0,
                         note: str = "", best_bid: float = 0.0, best_ask: float = 0.0):
     """
-    Виконання ордера без повторного мережевого запиту стакану (якщо вже передано best_bid/best_ask).
+    Розумне виконання ордера (Maker Post-Only -> Market Fallback) з коректним обліком часткового виконання.
     """
     exchange = get_exchange()
     side = 'buy' if target_delta_btc > 0 else 'sell'
     raw_amount = abs(target_delta_btc)
 
     try:
-        amount = float(exchange.amount_to_precision(config.SYMBOL, raw_amount))
+        amount = safe_amount_to_precision(exchange, raw_amount)
 
         if amount < config.MIN_TRADE_BTC:
             config.logger.info(f"Пропуск: об'єм {amount} BTC < MIN_TRADE_BTC ({config.MIN_TRADE_BTC})")
@@ -248,9 +287,9 @@ def execute_smart_order(target_delta_btc: float, realized_pnl_est: float = 0.0,
             return None
 
         limit_price = best_bid if side == 'buy' else best_ask
-        limit_price_str = exchange.price_to_precision(config.SYMBOL, limit_price)
+        limit_price_val = safe_price_to_precision(exchange, limit_price)
 
-        config.logger.info(f"⏳ Розміщення Maker-ордера: {side.upper()} {amount} BTC @ ${limit_price_str}...")
+        config.logger.info(f"⏳ Розміщення Maker-ордера: {side.upper()} {amount} BTC @ ${limit_price_val}...")
 
         try:
             maker_order = exchange.create_order(
@@ -258,7 +297,7 @@ def execute_smart_order(target_delta_btc: float, realized_pnl_est: float = 0.0,
                 type='limit',
                 side=side,
                 amount=amount,
-                price=float(limit_price_str),
+                price=limit_price_val,
                 params={'postOnly': True}
             )
         except Exception as pe:
@@ -266,7 +305,8 @@ def execute_smart_order(target_delta_btc: float, realized_pnl_est: float = 0.0,
             maker_order = None
 
         filled = False
-        fill_price = 0.0
+        maker_filled_qty = 0.0
+        maker_fill_price = limit_price_val
         fee_cost = 0.0
         order_id = None
 
@@ -278,9 +318,10 @@ def execute_smart_order(target_delta_btc: float, realized_pnl_est: float = 0.0,
                 check_o = exchange.fetch_order(order_id, config.SYMBOL)
                 if check_o.get('status') == 'closed':
                     filled = True
-                    fill_price = float(check_o.get('average') or limit_price)
-                    fee_cost = float(check_o.get('fee', {}).get('cost') or (amount * fill_price * 0.0002))
-                    config.logger.info(f"⚡ Maker-ордер виконано за ціною ${fill_price:.2f}!")
+                    maker_filled_qty = float(check_o.get('filled') or amount)
+                    maker_fill_price = float(check_o.get('average') or limit_price_val)
+                    fee_cost = float(check_o.get('fee', {}).get('cost') or (maker_filled_qty * maker_fill_price * 0.0002))
+                    config.logger.info(f"⚡ Maker-ордер виконано за ціною ${maker_fill_price:.2f}!")
                     break
 
             if not filled:
@@ -290,28 +331,43 @@ def execute_smart_order(target_delta_btc: float, realized_pnl_est: float = 0.0,
                 except Exception:
                     pass
 
-        if not filled:
-            remaining_amount = amount
-            if order_id:
                 try:
                     canceled_o = exchange.fetch_order(order_id, config.SYMBOL)
-                    filled_qty = float(canceled_o.get('filled') or 0.0)
-                    remaining_amount = max(0.0, amount - filled_qty)
+                    maker_filled_qty = float(canceled_o.get('filled') or 0.0)
+                    if maker_filled_qty > 0:
+                        maker_fill_price = float(canceled_o.get('average') or limit_price_val)
+                        fee_cost += float(canceled_o.get('fee', {}).get('cost') or (maker_filled_qty * maker_fill_price * 0.0002))
                 except Exception:
                     pass
 
-            if remaining_amount >= config.MIN_TRADE_BTC:
-                market_amount = float(exchange.amount_to_precision(config.SYMBOL, remaining_amount))
+        market_filled_qty = 0.0
+        market_fill_price = price_estimate
+
+        if not filled:
+            remaining_amount = max(0.0, amount - maker_filled_qty)
+            market_amount = safe_amount_to_precision(exchange, remaining_amount)
+
+            if market_amount >= getattr(config, "MIN_PRECISION_BTC", 0.0001) and (market_amount * price_estimate) >= 5.0:
                 m_order = exchange.create_market_order(config.SYMBOL, side, market_amount)
-                fill_price = float(m_order.get('average') or m_order.get('price') or price_estimate)
-                fee_cost += float(m_order.get('fee', {}).get('cost') or (market_amount * fill_price * 0.0005))
+                market_filled_qty = float(m_order.get('filled') or market_amount)
+                market_fill_price = float(m_order.get('average') or m_order.get('price') or price_estimate)
+                fee_cost += float(m_order.get('fee', {}).get('cost') or (market_filled_qty * market_fill_price * 0.0005))
                 order_id = m_order.get('id')
-                config.logger.info(f"✅ Market-ордер виконано: {side.upper()} {market_amount} BTC @ ${fill_price:.2f}")
+                config.logger.info(f"✅ Market-ордер виконано: {side.upper()} {market_filled_qty} BTC @ ${market_fill_price:.2f}")
+
+        total_executed_qty = maker_filled_qty + market_filled_qty
+        if total_executed_qty <= 0.0:
+            config.logger.warning("⚠️ Ордер не було виконано (total_executed_qty == 0).")
+            return None
+
+        avg_fill_price = (
+            (maker_filled_qty * maker_fill_price) + (market_filled_qty * market_fill_price)
+        ) / total_executed_qty
 
         database.record_trade(
             side=side,
-            amount=amount,
-            price=fill_price,
+            amount=total_executed_qty,
+            price=avg_fill_price,
             order_id=order_id,
             pnl=realized_pnl_est,
             fee=fee_cost,
@@ -320,8 +376,8 @@ def execute_smart_order(target_delta_btc: float, realized_pnl_est: float = 0.0,
 
         return {
             'side': side,
-            'amount': amount,
-            'price': fill_price,
+            'amount': total_executed_qty,
+            'price': avg_fill_price,
             'fee': fee_cost,
             'order_id': order_id
         }
@@ -335,7 +391,7 @@ def emergency_close_all():
     exchange = get_exchange()
     try:
         exchange.cancel_all_orders(config.SYMBOL)
-        current_btc, usdt_balance, entry_p, un_pnl = get_current_position_status(exchange)
+        current_btc, usdt_balance, entry_p, un_pnl = get_current_position_status(exchange, raise_on_error=True)
 
         config.TRADE_ENTRY_PRICE = 0.0
         config.TRADE_CANDLES_COUNT = 0
@@ -344,9 +400,9 @@ def emergency_close_all():
         config.INITIAL_TRADE_AMOUNT = 0.0
         config.ACTIVE_SL_PRICE = 0.0
 
-        if abs(current_btc) >= config.MIN_TRADE_BTC:
+        if abs(current_btc) >= getattr(config, "MIN_PRECISION_BTC", 0.0001):
             side = 'sell' if current_btc > 0 else 'buy'
-            amount_formatted = float(exchange.amount_to_precision(config.SYMBOL, abs(current_btc)))
+            amount_formatted = safe_amount_to_precision(exchange, abs(current_btc))
 
             order = exchange.create_market_order(
                 config.SYMBOL,

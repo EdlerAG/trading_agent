@@ -158,12 +158,12 @@ def update_bot_state_from_ui(updates: dict):
 
 @st.cache_data(ttl=10)
 def load_fast_sql_data():
-    """Векторне читання таблиць SQLite напряму у DataFrame (у 15 разів швидше за ORM-цикли)."""
+    """Векторне читання таблиць SQLite напряму у DataFrame."""
     try:
         df_snap = pd.read_sql_query(
             "SELECT timestamp AS Time, balance_usdt AS Balance, position_btc AS Position, "
             "btc_price AS BTC_Price, total_equity AS Total_Eq, unrealized_pnl AS Unrealized_PnL, "
-            "model_action AS Action FROM equity_snapshots ORDER BY timestamp ASC",
+            "model_action AS Action FROM equity_snapshots WHERE balance_usdt > 0 ORDER BY timestamp ASC",
             engine
         )
         df_trades = pd.read_sql_query(
@@ -175,7 +175,6 @@ def load_fast_sql_data():
 
         if not df_snap.empty:
             df_snap['Time'] = pd.to_datetime(df_snap['Time']).dt.tz_localize(None)
-            # Виправлена інституційна формула ф'ючерсного Equity: Balance + Unrealized PnL
             df_snap['Equity'] = np.where(
                 df_snap['Total_Eq'].notnull() & (df_snap['Total_Eq'] > 0) & (np.abs(df_snap['Total_Eq'] - (df_snap['Balance'] + df_snap['Unrealized_PnL'])) < 200),
                 df_snap['Total_Eq'],
@@ -286,7 +285,6 @@ with st.sidebar:
 latest_equity = float(df_snap['Equity'].iloc[-1])
 initial_equity = float(df_snap['Equity'].iloc[0])
 total_pnl_pct = ((latest_equity - initial_equity) / initial_equity) * 100.0 if initial_equity > 0 else 0.0
-total_pnl_usd = latest_equity - initial_equity
 btc_bh_pct = float(df_snap['BTC_Return_Pct'].iloc[-1])
 alpha_vs_btc = total_pnl_pct - btc_bh_pct
 
@@ -335,12 +333,12 @@ st.markdown(f"""
 
 # --- РЯД 1: 6 КАРТОК КЛЮЧОВИХ МЕТРИК ---
 k1, k2, k3, k4, k5, k6 = st.columns(6)
-k1.metric("Сумарний Equity", f"\${latest_equity:,.2f}", f"{total_pnl_pct:+.2f}%")
+k1.metric("Сумарний Equity", f"${latest_equity:,.2f}", f"{total_pnl_pct:+.2f}%")
 k2.metric("Чиста Альфа vs BTC", f"{alpha_vs_btc:+.2f}%", f"BTC B&H: {btc_bh_pct:+.2f}%")
 k3.metric("Котирування BTC", f"${btc_price:,.1f}", f"ATR: ${telem.get('atr', 0):,.1f}")
 k4.metric("Sharpe / Calmar", f"{sharpe_ratio:.2f}", f"Calmar: {calmar_ratio:.2f}")
-k5.metric("Max Drawdown", f"{max_drawdown:.2f}%", f"Fee: \${total_fees:.2f}", delta_color="inverse")
-k6.metric("Операцій / WR", f"{total_ops}", f"WR: {win_rate:.1f}% | Net: \${net_realized_pnl:+.1f}")
+k5.metric("Max Drawdown", f"{max_drawdown:.2f}%", f"Fee: ${total_fees:.2f}", delta_color="inverse")
+k6.metric("Операцій / WR", f"{total_ops}", f"WR: {win_rate:.1f}% | Net: ${net_realized_pnl:+.1f}")
 
 
 # --- РЯД 2: КАРТКА ПОЗИЦІЇ + ЖИВИЙ РАДАР 4 АЛЬФА-ЯДЕР V7.8 ---
@@ -356,7 +354,7 @@ with col_pos:
         notional = abs(current_pos) * btc_price
         eff_lev = notional / latest_equity if latest_equity > 0 else 0.0
         pnl_color = "#10b981" if unrealized_pnl_usd >= 0 else "#ef4444"
-        sl_text = f"\${live_sl:,.1f} ({'БЕЗЗБИТОК 🛡️' if live_be else '3.5x ATR Stop'})" if live_sl > 0 else "Активний"
+        sl_text = f"${live_sl:,.1f} ({'БЕЗЗБИТОК 🛡️' if live_be else '3.5x ATR Stop'})" if live_sl > 0 else "Активний"
 
         st.markdown(f"""
         <div class="bento-card" style="height:100%;">
@@ -367,7 +365,7 @@ with col_pos:
             <div style="display:grid; grid-template-columns: 1fr 1fr; gap:14px; margin-top:10px;">
                 <div class="core-box">
                     <div style="color:#64748b; font-size:11px;">Об'єм позиції</div>
-                    <div class="val-mono" style="font-size:17px; font-weight:700; color:#f8fafc;">{abs(current_pos):.3f} BTC <span style="font-size:12px; color:#94a3b8;">(\${notional:,.0f})</span></div>
+                    <div class="val-mono" style="font-size:17px; font-weight:700; color:#f8fafc;">{abs(current_pos):.3f} BTC <span style="font-size:12px; color:#94a3b8;">(${notional:,.0f})</span></div>
                 </div>
                 <div class="core-box">
                     <div style="color:#64748b; font-size:11px;">Unrealized PnL</div>
@@ -375,7 +373,7 @@ with col_pos:
                 </div>
                 <div class="core-box">
                     <div style="color:#64748b; font-size:11px;">Середня ціна входу</div>
-                    <div class="val-mono" style="font-size:16px; font-weight:600; color:#38bdf8;">\${live_entry:,.1f}</div>
+                    <div class="val-mono" style="font-size:16px; font-weight:600; color:#38bdf8;">${live_entry:,.1f}</div>
                 </div>
                 <div class="core-box">
                     <div style="color:#64748b; font-size:11px;">Страховий Stop-Loss</div>
@@ -521,11 +519,11 @@ with tab_trades:
 
         vt = df_trades.copy()
         vt['Time'] = vt['Time'].dt.strftime('%Y-%m-%d %H:%M:%S')
-        vt['Price'] = vt['Price'].map('\${:,.1f}'.format)
-        vt['Amount'] = vt['Amount'].map('{:.3f} BTC'.format)
-        vt['PnL'] = vt['PnL'].map('\${:+,.2f}'.format)
-        vt['Fee'] = vt['Fee'].map('\${:.3f}'.format)
-        vt['Net_PnL'] = vt['Net_PnL'].map('\${:+,.2f}'.format)
+        vt['Price'] = vt['Price'].map('${:,.1f}'.format)
+        vt['Amount'] = vt['Amount'].map('{:.4f} BTC'.format)
+        vt['PnL'] = vt['PnL'].map('${:+,.2f}'.format)
+        vt['Fee'] = vt['Fee'].map('${:.3f}'.format)
+        vt['Net_PnL'] = vt['Net_PnL'].map('${:+,.2f}'.format)
         st.dataframe(vt, use_container_width=True, hide_index=True)
     else:
         st.info("У вибраному часовому діапазоні угод ще не зафіксовано.")
@@ -533,10 +531,10 @@ with tab_trades:
 with tab_telemetry:
     vs = df_snap[['Time', 'BTC_Price', 'Action', 'Position', 'Equity', 'Unrealized_PnL', 'Drawdown_Pct']].tail(50).iloc[::-1].copy()
     vs['Time'] = vs['Time'].dt.strftime('%Y-%m-%d %H:%M')
-    vs['BTC_Price'] = vs['BTC_Price'].map('\${:,.1f}'.format)
+    vs['BTC_Price'] = vs['BTC_Price'].map('${:,.1f}'.format)
     vs['Action'] = vs['Action'].map('{:+.4f}'.format)
-    vs['Position'] = vs['Position'].map('{:+.3f} BTC'.format)
-    vs['Equity'] = vs['Equity'].map('\${:,.2f}'.format)
-    vs['Unrealized_PnL'] = vs['Unrealized_PnL'].map('\${:+,.2f}'.format)
+    vs['Position'] = vs['Position'].map('{:+.4f} BTC'.format)
+    vs['Equity'] = vs['Equity'].map('${:,.2f}'.format)
+    vs['Unrealized_PnL'] = vs['Unrealized_PnL'].map('${:+,.2f}'.format)
     vs['Drawdown_Pct'] = vs['Drawdown_Pct'].map('{:.2f}%'.format)
     st.dataframe(vs, use_container_width=True, hide_index=True)
