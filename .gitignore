@@ -46,11 +46,8 @@ trading_history.db
 *.log*
 logs/
 
-# --- Heavy Datasets & Experimental Training Artifacts ---
-Prepearing/*.csv
-Prepearing/*.zip
-Prepearing/*.db
-Prepearing/*вхід*.txt
+# --- Research / Experimental Folders & Heavy Datasets ---
+Prepearing/
 *.csv
 
 # --- Machine Learning Models & Weights ---
