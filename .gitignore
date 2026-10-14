@@ -1,0 +1,66 @@
+# ==============================================================================
+# Git Ignore Rules - QuantCore Trading Bot
+# ==============================================================================
+
+# --- Secrets & Environment Credentials ---
+.env
+.env.*
+!.env.example
+bot_state.json
+
+# --- Python & Bytecode Cache ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Virtual Environments ---
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# --- IDEs & OS Meta ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Databases & Snapshots ---
+*.db
+*.sqlite
+*.sqlite3
+trading_history.db
+
+# --- Logs ---
+*.log
+*.log*
+logs/
+
+# --- Heavy Datasets & Experimental Training Artifacts ---
+Prepearing/*.csv
+Prepearing/*.zip
+Prepearing/*.db
+Prepearing/*вхід*.txt
+*.csv
+
+# --- Machine Learning Models & Weights ---
+*.joblib
+*.pkl
+*.bin
+quant_core_production.joblib
+
+
+# --- Distribution & Build ---
+build/
+dist/
+*.egg-info/
