@@ -35,7 +35,9 @@ venv.bak/
 Thumbs.db
 desktop.ini
 
-# --- Databases & Snapshots ---
+# --- Databases, Storage & Snapshots ---
+storage/
+**/storage/
 *.db
 *.sqlite
 *.sqlite3
