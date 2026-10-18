@@ -1,0 +1,15 @@
+services:
+  quantcore-grandmaster:
+    build: .
+    container_name: quantcore-v23-server
+    restart: always
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    volumes:
+      - ./storage:/srv/quantcore/storage
+    deploy:
+      resources:
+        limits:
+          memory: 360M

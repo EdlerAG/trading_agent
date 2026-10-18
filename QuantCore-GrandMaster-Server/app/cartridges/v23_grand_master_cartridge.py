@@ -213,10 +213,12 @@ class V23GrandMasterCartridge(IAlphaCartridge):
         online_asset_state: Dict[str, Any],
     ) -> Tuple[np.ndarray, List[float]]:
         """
-        Обчислює вектор ML-сигналу на останніх 350 свічках, комбінуючи базові ваги
-        моделі з живими онлайн-вагами Bandit (якщо активовано онлайн-самонавчання).
-        Повертає (sig_ml_ewm, latest_raw_submodel_preds).
+        Обчислює вектор ML-сигналу на останніх 350 свічках. Якщо зовнішній .joblib
+        ще не завантажено, повертає нульовий вектор ML, дозволяючи працювати структурному ядру V23.
         """
+        if not models_dict or "scaler" not in models_dict:
+            return np.zeros(len(X_tail), dtype=np.float64), []
+
         scaler = models_dict["scaler"]
         X_scaled = np.clip(scaler.transform(X_tail), -4.0, 4.0)
 

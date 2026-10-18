@@ -21,19 +21,6 @@ FEATURE_COLS_V23: Tuple[str, ...] = (
     "rs_vs_btc_96", "rs_vs_btc_384", "market_breadth",
 )
 
-FEATURE_COLS_V7_8: Tuple[str, ...] = (
-    "vol_96", "vol_ratio_96_384",
-    "tsmom_48", "tsmom_96", "tsmom_192", "tsmom_384", "tsmom_768", "tsmom_1536",
-    "dist_ema48", "dist_ema96", "dist_ema192", "dist_ema384", "dist_ema768", "dist_ema1536",
-    "spread_96_384", "spread_192_768", "spread_384_1536",
-    "slope_384", "slope_768", "slope_1536",
-    "ker_raw_96", "signed_ker_96", "ker_raw_192", "signed_ker_192",
-    "ker_raw_288", "signed_ker_288", "ker_raw_576", "signed_ker_576",
-    "donchian_96", "donchian_384", "donchian_768", "donchian_1536",
-    "rsi_14", "rsi_64", "rsi_192", "zscore_96", "vol_surge",
-    "taker_imb_32", "taker_imb_96", "taker_imb_192",
-)
-
 
 def _wilder_atr(high: pd.Series, low: pd.Series, close: pd.Series, window: int) -> pd.Series:
     prev_c = close.shift(1)
@@ -91,7 +78,7 @@ def compute_v23_features_float32(
     core_breadth: pd.Series,
 ) -> pd.DataFrame:
     """
-    Zero-Fragmentation розрахунок факторів V23 Grand-Master у форматі float32.
+    Zero-Fragmentation розрахунок 43 факторів V23 Grand-Master у форматі float32.
     Виконує всі векторні операції за один прохід у словнику пам'яті.
     """
     n = len(df)
@@ -100,7 +87,6 @@ def compute_v23_features_float32(
     l = df["low"].astype(float).reset_index(drop=True)
     v = df["volume"].astype(float).reset_index(drop=True)
 
-    # Вирівнюємо довжину ряду BTC та market_breadth під поточний актив
     if len(btc_close) >= n:
         btc_c = btc_close.iloc[-n:].reset_index(drop=True)
         mb_s = core_breadth.iloc[-n:].reset_index(drop=True)
@@ -202,14 +188,3 @@ def compute_v23_features_float32(
     if "timestamp" in df.columns:
         feats_df["timestamp"] = df["timestamp"].values
     return feats_df
-
-
-def compute_v7_8_features_float32(df: pd.DataFrame) -> pd.DataFrame:
-    """Формує 40 класичних факторів для зворотної сумісності з одномонетним бандлом V7.8 Ultra."""
-    btc_c = df["close"].astype(float).reset_index(drop=True)
-    mb_s = pd.Series(np.zeros(len(df), dtype=np.float32))
-    full_df = compute_v23_features_float32(df, btc_c, mb_s)
-    cols = list(FEATURE_COLS_V7_8) + ["close", "atr"]
-    if "timestamp" in full_df.columns:
-        cols.append("timestamp")
-    return full_df[cols]

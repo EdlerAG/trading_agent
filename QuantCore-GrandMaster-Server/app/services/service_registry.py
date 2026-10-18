@@ -11,6 +11,9 @@ from app.services.state_service import StateService
 from app.services.online_adaptation_service import OnlineAdaptationService
 from app.services.database_service import DatabaseService
 from app.services.exchange_ccxt_service import ExchangeCcxtService
+from app.services.market_data_service import MarketDataService
+from app.services.currency_governor_service import CurrencyGovernorService
+from app.services.risk_guard_service import RiskGuardService
 from app.services.news_ai_service import NewsAiService
 from app.services.execution_service import MultiAssetExecutionOrchestrator
 from app.services.telegram_bot_service import TelegramBotService
@@ -26,8 +29,11 @@ class ApplicationContainer:
         "online_learner",
         "db_service",
         "cartridge_service",
-        "cartridge_Service",  # Аліас для повної сумісності з main.py
+        "cartridge_Service",
         "exchange_service",
+        "market_data_service",
+        "currency_governor",
+        "risk_guard",
         "news_service",
         "orchestrator",
         "telegram_bot",
@@ -42,6 +48,14 @@ class ApplicationContainer:
         self.cartridge_service = CartridgeLoaderService(logger=logger)
         self.cartridge_Service = self.cartridge_service
         self.exchange_service = ExchangeCcxtService(logger=logger, db_service=self.db_service)
+        self.market_data_service = MarketDataService(logger=logger, exchange_service=self.exchange_service)
+        self.currency_governor = CurrencyGovernorService(logger=logger, state_service=self.state_service)
+        self.risk_guard = RiskGuardService(
+            logger=logger,
+            state_service=self.state_service,
+            db_service=self.db_service,
+            exchange_service=self.exchange_service,
+        )
         self.news_service = NewsAiService()
 
         self.orchestrator = MultiAssetExecutionOrchestrator(
@@ -53,6 +67,7 @@ class ApplicationContainer:
             online_learner=self.online_learner,
             news_service=self.news_service,
         )
+        self.risk_guard.bind_orchestrator(self.orchestrator)
 
         self.telegram_bot = TelegramBotService(
             logger=logger,
@@ -63,7 +78,7 @@ class ApplicationContainer:
             orchestrator=self.orchestrator,
         )
         self.orchestrator.bind_telegram_sender(self.telegram_bot)
-        self.watchdog = None
+        self.watchdog = self.risk_guard
 
     async def init_all(self) -> None:
         for srv in (
@@ -72,6 +87,9 @@ class ApplicationContainer:
             self.online_learner,
             self.cartridge_service,
             self.exchange_service,
+            self.market_data_service,
+            self.currency_governor,
+            self.risk_guard,
             self.news_service,
             self.orchestrator,
             self.telegram_bot,
@@ -84,6 +102,9 @@ class ApplicationContainer:
             self.telegram_bot,
             self.orchestrator,
             self.news_service,
+            self.risk_guard,
+            self.currency_governor,
+            self.market_data_service,
             self.exchange_service,
             self.cartridge_service,
             self.online_learner,
@@ -99,7 +120,6 @@ class ApplicationContainer:
 
 
 def _register_restart_endpoint() -> None:
-    """Додає ендпоінт /api/v1/control/restart для 1-клік перезавантаження сервера з Веб-термінала."""
     try:
         from app.api.endpoints_control import router as ctrl_router
         paths = [getattr(r, "path", "") for r in ctrl_router.routes]
