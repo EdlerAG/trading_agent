@@ -1,5 +1,6 @@
 import gc
 import os
+import time
 import ctypes
 from typing import Dict, Any, List, Tuple
 from app.core.config import settings
@@ -17,6 +18,7 @@ class MemoryAndDiskGuard:
 
     PROTECTED_FILENAMES = frozenset({
         "engine_state.json",
+        "adaptive_weights.json",
         "online_learning.json",
         "trading_history.db",
         "trading_history.db-wal",
@@ -54,16 +56,8 @@ class MemoryAndDiskGuard:
         return 0.0
 
     def enforce_disk_quota(self, active_cartridge_filename: str = "") -> int:
-        """
-        Захищає диск від переповнення:
-        1. Залишає в storage/cartridges/ максимум MAX_CARTRIDGES_KEPT файлів (активний + 1 для відкату).
-        2. Залишає в storage/backups/ максимум MAX_BACKUPS_KEPT файлів.
-        3. Якщо сумарний розмір storage/ перевищує MAX_STORAGE_BYTES, видаляє найстаріші тимчасові файли.
-        Повертає кількість звільнених байтів.
-        """
         removed_bytes = 0
 
-        # 1. Ротація старих картриджів моделей (.joblib)
         removed_bytes += self._prune_directory(
             directory=settings.CARTRIDGES_DIR,
             keep_count=settings.MAX_CARTRIDGES_KEPT,
@@ -71,7 +65,6 @@ class MemoryAndDiskGuard:
             extensions=(".joblib", ".pkl", ".bin"),
         )
 
-        # 2. Ротація старих бекапів БД
         removed_bytes += self._prune_directory(
             directory=settings.BACKUPS_DIR,
             keep_count=settings.MAX_BACKUPS_KEPT,
@@ -79,7 +72,6 @@ class MemoryAndDiskGuard:
             extensions=(".db", ".gz", ".zip", ".bak", ".json"),
         )
 
-        # 3. Загальна перевірка ліміту MAX_STORAGE_BYTES по всій папці storage/
         all_files: List[Tuple[float, int, str]] = []
         total_bytes = 0
 
@@ -96,7 +88,6 @@ class MemoryAndDiskGuard:
                     pass
 
         if total_bytes > settings.MAX_STORAGE_BYTES:
-            # Сортуємо від найстаріших до найновіших (LRU)
             all_files.sort(key=lambda x: x[0])
             target_bytes = int(settings.MAX_STORAGE_BYTES * 0.82)
             for _, fsize, fpath in all_files:
@@ -129,8 +120,7 @@ class MemoryAndDiskGuard:
                     continue
                 try:
                     st = os.stat(fpath)
-                    # Видаляємо завислі .tmp файли старше 10 хвилин
-                    if fname.endswith(".tmp") and (os.path.getmtime(fpath) < (st.st_mtime - 600)):
+                    if fname.endswith(".tmp") and ((time.time() - st.st_mtime) > 600):
                         os.remove(fpath)
                         continue
                     entries.append((st.st_mtime, st.st_size, fname, fpath))
@@ -140,7 +130,6 @@ class MemoryAndDiskGuard:
         if len(entries) <= keep_count:
             return 0
 
-        # Сортуємо від найновіших до найстаріших
         entries.sort(key=lambda x: x[0], reverse=True)
         kept = 0
         freed = 0
@@ -158,7 +147,6 @@ class MemoryAndDiskGuard:
         return freed
 
     def get_resource_telemetry(self, active_cartridge: str = "") -> Dict[str, Any]:
-        """Повертає актуальну статистику RAM та диска для Telegram і Web-терміналу."""
         total_storage_bytes = 0
         cartridges_list: List[str] = []
 

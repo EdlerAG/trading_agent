@@ -14,9 +14,8 @@ from app.services.database_service import DatabaseService
 class ExchangeCcxtService(IExchangeGateway):
     """
     Мультивалютний клієнт Binance Futures (One-Way Mode) з:
-    - In-Memory Ring-Buffer кешем свічок для 5+ монет (стягує лише дельту 5 свічок!).
-    - Безпечним округленням об'єму та ціни для будь-якої монети (BTC, ETH, SOL, BNB, XRP).
-    - Захистом від фейкових нульових балансів при мережевих збоях.
+    - In-Memory Ring-Buffer кешем свічок для 5+ монет.
+    - Автоматичним обліком закритих біржею Stop-Loss ордерів у SQLite.
     """
 
     __slots__ = ("_logger", "_db", "_exchange", "_candles_cache")
@@ -72,7 +71,6 @@ class ExchangeCcxtService(IExchangeGateway):
         self._candles_cache.clear()
 
     def safe_amount(self, symbol: str, raw_qty: float) -> float:
-        """Безпечне округлення об'єму для будь-якої монети без винятку CCXT InvalidOrder."""
         qty = abs(float(raw_qty))
         min_qty, step_size, _, _, _ = settings.get_symbol_spec(symbol)
         if qty < min(min_qty * 0.5, step_size):
@@ -97,6 +95,49 @@ class ExchangeCcxtService(IExchangeGateway):
         except Exception:
             pass
         return round(p, 4 if p < 10.0 else 2)
+
+    async def sync_exchange_stop_closure(self, symbol: str) -> Optional[Tuple[float, float, float]]:
+        """
+        Викликається, коли відкрита позиція зникла на біржі (спрацював STOP_MARKET).
+        Скасовує залишкові ордери, записує фактичний PnL у БД і повертає (qty, avg_price, realized_pnl).
+        """
+        return await asyncio.to_thread(self._sync_exchange_stop_closure_sync, symbol)
+
+    def _sync_exchange_stop_closure_sync(self, symbol: str) -> Optional[Tuple[float, float, float]]:
+        if self._exchange is None:
+            return None
+        clean_sym = ccxt_to_symbol(symbol)
+        ccxt_sym = symbol_to_ccxt(clean_sym)
+        try:
+            self._exchange.cancel_all_orders(ccxt_sym)
+        except Exception:
+            pass
+        try:
+            trades = self._exchange.fetch_my_trades(ccxt_sym, limit=6)
+            if not trades:
+                return None
+            last_order_id = trades[-1].get("order")
+            related = [t for t in trades if t.get("order") == last_order_id] or [trades[-1]]
+            tot_qty = sum(float(t.get("amount") or 0.0) for t in related)
+            tot_fee = sum(float(t.get("fee", {}).get("cost") or 0.0) for t in related)
+            tot_pnl = sum(float(t.get("info", {}).get("realizedPnl") or 0.0) for t in related)
+            last_side = str(related[-1].get("side") or "SELL").upper()
+            avg_price = float(related[-1].get("price") or 0.0)
+
+            self._db.record_trade(
+                symbol=clean_sym,
+                side=last_side,
+                amount=tot_qty,
+                price=avg_price,
+                order_id=str(last_order_id or ""),
+                pnl=tot_pnl,
+                fee=tot_fee,
+                note="STOP_LOSS_EXCHANGE",
+            )
+            return tot_qty, avg_price, tot_pnl
+        except Exception as e:
+            self._logger.warning(f"⚠️ [{clean_sym}] Не вдалося зчитати деталі закритого стопа: {e}")
+            return None
 
     async def fetch_account_snapshot(
         self, symbols: Tuple[str, ...]
@@ -184,7 +225,12 @@ class ExchangeCcxtService(IExchangeGateway):
 
         try:
             if cached_df is not None and len(cached_df) >= (target_limit - 15):
-                last_ms = int(cached_df["open_ms"].iloc[-1])
+                if "open_ms" in cached_df.columns:
+                    last_ms = int(cached_df["open_ms"].iloc[-1])
+                elif "timestamp" in cached_df.columns:
+                    last_ms = int(pd.to_datetime(cached_df["timestamp"]).iloc[-1].timestamp() * 1000)
+                else:
+                    last_ms = int(time.time() * 1000) - (len(cached_df) * candle_ms)
                 now_ms = int(time.time() * 1000)
                 missing_bars = int((now_ms - last_ms) // candle_ms) + 3
                 if 1 <= missing_bars <= 100:

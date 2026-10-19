@@ -10,12 +10,8 @@ from app.domain.interfaces import IOnlineLearner
 
 class OnlineAdaptationService(IOnlineLearner):
     """
-    Дворівневий модуль безперервного самонавчання в реальному часі (Zero Memory Leak):
-    1. Asset-Level MWU Trust: веде віртуальний трек-рекорд кожної валюти (pod_eq, pod_ema, pod_peak)
-       і динамічно коригує множник довіри online_mult (від карантину 0.10x до бусту 1.25x).
-    2. Model-Level Online Hedge Bandit: порівнює попередні прогнози 5/6 під-моделей
-       (Ridge, Huber, LGBM, CatBoost, HistGB, MLP) зі справжнім рухом ціни свічки
-       та адаптує ваги ансамблю під поточну фазу ринку.
+    Дворівневий модуль безперервного самонавчання в реальному часі (Zero Memory Leak)
+    із повною персистентністю останніх цін та прогнозів у storage/adaptive_weights.json.
     """
 
     __slots__ = ("_learning_rate_mwu", "_learning_rate_bandit", "_total_updates", "_assets", "_last_prices", "_last_preds")
@@ -50,6 +46,8 @@ class OnlineAdaptationService(IOnlineLearner):
                 "bandit_6_weights": [0.20, 0.20, 0.15, 0.25, 0.10, 0.10],
                 "bandit_5_weights": [0.27, 0.10, 0.45, 0.10, 0.08],
                 "cumulative_ic_ema": 0.0,
+                "last_price": 0.0,
+                "last_preds": [],
             }
         return self._assets[sym]
 
@@ -67,7 +65,10 @@ class OnlineAdaptationService(IOnlineLearner):
             self._total_updates = int(data.get("total_updates", 0))
             raw_assets = data.get("assets", {})
             for s, st in raw_assets.items():
-                entry = self._ensure_asset(s)
+                sym = s.upper()
+                entry = self._ensure_asset(sym)
+                lp = float(st.get("last_price", 0.0))
+                lpreds = list(st.get("last_preds", []))
                 entry.update({
                     "pod_eq": float(st.get("pod_eq", 1000.0)),
                     "pod_ema": float(st.get("pod_ema", 1000.0)),
@@ -77,13 +78,25 @@ class OnlineAdaptationService(IOnlineLearner):
                     "bandit_6_weights": list(st.get("bandit_6_weights", entry["bandit_6_weights"])),
                     "bandit_5_weights": list(st.get("bandit_5_weights", entry["bandit_5_weights"])),
                     "cumulative_ic_ema": float(st.get("cumulative_ic_ema", 0.0)),
+                    "last_price": lp,
+                    "last_preds": lpreds,
                 })
+                if lp > 0:
+                    self._last_prices[sym] = lp
+                if lpreds:
+                    self._last_preds[sym] = lpreds
         except Exception:
             pass
 
     def save_state(self) -> None:
+        for sym, st in self._assets.items():
+            if sym in self._last_prices:
+                st["last_price"] = round(float(self._last_prices[sym]), 6)
+            if sym in self._last_preds:
+                st["last_preds"] = [round(float(x), 5) for x in self._last_preds[sym]]
+
         payload = {
-            "schema_version": "2.0",
+            "schema_version": "23.0",
             "learning_rate_mwu": self._learning_rate_mwu,
             "learning_rate_bandit": self._learning_rate_bandit,
             "total_updates": self._total_updates,
@@ -113,16 +126,16 @@ class OnlineAdaptationService(IOnlineLearner):
         tier_role: int,
         new_submodel_preds: Optional[list] = None,
     ) -> float:
-        st = self._ensure_asset(symbol)
+        sym = symbol.upper()
+        st = self._ensure_asset(sym)
         if not settings.ENABLE_ONLINE_LEARNING:
             return float(st["online_mult"])
 
-        ref_prev_p = prev_price if prev_price > 0 else self._last_prices.get(symbol, 0.0)
+        ref_prev_p = prev_price if prev_price > 0 else self._last_prices.get(sym, float(st.get("last_price", 0.0)))
         if ref_prev_p > 0 and curr_price > 0:
             bar_ret = (curr_price - ref_prev_p) / ref_prev_p
             bar_ret = max(-0.15, min(0.15, bar_ret))
 
-            # 1. Оновлюємо віртуальну криву капіталу монети pod_eq (як у V23 Grand-Master)
             pod_eq = float(st["pod_eq"]) * (1.0 + float(prev_model_pos) * 0.50 * bar_ret)
             pod_ema = 0.996 * float(st["pod_ema"]) + 0.004 * pod_eq
             pod_peak = max(float(st["pod_peak"]), pod_eq)
@@ -142,8 +155,7 @@ class OnlineAdaptationService(IOnlineLearner):
             st["pod_dd"] = round(p_dd * 100.0, 2)
             st["online_mult"] = round(mult, 3)
 
-            # 2. Онлайн-корекція ваг під-моделей (Exponentially Weighted Forecaster / Hedge Bandit)
-            prev_preds = self._last_preds.get(symbol)
+            prev_preds = self._last_preds.get(sym) or st.get("last_preds")
             if prev_preds and abs(bar_ret) > 1e-5:
                 realized_dir = np.sign(bar_ret)
                 n_m = len(prev_preds)
@@ -162,9 +174,11 @@ class OnlineAdaptationService(IOnlineLearner):
             self._total_updates += 1
 
         if curr_price > 0:
-            self._last_prices[symbol] = curr_price
+            self._last_prices[sym] = curr_price
+            st["last_price"] = round(curr_price, 6)
         if new_submodel_preds:
-            self._last_preds[symbol] = list(new_submodel_preds)
+            self._last_preds[sym] = list(new_submodel_preds)
+            st["last_preds"] = [round(float(x), 5) for x in new_submodel_preds]
 
         return float(st["online_mult"])
 

@@ -18,9 +18,7 @@ class MultiAssetExecutionOrchestrator(IService):
     """
     Верховний Оркестратор Виконання (V23 Grand-Master & Universal Cartridge Runner):
     - Керує кошиком із 5+ валют одночасно на єдиному ф'ючерсному рахунку USDT.
-    - Після кожної закритої 15m свічки оновлює онлайн-самонавчання (MWU + Bandit).
-    - Захищає кожну відкриту позицію індивідуальним біржовим STOP_MARKET (3.5x ATR)
-      та автоматично переносить його в БЕЗЗБИТОК при досягненні +1.8x ATR.
+    - Фіксує спрацювання біржових стопів у SQLite та зберігає захист Breakeven при ребалансах.
     """
 
     __slots__ = (
@@ -157,7 +155,6 @@ class MultiAssetExecutionOrchestrator(IService):
             self._logger.info("⏸️ Оркестратор на паузі. Пропуск свічки.")
             return
 
-        # Плановий щоденний авто-бекап БД та очищення диска
         today = datetime.now(timezone.utc).date()
         if today > self._last_backup_date:
             self._last_backup_date = today
@@ -169,7 +166,7 @@ class MultiAssetExecutionOrchestrator(IService):
         self._state.active_cartridge = self._cartridges.active_name
         active_syms = cartridge.supported_symbols
 
-        # 1. Завантаження свічок (Ring-Buffer дельта) по всіх підтримуваних валютах
+        # 1. Завантаження свічок по всіх підтримуваних валютах
         candles_map: Dict[str, pd.DataFrame] = {}
         for sym in active_syms:
             df = await self._exchange.fetch_delta_candles(sym, limit=settings.CANDLES_FETCH_LIMIT)
@@ -192,8 +189,6 @@ class MultiAssetExecutionOrchestrator(IService):
             return
 
         total_equity = max(10.0, usdt_balance + total_upnl)
-        if await self._check_daily_circuit_breaker(total_equity):
-            return
 
         coin_prices: Dict[str, float] = {}
         coin_upnl: Dict[str, float] = {}
@@ -212,8 +207,17 @@ class MultiAssetExecutionOrchestrator(IService):
             coin_upnl[sym] = ex_p.unrealized_pnl if ex_p else 0.0
             min_qty, _, _, _, _ = settings.get_symbol_spec(sym)
 
-            # Якщо біржа закрила позицію по Stop-Loss
+            # Якщо біржа закрила позицію по Stop-Loss між свічками — фіксуємо PnL у БД та сповіщаємо!
             if abs(real_qty) < min_qty and abs(c_st.current_pos_qty) >= min_qty:
+                if hasattr(self._exchange, "sync_exchange_stop_closure"):
+                    sl_info = await self._exchange.sync_exchange_stop_closure(sym)
+                    if sl_info:
+                        closed_q, avg_p, r_pnl = sl_info
+                        await self._send_alert(
+                            f"🛡️ <b>[{sym}] Спрацював біржовий Stop-Loss!</b>\n"
+                            f"• Закрито: <code>{closed_q:.4f}</code> @ <code>${avg_p:,.4f}</code>\n"
+                            f"• Фіксований PnL: <b>{r_pnl:+.2f} USDT</b>"
+                        )
                 c_st.current_pos_qty = 0.0
                 c_st.entry_price = 0.0
                 c_st.active_sl_price = 0.0
@@ -226,10 +230,13 @@ class MultiAssetExecutionOrchestrator(IService):
                 if is_new_candle:
                     c_st.bars_held += 1
 
-        # 3. Оцінка новинного фону Gemini AI (з 60-хвилинного кешу)
+        if await self._check_daily_circuit_breaker(total_equity):
+            return
+
+        # 3. Оцінка новинного фону Gemini AI
         news_score = await self._news.get_sentiment_score()
 
-        # 4. Запуск ШІ-картриджа (V23 Grand-Master) для розрахунку цільового портфеля
+        # 4. Запуск ШІ-картриджа для розрахунку цільового портфеля
         online_states = self._learner.get_all_learning_states()
         portfolio_dto = await asyncio.to_thread(
             cartridge.compute_portfolio_targets,
@@ -241,7 +248,7 @@ class MultiAssetExecutionOrchestrator(IService):
             news_score,
         )
 
-        # 5. Онлайн-самонавчання на закритій свічці + перевірка Breakeven + Виконання ордерів
+        # 5. Онлайн-самонавчання + перевірка Breakeven + Виконання ордерів
         executed_orders_summary: List[str] = []
         coin_targets_map: Dict[str, float] = {}
 
@@ -254,7 +261,6 @@ class MultiAssetExecutionOrchestrator(IService):
             cur_atr = target_dto.atr_14
             coin_targets_map[sym] = target_dto.desired_weight
 
-            # Крок самонавчання в реальному часі (тільки один раз на нову свічку)
             if is_new_candle:
                 new_mwu = self._learner.record_step_and_adapt(
                     symbol=sym,
@@ -272,7 +278,6 @@ class MultiAssetExecutionOrchestrator(IService):
 
             await self._monitor_coin_breakeven(sym, cur_p, cur_atr)
 
-            # Перевірка необхідності ребалансування по монеті
             min_qty, _, min_notional, _, _ = settings.get_symbol_spec(sym)
             cur_weight = (c_st.current_pos_qty * cur_p) / total_equity if total_equity > 0 else 0.0
             desired_w = target_dto.desired_weight if (c_st.enabled and c_st.mode != 0) else 0.0
@@ -301,8 +306,13 @@ class MultiAssetExecutionOrchestrator(IService):
                 delta_qty = target_qty - c_st.current_pos_qty
                 if abs(delta_qty) < min_qty or (abs(delta_qty) * cur_p) < min_notional:
                     continue
-                reduce_only = False
-                pnl_est = 0.0
+                is_partial_trim = (c_st.current_pos_qty * delta_qty) < 0.0 and not is_flip
+                reduce_only = is_partial_trim
+                if is_partial_trim and abs(c_st.current_pos_qty) > 0:
+                    trim_ratio = min(1.0, abs(delta_qty) / abs(c_st.current_pos_qty))
+                    pnl_est = coin_upnl.get(sym, 0.0) * trim_ratio
+                else:
+                    pnl_est = 0.0
                 note_str = f"V23 Phase {target_dto.phase} ({desired_w:+.2f}x | MWU:{c_st.mwu_trust:.2f}x)"
 
             ord_dto = await self._exchange.execute_smart_rebalance_order(
@@ -315,20 +325,34 @@ class MultiAssetExecutionOrchestrator(IService):
             )
 
             if ord_dto is not None:
+                old_qty = c_st.current_pos_qty
                 signed_exec = ord_dto.executed_qty if ord_dto.side == "BUY" else -ord_dto.executed_qty
-                new_pos_qty = 0.0 if is_closing_to_cash else (c_st.current_pos_qty + signed_exec)
+                new_pos_qty = 0.0 if is_closing_to_cash else (old_qty + signed_exec)
 
                 if abs(new_pos_qty) >= min_qty:
                     if is_opening_from_cash or is_flip:
                         c_st.entry_price = ord_dto.avg_price
                         c_st.bars_held = 1
                         c_st.is_breakeven = False
-                    else:
-                        c_st.entry_price = ord_dto.avg_price
+                    elif (old_qty * signed_exec) > 0.0 and c_st.entry_price > 0.0:
+                        # Додавання до існуючої позиції: середньозважена ціна входу
+                        c_st.entry_price = (
+                            (abs(old_qty) * c_st.entry_price) + (ord_dto.executed_qty * ord_dto.avg_price)
+                        ) / max(1e-8, abs(new_pos_qty))
 
                     c_st.current_pos_qty = new_pos_qty
-                    sl_dist = settings.EMERGENCY_SL_ATR_MULT * cur_atr
-                    raw_sl = (c_st.entry_price - sl_dist) if new_pos_qty > 0 else (c_st.entry_price + sl_dist)
+
+                    # Якщо вже був активований Breakeven — зберігаємо беззбитковий стоп!
+                    if c_st.is_breakeven and c_st.entry_price > 0.0:
+                        raw_sl = (
+                            c_st.entry_price * (1.0 + settings.BREAKEVEN_BUFFER_PCT)
+                            if new_pos_qty > 0
+                            else c_st.entry_price * (1.0 - settings.BREAKEVEN_BUFFER_PCT)
+                        )
+                    else:
+                        sl_dist = settings.EMERGENCY_SL_ATR_MULT * cur_atr
+                        raw_sl = (c_st.entry_price - sl_dist) if new_pos_qty > 0 else (c_st.entry_price + sl_dist)
+
                     sl_p = self._exchange.safe_price(sym, raw_sl)
                     c_st.active_sl_price = sl_p
                     await self._exchange.place_or_update_stop_loss(sym, new_pos_qty, sl_p)
