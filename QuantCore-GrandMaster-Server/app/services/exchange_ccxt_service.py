@@ -69,6 +69,14 @@ class ExchangeCcxtService(IExchangeGateway):
 
     async def shutdown(self) -> None:
         self._candles_cache.clear()
+        if self._exchange is not None and hasattr(self._exchange, "close"):
+            try:
+                if asyncio.iscoroutinefunction(self._exchange.close):
+                    await self._exchange.close()
+                else:
+                    self._exchange.close()
+            except Exception:
+                pass
 
     def safe_amount(self, symbol: str, raw_qty: float) -> float:
         qty = abs(float(raw_qty))

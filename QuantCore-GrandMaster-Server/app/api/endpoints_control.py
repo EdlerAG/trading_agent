@@ -1,3 +1,6 @@
+import os
+import signal
+import asyncio
 from fastapi import APIRouter, Depends, Request, HTTPException
 from app.core.security import verify_api_access
 from app.core.events import event_bus, EventType
@@ -95,3 +98,14 @@ async def emergency_panic_close_all(request: Request, _: str = Depends(verify_ap
     container.state_service.set_pause_state(paused=True, hours=None)
     report = await container.orchestrator.emergency_close_all_positions()
     return {"ok": True, "report": report}
+
+
+@router.post("/restart")
+async def restart_server_from_web(request: Request, _: str = Depends(verify_api_access)):
+    """Безпечний перезапуск сервера з веб-термінала (systemd-сумісний)."""
+    container = getattr(request.app.state, "container", None)
+    if container is not None and getattr(container, "telegram_bot", None) is not None:
+        asyncio.create_task(container.telegram_bot.trigger_graceful_server_restart())
+    else:
+        asyncio.get_running_loop().call_later(0.6, lambda: os.kill(os.getpid(), signal.SIGTERM))
+    return {"ok": True, "message": "Сервер перезавантажується (3 сек)..."}

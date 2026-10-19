@@ -1,4 +1,5 @@
 import os
+from collections import deque
 from fastapi import APIRouter, Depends, Request, Query
 from app.core.security import verify_api_access
 from app.core.config import settings
@@ -84,8 +85,7 @@ async def get_recent_logs(
         return {"ok": True, "lines": []}
     try:
         with open(settings.LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
-            all_lines = f.readlines()
-            tail = [ln.rstrip("\r\n") for ln in all_lines[-lines:]]
+            tail = [ln.rstrip("\r\n") for ln in deque(f, maxlen=lines)]
         return {"ok": True, "lines": tail}
     except Exception as e:
         return {"ok": False, "error": str(e), "lines": []}

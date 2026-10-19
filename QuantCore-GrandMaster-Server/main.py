@@ -210,7 +210,7 @@ async def health_check():
     is_paused = False
 
     if container is not None:
-        cartridge_name = getattr(container.cartridge_Service, "active_name", "loaded")
+        cartridge_name = getattr(container.cartridge_service, "active_name", "loaded")
         is_paused = getattr(container.state_service, "is_paused", False)
 
     return {

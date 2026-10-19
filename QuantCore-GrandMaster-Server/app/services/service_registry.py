@@ -1,11 +1,8 @@
 import os
-import signal
 import asyncio
 import logging
-from fastapi import Depends, Request
 from app.core.http_client import http_pool
 from app.core.events import event_bus
-from app.core.security import verify_api_access
 from app.core.memory_guard import memory_guard
 from app.services.state_service import StateService
 from app.services.online_adaptation_service import OnlineAdaptationService
@@ -29,7 +26,6 @@ class ApplicationContainer:
         "online_learner",
         "db_service",
         "cartridge_service",
-        "cartridge_Service",
         "exchange_service",
         "market_data_service",
         "currency_governor",
@@ -46,7 +42,6 @@ class ApplicationContainer:
         self.online_learner = OnlineAdaptationService()
         self.db_service = DatabaseService()
         self.cartridge_service = CartridgeLoaderService(logger=logger)
-        self.cartridge_Service = self.cartridge_service
         self.exchange_service = ExchangeCcxtService(logger=logger, db_service=self.db_service)
         self.market_data_service = MarketDataService(logger=logger, exchange_service=self.exchange_service)
         self.currency_governor = CurrencyGovernorService(logger=logger, state_service=self.state_service)
@@ -119,23 +114,6 @@ class ApplicationContainer:
         memory_guard.trim_ram()
 
 
-def _register_restart_endpoint() -> None:
-    try:
-        from app.api.endpoints_control import router as ctrl_router
-        paths = [getattr(r, "path", "") for r in ctrl_router.routes]
-        if "/api/v1/control/restart" not in paths:
-            @ctrl_router.post("/restart")
-            async def restart_server_from_web(request: Request, _: str = Depends(verify_api_access)):
-                container = getattr(request.app.state, "container", None)
-                if container is not None and container.telegram_bot is not None:
-                    asyncio.create_task(container.telegram_bot.trigger_graceful_server_restart())
-                else:
-                    asyncio.get_running_loop().call_later(0.6, lambda: os.kill(os.getpid(), signal.SIGTERM))
-                return {"ok": True, "message": "Сервер перезавантажується (3 сек)..."}
-    except Exception:
-        pass
-
-
 async def build_application_container(
     base_dir: str,
     storage_dir: str,
@@ -143,7 +121,6 @@ async def build_application_container(
     logger: logging.Logger,
 ) -> ApplicationContainer:
     event_bus.bind_wakeup_event(wakeup_event)
-    _register_restart_endpoint()
     container = ApplicationContainer(logger=logger)
     await container.init_all()
     return container

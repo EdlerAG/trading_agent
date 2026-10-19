@@ -662,5 +662,6 @@ class TelegramBotService(IService):
                     await asyncio.sleep(4.0)
             except asyncio.CancelledError:
                 break
-            except Exception:
+            except Exception as e:
+                self._logger.debug(f"Тимчасова помилка telegram polling: {e}")
                 await asyncio.sleep(4.0)
