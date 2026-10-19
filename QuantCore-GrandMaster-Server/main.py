@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 
 import uvicorn
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi.responses import ORJSONResponse, HTMLResponse
 from dotenv import load_dotenv
 
 # --- БАЗОВІ ШЛЯХИ ТА СХОВИЩЕ STORAGE ---
@@ -189,6 +189,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="QuantCore Sovereign Multi-Asset Terminal",
     version="23.0-GrandMaster",
+    default_response_class=ORJSONResponse,
     lifespan=lifespan,
 )
 

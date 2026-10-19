@@ -200,7 +200,7 @@ class TelegramBotService(IService):
 
     async def _download_tg_file(self, file_id: str) -> Optional[bytes]:
         f_info = await self._api("getFile", {"file_id": file_id})
-        f_path = f_info.get("result", {}).get("file_path") if f_info else None
+        f_path = (f_info.get("result") or {}).get("file_path") if isinstance(f_info, dict) else None
         if not f_path:
             return None
         dl_url = f"https://api.telegram.org/file/bot{settings.TELEGRAM_TOKEN}/{f_path}"
@@ -638,14 +638,14 @@ class TelegramBotService(IService):
 
                         if "callback_query" in item:
                             cq = item["callback_query"]
-                            chat_id = str(cq.get("message", {}).get("chat", {}).get("id", ""))
+                            chat_id = str(((cq.get("message") or {}).get("chat") or {}).get("id", ""))
                             if chat_id == str(settings.TELEGRAM_CHAT_ID):
                                 await self._api("answerCallbackQuery", {"callback_query_id": cq["id"]})
                                 await self._handle_command_or_callback(str(cq.get("data", "")))
 
                         elif "message" in item:
                             msg = item["message"]
-                            chat_id = str(msg.get("chat", {}).get("id", ""))
+                            chat_id = str((msg.get("chat") or {}).get("id", ""))
                             if chat_id != str(settings.TELEGRAM_CHAT_ID):
                                 continue
 

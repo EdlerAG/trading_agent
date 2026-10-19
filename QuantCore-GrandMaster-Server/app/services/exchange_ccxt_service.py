@@ -118,9 +118,9 @@ class ExchangeCcxtService(IExchangeGateway):
                 return None
             last_order_id = trades[-1].get("order")
             related = [t for t in trades if t.get("order") == last_order_id] or [trades[-1]]
-            tot_qty = sum(float(t.get("amount") or 0.0) for t in related)
-            tot_fee = sum(float(t.get("fee", {}).get("cost") or 0.0) for t in related)
-            tot_pnl = sum(float(t.get("info", {}).get("realizedPnl") or 0.0) for t in related)
+            tot_qty = sum(float(t.get("amount") or 0.0) for t in related if isinstance(t, dict))
+            tot_fee = sum(float((t.get("fee") or {}).get("cost") or 0.0) for t in related if isinstance(t, dict))
+            tot_pnl = sum(float((t.get("info") or {}).get("realizedPnl") or 0.0) for t in related if isinstance(t, dict))
             last_side = str(related[-1].get("side") or "SELL").upper()
             avg_price = float(related[-1].get("price") or 0.0)
 
@@ -152,8 +152,8 @@ class ExchangeCcxtService(IExchangeGateway):
         try:
             bal = self._exchange.fetch_balance()
             usdt_wallet = float(
-                bal.get("total", {}).get("USDT")
-                or bal.get("free", {}).get("USDT")
+                (bal.get("total") or {}).get("USDT")
+                or (bal.get("free") or {}).get("USDT")
                 or 0.0
             )
             ccxt_syms = [symbol_to_ccxt(s) for s in symbols]
@@ -349,17 +349,17 @@ class ExchangeCcxtService(IExchangeGateway):
             fee_cost = 0.0
             order_id = None
 
-            if maker_order and "id" in maker_order:
+            if maker_order and isinstance(maker_order, dict) and "id" in maker_order:
                 order_id = maker_order["id"]
                 t0 = time.time()
                 while (time.time() - t0) < settings.MAKER_TIMEOUT_SEC:
                     time.sleep(1.5)
                     chk = self._exchange.fetch_order(order_id, ccxt_sym)
-                    if chk.get("status") == "closed":
+                    if chk and isinstance(chk, dict) and chk.get("status") == "closed":
                         filled = True
                         maker_filled = float(chk.get("filled") or amount)
-                        maker_price = float(chk.get("average") or limit_price)
-                        fee_cost = float(chk.get("fee", {}).get("cost") or (maker_filled * maker_price * 0.0002))
+                        maker_price = float(chk.get("average") or chk.get("price") or limit_price)
+                        fee_cost = float((chk.get("fee") or {}).get("cost") or (maker_filled * maker_price * 0.0002))
                         break
 
                 if not filled:
@@ -369,10 +369,11 @@ class ExchangeCcxtService(IExchangeGateway):
                         pass
                     try:
                         canceled = self._exchange.fetch_order(order_id, ccxt_sym)
-                        maker_filled = float(canceled.get("filled") or 0.0)
-                        if maker_filled > 0:
-                            maker_price = float(canceled.get("average") or limit_price)
-                            fee_cost += float(canceled.get("fee", {}).get("cost") or (maker_filled * maker_price * 0.0002))
+                        if canceled and isinstance(canceled, dict):
+                            maker_filled = float(canceled.get("filled") or 0.0)
+                            if maker_filled > 0:
+                                maker_price = float(canceled.get("average") or canceled.get("price") or limit_price)
+                                fee_cost += float((canceled.get("fee") or {}).get("cost") or (maker_filled * maker_price * 0.0002))
                     except Exception:
                         pass
 
@@ -385,10 +386,11 @@ class ExchangeCcxtService(IExchangeGateway):
                 if m_qty >= min_qty and (reduce_only or (m_qty * est_price) >= min_notional):
                     m_params = {"reduceOnly": True} if reduce_only else {}
                     m_ord = self._exchange.create_market_order(ccxt_sym, side, m_qty, params=m_params)
-                    market_filled = float(m_ord.get("filled") or m_qty)
-                    market_price = float(m_ord.get("average") or m_ord.get("price") or est_price)
-                    fee_cost += float(m_ord.get("fee", {}).get("cost") or (market_filled * market_price * 0.0005))
-                    order_id = m_ord.get("id")
+                    if m_ord and isinstance(m_ord, dict):
+                        market_filled = float(m_ord.get("filled") or m_qty)
+                        market_price = float(m_ord.get("average") or m_ord.get("price") or est_price)
+                        fee_cost += float((m_ord.get("fee") or {}).get("cost") or (market_filled * market_price * 0.0005))
+                        order_id = m_ord.get("id")
 
             tot_qty = maker_filled + market_filled
             if tot_qty <= 0.0:
@@ -488,14 +490,20 @@ class ExchangeCcxtService(IExchangeGateway):
                         ord_res = self._exchange.create_market_order(
                             ccxt_sym, side, qty, params={"reduceOnly": True}
                         )
-                        fill_p = float(ord_res.get("average") or p_dto.mark_price or 0.0)
-                        fee_c = float(ord_res.get("fee", {}).get("cost") or (qty * fill_p * 0.0005))
+                        if ord_res and isinstance(ord_res, dict):
+                            fill_p = float(ord_res.get("average") or ord_res.get("price") or p_dto.mark_price or 0.0)
+                            fee_c = float((ord_res.get("fee") or {}).get("cost") or (qty * fill_p * 0.0005))
+                            ord_id = ord_res.get("id")
+                        else:
+                            fill_p = float(p_dto.mark_price or 0.0)
+                            fee_c = float(qty * fill_p * 0.0005)
+                            ord_id = ""
                         self._db.record_trade(
                             symbol=clean,
                             side=side,
                             amount=qty,
                             price=fill_p,
-                            order_id=ord_res.get("id"),
+                            order_id=ord_id,
                             pnl=p_dto.unrealized_pnl,
                             fee=fee_c,
                             note="PANIC_CLOSE_ALL",
