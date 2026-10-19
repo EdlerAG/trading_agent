@@ -231,7 +231,8 @@ class V23GrandMasterCartridge(IAlphaCartridge):
 
         # 5-Model Classic Stacker
         stack_5 = np.column_stack([p_ridge, p_lgbm, p_cb, p_hgb, p_mlp])
-        w5_base = np.asarray(models_dict.get("w5") or models_dict.get("w5_classic") or models_dict.get("meta_weights", [0.30, 0.25, 0.25, 0.10, 0.10]), dtype=np.float64)
+        w5_raw = next((models_dict[k] for k in ("w5", "w5_classic", "meta_weights") if k in models_dict and models_dict[k] is not None), [0.30, 0.25, 0.25, 0.10, 0.10])
+        w5_base = np.asarray(w5_raw, dtype=np.float64)
         if len(w5_base) != 5:
             w5_base = np.array([0.30, 0.25, 0.25, 0.10, 0.10], dtype=np.float64)
 
@@ -251,7 +252,8 @@ class V23GrandMasterCartridge(IAlphaCartridge):
         if huber_model is not None:
             p_huber = huber_model.predict(X_scaled)
             stack_6 = np.column_stack([p_ridge, p_huber, p_lgbm, p_cb, p_hgb, p_mlp])
-            w6_base = np.asarray(models_dict.get("w6") or models_dict.get("w6_huber") or models_dict.get("meta_weights", [0.20, 0.20, 0.15, 0.25, 0.10, 0.10]), dtype=np.float64)
+            w6_raw = next((models_dict[k] for k in ("w6", "w6_huber", "meta_weights") if k in models_dict and models_dict[k] is not None), [0.20, 0.20, 0.15, 0.25, 0.10, 0.10])
+            w6_base = np.asarray(w6_raw, dtype=np.float64)
             if len(w6_base) != 6:
                 w6_base = np.array([0.20, 0.20, 0.15, 0.25, 0.10, 0.10], dtype=np.float64)
 
