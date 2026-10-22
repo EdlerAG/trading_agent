@@ -61,6 +61,8 @@ class ApplicationContainer:
             cartridge_service=self.cartridge_service,
             online_learner=self.online_learner,
             news_service=self.news_service,
+            market_data_service=self.market_data_service,
+            currency_governor=self.currency_governor,
         )
         self.risk_guard.bind_orchestrator(self.orchestrator)
 

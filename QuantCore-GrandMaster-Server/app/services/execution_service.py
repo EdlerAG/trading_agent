@@ -29,6 +29,8 @@ class MultiAssetExecutionOrchestrator(IService):
         "_cartridges",
         "_learner",
         "_news",
+        "_market_data",
+        "_governor",
         "_tg_sender",
         "_last_backup_date",
     )
@@ -42,6 +44,8 @@ class MultiAssetExecutionOrchestrator(IService):
         cartridge_service: CartridgeLoaderService,
         online_learner: IOnlineLearner,
         news_service: NewsAiService,
+        market_data_service: Optional[Any] = None,
+        currency_governor: Optional[Any] = None,
     ) -> None:
         self._logger = logger
         self._state = state_service
@@ -50,6 +54,8 @@ class MultiAssetExecutionOrchestrator(IService):
         self._cartridges = cartridge_service
         self._learner = online_learner
         self._news = news_service
+        self._market_data = market_data_service
+        self._governor = currency_governor
         self._tg_sender = None
         self._last_backup_date = datetime.now(timezone.utc).date()
 
@@ -166,12 +172,15 @@ class MultiAssetExecutionOrchestrator(IService):
         self._state.active_cartridge = self._cartridges.active_name
         active_syms = cartridge.supported_symbols
 
-        # 1. Завантаження свічок по всіх підтримуваних валютах
-        candles_map: Dict[str, pd.DataFrame] = {}
-        for sym in active_syms:
-            df = await self._exchange.fetch_delta_candles(sym, limit=settings.CANDLES_FETCH_LIMIT)
-            if df is not None and len(df) >= 200:
-                candles_map[sym] = df
+        # 1. Високошвидкісне конкурентне завантаження свічок через MarketDataService (<1.5с)
+        if self._market_data is not None:
+            candles_map = await self._market_data.fetch_synchronized_candles(active_syms, min_bars=200)
+        else:
+            candles_map = {}
+            for sym in active_syms:
+                df = await self._exchange.fetch_delta_candles(sym, limit=settings.CANDLES_FETCH_LIMIT)
+                if df is not None and len(df) >= 200:
+                    candles_map[sym] = df
 
         if "BTCUSDT" not in candles_map:
             self._logger.warning("⚠️ Недостатньо свічок для BTCUSDT. Очікування наступної ітерації.")
@@ -248,6 +257,10 @@ class MultiAssetExecutionOrchestrator(IService):
             news_score,
         )
 
+        # Синхронізація лімітів та налаштувань монет через Currency Governor
+        if self._governor is not None:
+            portfolio_dto = self._governor.enforce_currency_rules(portfolio_dto)
+
         # 5. Онлайн-самонавчання + перевірка Breakeven + Виконання ордерів
         executed_orders_summary: List[str] = []
         coin_targets_map: Dict[str, float] = {}
@@ -318,9 +331,6 @@ class MultiAssetExecutionOrchestrator(IService):
             if reduce_only or is_closing_to_cash or is_flip:
                 await self._exchange.cancel_symbol_orders(sym)
 
-            if reduce_only or is_closing_to_cash or is_flip:
-                await self._exchange.cancel_symbol_orders(sym)
-
             ord_dto = await self._exchange.execute_smart_rebalance_order(
                 symbol=sym,
                 delta_qty=delta_qty,
@@ -331,13 +341,7 @@ class MultiAssetExecutionOrchestrator(IService):
             )
 
             if ord_dto is None:
-                if is_closing_to_cash:
-                    c_st.current_pos_qty = 0.0
-                    c_st.entry_price = 0.0
-                    c_st.active_sl_price = 0.0
-                    c_st.bars_held = 0
-                    c_st.is_breakeven = False
-                    await self._exchange.cancel_symbol_orders(sym)
+                self._logger.warning(f"⚠️ [{sym}] Ордер ребалансу не виконано біржею (пропуск до наступної свічки).")
                 continue
 
             if ord_dto is not None:

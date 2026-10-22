@@ -145,9 +145,9 @@ class OnlineAdaptationService(IOnlineLearner):
             if tier_role == 1:
                 mult = 1.25 if (p_dd < 0.06 and above_ema) else (0.75 if p_dd > 0.14 else 1.05)
             elif tier_role == 2:
-                mult = 1.15 if (p_dd < 0.07 and above_ema) else (0.50 if p_dd > 0.12 else 0.90)
+                mult = 1.15 if (p_dd < 0.07 and above_ema) else (0.55 if p_dd > 0.12 else 0.95)
             else:
-                mult = 0.85 if (pod_eq > 1020.0 and p_dd < 0.06 and above_ema) else 0.10
+                mult = 1.00 if (p_dd < 0.06 and above_ema) else (0.40 if p_dd > 0.12 else 0.80)
 
             st["pod_eq"] = round(pod_eq, 3)
             st["pod_ema"] = round(pod_ema, 3)

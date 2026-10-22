@@ -83,7 +83,7 @@ class Settings:
     TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
     ENABLE_NEWS_SENTIMENT: bool = os.getenv("ENABLE_NEWS_SENTIMENT", "true").lower() == "true"
     NEWS_REQUEST_TIMEOUT: int = 10
 
@@ -98,11 +98,11 @@ class Settings:
 
     CANDLES_FETCH_LIMIT: int = 1950
     CASH_ZONE_THRESHOLD: float = 0.06
-    ACTION_DEADZONE: float = 0.18
+    ACTION_DEADZONE: float = float(os.getenv("ACTION_DEADZONE", "0.06"))
     STICKY_RANK_BONUS: float = 0.05
 
     MAX_DAILY_LOSS_PCT: float = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.06"))
-    MAX_ALLOWED_SPREAD_PCT: float = 0.0010
+    MAX_ALLOWED_SPREAD_PCT: float = float(os.getenv("MAX_ALLOWED_SPREAD_PCT", "0.0055"))
     MAX_FUNDING_RATE: float = 0.0005
     FUNDING_BUFFER_MINUTES: int = 15
     MAKER_TIMEOUT_SEC: int = 18

@@ -482,24 +482,38 @@ class ExchangeCcxtService(IExchangeGateway):
         try:
             open_ords = self._exchange.fetch_open_orders(ccxt_sym)
             for o in open_ords:
-                if str(o.get("type") or "").lower() in ("stop_market", "stop", "take_profit_market"):
+                if str(o.get("type") or "").lower() in ("stop_market", "stop"):
                     try:
                         self._exchange.cancel_order(o["id"], ccxt_sym)
                     except Exception:
                         pass
 
-            self._exchange.create_order(
-                symbol=ccxt_sym,
-                type="STOP_MARKET",
-                side=close_side,
-                amount=qty,
-                price=None,
-                params={
-                    "stopPrice": sl_p,
-                    "reduceOnly": True,
-                    "workingType": "MARK_PRICE",
-                },
-            )
+            try:
+                self._exchange.create_order(
+                    symbol=ccxt_sym,
+                    type="STOP_MARKET",
+                    side=close_side,
+                    amount=qty,
+                    price=None,
+                    params={
+                        "stopPrice": sl_p,
+                        "closePosition": True,
+                        "workingType": "MARK_PRICE",
+                    },
+                )
+            except Exception:
+                self._exchange.create_order(
+                    symbol=ccxt_sym,
+                    type="STOP_MARKET",
+                    side=close_side,
+                    amount=qty,
+                    price=None,
+                    params={
+                        "stopPrice": sl_p,
+                        "reduceOnly": True,
+                        "workingType": "MARK_PRICE",
+                    },
+                )
             return True
         except Exception as e:
             self._logger.warning(f"⚠️ [{clean_sym}] Не вдалося виставити SL @ {sl_p}: {e}")
@@ -528,18 +542,32 @@ class ExchangeCcxtService(IExchangeGateway):
                     except Exception:
                         pass
 
-            self._exchange.create_order(
-                symbol=ccxt_sym,
-                type="TAKE_PROFIT_MARKET",
-                side=close_side,
-                amount=qty,
-                price=None,
-                params={
-                    "stopPrice": tp_p,
-                    "reduceOnly": True,
-                    "workingType": "MARK_PRICE",
-                },
-            )
+            try:
+                self._exchange.create_order(
+                    symbol=ccxt_sym,
+                    type="TAKE_PROFIT_MARKET",
+                    side=close_side,
+                    amount=qty,
+                    price=None,
+                    params={
+                        "stopPrice": tp_p,
+                        "closePosition": True,
+                        "workingType": "MARK_PRICE",
+                    },
+                )
+            except Exception:
+                self._exchange.create_order(
+                    symbol=ccxt_sym,
+                    type="TAKE_PROFIT_MARKET",
+                    side=close_side,
+                    amount=qty,
+                    price=None,
+                    params={
+                        "stopPrice": tp_p,
+                        "reduceOnly": True,
+                        "workingType": "MARK_PRICE",
+                    },
+                )
             return True
         except Exception as e:
             self._logger.warning(f"⚠️ [{clean_sym}] Не вдалося виставити TP @ {tp_p}: {e}")

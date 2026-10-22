@@ -133,6 +133,7 @@ class V58GrandMasterCartridge(IAlphaCartridge):
         ortho_df: pd.DataFrame,
         asset_bundle: Dict[str, Any],
         online_state: Dict[str, Any],
+        news_sentiment: float = 0.0,
     ) -> Tuple[float, float, float, int, List[float]]:
         """
         Evaluates SOTA ML models or Autonomous Structural V58 fallback for a single asset.
@@ -222,12 +223,14 @@ class V58GrandMasterCartridge(IAlphaCartridge):
         tri_ml = 0.40 * ml_sig + 0.35 * swing_sig + 0.25 * macro_sig
 
         alpha_score = 0.44 * macro_sig + 0.34 * tri_ml + 0.12 * rs96_val + 0.10 * ker_val
+        if abs(news_sentiment) > 0.05:
+            alpha_score = math.tanh(alpha_score * 0.82 + news_sentiment * 0.18)
 
         # 6 Cognitive Regimes Detection
         breadth_z = float(last_row.get("cont_breadth_z", last_row.get("cross_dispersion_idx", 0.0)))
         geo_shock = float(last_row.get("geo_shock_idx", last_row.get("geo_macro_shock_z", 0.0)))
 
-        if geo_shock > 1.3 or breadth_z < -1.8:
+        if geo_shock > 1.3 or breadth_z < -1.8 or news_sentiment < -0.65:
             regime_id = 5  # R5: Geo-Macro Shock
         elif breadth_z < -0.8 and tsmom_96_val < -0.4:
             regime_id = 6  # R6: Bear Cascade
@@ -305,6 +308,7 @@ class V58GrandMasterCartridge(IAlphaCartridge):
                 ortho_df=ortho_df,
                 asset_bundle=asset_b,
                 online_state=onl_s,
+                news_sentiment=news_sentiment,
             )
 
             # Build 16-dim state vector for Cross-Asset MoE Policy Net
@@ -375,10 +379,11 @@ class V58GrandMasterCartridge(IAlphaCartridge):
                 pos_now *= 0.22
 
             # Pillar 3: Slot Hysteresis & Conviction Bonus for Top-3
-            if rank_i in (0, 1, 2) and q_mult >= 0.85 and abs(pos_now) >= 0.03:
+            if rank_i in (0, 1, 2) and q_mult >= 0.50 and abs(pos_now) >= 0.03:
                 conv_boost = 1.40 if rank_i == 0 else (1.24 if rank_i == 1 else 1.12)
-                # Pillar 11: House-Money / Neural multiplier
-                w_s = pos_now * 0.54 * q_mult * conv_boost * n_mult
+                lev_scale = max(0.5, min(1.85, max_portfolio_lev / 2.0))
+                # Pillar 11: House-Money / Neural multiplier with dynamic leverage scaling
+                w_s = pos_now * (0.54 * lev_scale) * q_mult * conv_boost * n_mult
                 raw_weights[sym] = w_s
 
         # Pillar 6: Lead-Lag Relay (if BTC is surging, boost ETH/SOL)
