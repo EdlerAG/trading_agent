@@ -14,6 +14,7 @@ from app.services.risk_guard_service import RiskGuardService
 from app.services.news_ai_service import NewsAiService
 from app.services.execution_service import MultiAssetExecutionOrchestrator
 from app.services.telegram_bot_service import TelegramBotService
+from app.services.ws_sentinel_service import WebSocketSentinelService
 from app.cartridges.cartridge_loader import CartridgeLoaderService
 
 
@@ -33,6 +34,7 @@ class ApplicationContainer:
         "news_service",
         "orchestrator",
         "telegram_bot",
+        "ws_sentinel",
         "watchdog",
     )
 
@@ -75,6 +77,17 @@ class ApplicationContainer:
             orchestrator=self.orchestrator,
         )
         self.orchestrator.bind_telegram_sender(self.telegram_bot)
+
+        self.ws_sentinel = WebSocketSentinelService(
+            logger=logger,
+            state_service=self.state_service,
+            exchange_service=self.exchange_service,
+            event_bus_instance=event_bus,
+            orchestrator=self.orchestrator,
+        )
+        self.ws_sentinel.bind_telegram_sender(self.telegram_bot)
+        self.orchestrator.bind_ws_sentinel(self.ws_sentinel)
+
         self.watchdog = self.risk_guard
 
     async def init_all(self) -> None:
@@ -90,12 +103,14 @@ class ApplicationContainer:
             self.news_service,
             self.orchestrator,
             self.telegram_bot,
+            self.ws_sentinel,
         ):
             await srv.init()
         memory_guard.trim_ram()
 
     async def shutdown(self) -> None:
         for srv in (
+            self.ws_sentinel,
             self.telegram_bot,
             self.orchestrator,
             self.news_service,

@@ -151,6 +151,8 @@ async def lifespan(app: FastAPI):
             tasks.append(asyncio.create_task(container.telegram_bot.polling_loop(), name="tg_polling"))
         if container.watchdog is not None:
             tasks.append(asyncio.create_task(container.watchdog.loop(), name="risk_watchdog"))
+        if hasattr(container, "ws_sentinel") and container.ws_sentinel is not None:
+            tasks.append(asyncio.create_task(container.ws_sentinel.loop(), name="ws_sentinel"))
 
         rss_now = trim_process_memory()
         logger.info(f"✅ Усі мікросервіси запущено! Поточне споживання RAM: {rss_now:.1f} MB.")

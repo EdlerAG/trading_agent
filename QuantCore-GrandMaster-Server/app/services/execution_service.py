@@ -32,6 +32,7 @@ class MultiAssetExecutionOrchestrator(IService):
         "_market_data",
         "_governor",
         "_tg_sender",
+        "_ws_sentinel",
         "_last_backup_date",
     )
 
@@ -57,6 +58,7 @@ class MultiAssetExecutionOrchestrator(IService):
         self._market_data = market_data_service
         self._governor = currency_governor
         self._tg_sender = None
+        self._ws_sentinel = None
         self._last_backup_date = datetime.now(timezone.utc).date()
 
     @property
@@ -65,6 +67,9 @@ class MultiAssetExecutionOrchestrator(IService):
 
     def bind_telegram_sender(self, tg_service) -> None:
         self._tg_sender = tg_service
+
+    def bind_ws_sentinel(self, ws_sentinel) -> None:
+        self._ws_sentinel = ws_sentinel
 
     async def _send_alert(self, msg: str) -> None:
         if self._tg_sender is not None:
@@ -268,6 +273,11 @@ class MultiAssetExecutionOrchestrator(IService):
         # 5. Онлайн-самонавчання + перевірка Breakeven + Виконання ордерів
         executed_orders_summary: List[str] = []
         coin_targets_map: Dict[str, float] = {}
+        if self._ws_sentinel is not None:
+            self._ws_sentinel.clear_stink_bids()
+            self._ws_sentinel.update_symbol_atrs(
+                {s: t.atr_14 for s, t in portfolio_dto.targets.items() if t.atr_14 > 0}
+            )
 
         for sym, target_dto in portfolio_dto.targets.items():
             c_st = self._state.coins.get(sym)
@@ -416,7 +426,9 @@ class MultiAssetExecutionOrchestrator(IService):
                 stink_qty = stink_usdt / max(1e-8, stink_p)
                 min_q, _, min_not, _, _ = settings.get_symbol_spec(top_sym)
                 if stink_qty >= min_q and (stink_qty * stink_p) >= min_not:
-                    await self._exchange.place_passive_stink_bid(top_sym, stink_qty, stink_p)
+                    stink_ord_id = await self._exchange.place_passive_stink_bid(top_sym, stink_qty, stink_p)
+                    if self._ws_sentinel is not None:
+                        self._ws_sentinel.register_stink_bid(top_sym, stink_qty, stink_p, t_info.atr_14, order_id=stink_ord_id)
 
         # 6. Збереження телеметрії, стану та SQLite зрізу
         self._learner.save_state()
