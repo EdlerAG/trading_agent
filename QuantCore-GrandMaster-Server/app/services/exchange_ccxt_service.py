@@ -221,6 +221,24 @@ class ExchangeCcxtService(IExchangeGateway):
         df["timestamp"] = pd.to_datetime(df["open_ms"], unit="ms")
         return df
 
+    async def fetch_funding_rates(self, symbols: Tuple[str, ...]) -> Dict[str, float]:
+        return await asyncio.to_thread(self._fetch_funding_rates_sync, symbols)
+
+    def _fetch_funding_rates_sync(self, symbols: Tuple[str, ...]) -> Dict[str, float]:
+        if self._exchange is None:
+            return {}
+        try:
+            ccxt_syms = [symbol_to_ccxt(s) for s in symbols]
+            raw_fr = self._exchange.fetch_funding_rates(ccxt_syms)
+            rates: Dict[str, float] = {}
+            for s in symbols:
+                c_sym = symbol_to_ccxt(s)
+                item = raw_fr.get(c_sym) or raw_fr.get(s) or {}
+                rates[s.upper()] = float(item.get("fundingRate") or 0.0)
+            return rates
+        except Exception:
+            return {}
+
     async def fetch_delta_candles(self, symbol: str, limit: int = settings.CANDLES_FETCH_LIMIT) -> Optional[pd.DataFrame]:
         return await asyncio.to_thread(self._fetch_delta_candles_sync, symbol, limit)
 

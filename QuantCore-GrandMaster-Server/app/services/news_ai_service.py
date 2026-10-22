@@ -25,7 +25,7 @@ class NewsAiService(IService):
         self._score: float = 0.0
         self._headlines: List[str] = []
         self._updated_ts: float = 0.0
-        self._ttl_sec: float = 3600.0
+        self._ttl_sec: float = 900.0
 
     @property
     def name(self) -> str:
@@ -97,7 +97,7 @@ class NewsAiService(IService):
         }
 
         client = http_pool.get()
-        for model_name in (settings.GEMINI_MODEL, "gemini-2.5-flash", "gemini-2.0-flash"):
+        for model_name in (settings.GEMINI_MODEL, "gemini-flash-lite-latest", "gemini-2.5-flash"):
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={settings.GEMINI_API_KEY}"
             try:
                 resp = await client.post(url, json=payload, timeout=9.0)

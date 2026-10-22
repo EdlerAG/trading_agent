@@ -240,22 +240,22 @@ class V58GrandMasterCartridge(IAlphaCartridge):
         else:
             regime_id = 1  # R1: Whale Accumulation
 
-        # Dynamic Raw Position
+        # Dynamic Raw Position (Adaptive to earn in ALL 6 market regimes smoothly)
         if regime_id == 5:
-            # Crash mode: defend capital, zero longs
-            raw_pos = 0.0
+            # R5: Geo-Macro Shock - short the weakest momentum breakdown assets smoothly
+            raw_pos = -0.75 * math.tanh(abs(alpha_score) * 2.2) if alpha_score < -0.10 else 0.0
         elif regime_id == 6:
-            # Bear cascade: short if weak, cash otherwise
-            raw_pos = -0.65 if (alpha_score < -0.15 and rs96_val < -0.10) else 0.0
+            # R6: Bear Cascade - systematically harvest downside alpha
+            raw_pos = -0.75 if alpha_score < -0.20 else (-0.50 if alpha_score < -0.08 else 0.0)
         elif regime_id == 4:
-            # Flat / OU Harvester
-            raw_pos = 0.45 * math.tanh(alpha_score * 2.0) if abs(alpha_score) > 0.12 else 0.0
+            # R4: Flat / Mean-Reversion Harvester - capture range swings smoothly
+            raw_pos = 0.55 * math.tanh(alpha_score * 2.2) if abs(alpha_score) > 0.08 else 0.0
         else:
-            # Bull / Expansion / Altseason
-            if alpha_score > 0.12 and ker_val > -0.05:
-                raw_pos = 1.0 if alpha_score < 0.32 else 1.35
-            elif alpha_score < -0.22:
-                raw_pos = -0.50
+            # R1/R2/R3: Bull / Expansion / Altseason
+            if alpha_score > 0.10 and ker_val > -0.08:
+                raw_pos = 1.00 if alpha_score < 0.30 else 1.35
+            elif alpha_score < -0.15:
+                raw_pos = -0.60
             else:
                 raw_pos = 0.0
 
@@ -357,8 +357,9 @@ class V58GrandMasterCartridge(IAlphaCartridge):
                 coin_calc[sym]["neural_mult"] = 1.0
 
         # 3. Dynamic Top-3 Sticky Allocation + Active Ensemble Pillars [3, 6, 7, 9, 11, 12]
+        # Rank by absolute directional conviction so both top longs AND top shorts get capital
         ranked_syms = sorted(
-            coin_calc.keys(), key=lambda s: coin_calc[s]["eff_rank_score"], reverse=True
+            coin_calc.keys(), key=lambda s: abs(coin_calc[s]["eff_rank_score"]), reverse=True
         )
         top3_set = set(ranked_syms[:3])
         raw_weights: Dict[str, float] = {s: 0.0 for s in coin_calc}

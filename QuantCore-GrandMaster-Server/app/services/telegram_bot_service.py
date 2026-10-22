@@ -601,6 +601,75 @@ class TelegramBotService(IService):
             self._state.set_pause_state(paused=True)
             await self._orchestrator.emergency_close_all_positions()
 
+        else:
+            # Free-form intelligent conversation with Gemini AI about system state & crypto market
+            if settings.GEMINI_API_KEY and len(cmd) > 1:
+                await self._handle_gemini_ai_query(cmd)
+            else:
+                await self.send_alert(
+                    f"❓ Невідома команда: <code>{html.escape(cmd)}</code>\n\n"
+                    f"Надішліть /start для виклику головного меню або запитайте мене будь-що звичайною мовою!"
+                )
+
+    async def _handle_gemini_ai_query(self, user_question: str) -> None:
+        """Інтерактивний діалог користувача з Gemini AI про стан ринку, позиції та стратегію."""
+        st = self._state.get_full_state_dict()
+        t = st.get("telemetry", {})
+        eq = t.get("total_equity") or st.get("daily_starting_equity") or 0.0
+        upnl = t.get("unrealized_pnl", 0.0)
+        breadth = t.get("market_breadth", 0.0)
+        news_s = t.get("news_sentiment", 0.0)
+        risk = st.get("risk_profile", "OPTIMAL")
+        lev = st.get("max_portfolio_lev", 2.4)
+        active_c = self._cartridges.active_name
+
+        coins_info = []
+        for c in st.get("coins", []):
+            if abs(c.get("current_pos_qty", 0.0)) > 0:
+                side = "LONG" if c["current_pos_qty"] > 0 else "SHORT"
+                coins_info.append(f"• {c['symbol']}: {side} {abs(c['current_pos_qty']):.4f} (uPnL: {c.get('unrealized_pnl', 0.0):+.2f}$)")
+
+        pos_str = "\n".join(coins_info) if coins_info else "100% КЕШ (USDT), позицій немає"
+
+        prompt = (
+            "Ти — QuantCore Sovereign AI, інтелектуальний квантовий помічник і стратег крипто-фонду користувача.\n"
+            "Користувач надіслав тобі запитання в Telegram. Відповідай дружньо, професійно, впевнено та лаконічно українською мовою.\n\n"
+            f"ПОТОЧНИЙ СТАН СИСТЕМИ QUANTCORE:\n"
+            f"- Депозит / Equity: ${eq:,.2f} USDT (Плаваючий uPnL: {upnl:+.2f}$)\n"
+            f"- Режим ризику: {risk} ({lev:.1f}x)\n"
+            f"- Ринкова ширина (Breadth): {breadth:+.2f} (від -1.0 до +1.0)\n"
+            f"- Сентимент новин: {news_s:+.2f}\n"
+            f"- Активні позиції на біржі:\n{pos_str}\n"
+            f"- Активне квантове ядро: {active_c}\n\n"
+            f"Запитання користувача: \"{user_question}\"\n\n"
+            "Дай чітку, практичну відповідь без зайвої води, спираючись на поточний стан ринку та портфеля."
+        )
+
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.4, "maxOutputTokens": 350},
+        }
+
+        client = http_pool.get()
+        reply_text = None
+        for model_name in (settings.GEMINI_MODEL, "gemini-flash-lite-latest", "gemini-2.5-flash", "gemini-flash-latest"):
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={settings.GEMINI_API_KEY}"
+            try:
+                resp = await client.post(url, json=payload, timeout=12.0)
+                if resp.status_code == 200:
+                    d = resp.json()
+                    reply_text = d["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    break
+            except Exception:
+                continue
+
+        if reply_text:
+            await self.send_alert(f"🤖 <b>QuantCore AI:</b>\n\n{html.escape(reply_text)}")
+        else:
+            await self.send_alert("⚠️ Не вдалося отримати відповідь від Gemini AI. Спробуйте ще раз або скористайтесь кнопками меню /start.")
+
+
+
     # ==========================================
     # 6. ФОНОВИЙ ЦИКЛ LONG-POLLING (ZERO-IDLE CPU)
     # ==========================================
