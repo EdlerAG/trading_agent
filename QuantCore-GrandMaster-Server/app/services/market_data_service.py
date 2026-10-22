@@ -42,7 +42,9 @@ class MarketDataService(IService):
         min_bars: int = 200,
     ) -> Dict[str, pd.DataFrame]:
         """
-        Конкурентно завантажує свічки для всіх монет кошика та повертає словник валідних DataFrame.
+        Конкурентно завантажує свічки та ставки фінансування (funding rates) для всіх монет кошика.
+        Записує отримане значення ставки у колонку df["funding_rate"] кожної монети, щоб ознака funding_rate_z
+        у feature_pipe_v58.py працювала на реальних даних біржі.
         """
         candles_map: Dict[str, pd.DataFrame] = {}
 
@@ -57,11 +59,28 @@ class MarketDataService(IService):
                 self._logger.warning(f"⚠️ [{sym}] Помилка завантаження свічок: {e}")
                 return sym.upper(), None
 
-        # Паралельне асинхронне виконання запитів до біржі
-        results = await asyncio.gather(*[_fetch_single_symbol(sym) for sym in symbols])
+        async def _fetch_funding() -> Dict[str, float]:
+            try:
+                if hasattr(self._exchange, "fetch_funding_rates"):
+                    return await asyncio.wait_for(
+                        self._exchange.fetch_funding_rates(symbols),
+                        timeout=10.0,
+                    )
+                return {}
+            except Exception as e:
+                self._logger.warning(f"⚠️ Помилка завантаження funding rates: {e}")
+                return {}
 
-        for sym_u, df in results:
+        # Паралельне асинхронне виконання запитів до біржі: свічки + ставки фінансування
+        candles_task = asyncio.gather(*[_fetch_single_symbol(sym) for sym in symbols])
+        funding_task = _fetch_funding()
+
+        candles_results, funding_map = await asyncio.gather(candles_task, funding_task)
+
+        for sym_u, df in candles_results:
             if df is not None and len(df) >= min_bars:
+                fr_rate = float(funding_map.get(sym_u, 0.0))
+                df["funding_rate"] = fr_rate
                 candles_map[sym_u] = df
             else:
                 self._logger.warning(

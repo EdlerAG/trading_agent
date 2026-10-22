@@ -224,6 +224,7 @@ td{padding:8px 10px;border-bottom:1px solid rgba(255,255,255,0.05);font-family:'
       <span class="mono" style="font-size:12.5px;color:var(--muted)">
         Breadth: <b id="breadthVal" style="color:#fff">0.00</b> &nbsp;|&nbsp;
         Gemini News: <b id="newsVal" style="color:var(--sky)">0.00</b>
+        <span id="geoShockBadge" style="display:none;margin-left:8px;padding:2px 7px;border-radius:4px;background:#ef4444;color:#fff;font-size:11px;font-weight:700">🚨 R5 GEO SHOCK</span>
       </span>
     </div>
     <div class="coins-grid" id="coinsGrid"></div>
@@ -268,14 +269,9 @@ td{padding:8px 10px;border-bottom:1px solid rgba(255,255,255,0.05);font-family:'
   <div class="split-2">
     <div class="bento-card">
       <div class="card-hdr">
-        <span class="card-title">📜 Журнал виконаних ордерів (5 Валют)</span>
+        <span class="card-title">📜 Журнал виконаних ордерів (10 Валют Сварму)</span>
         <select id="tradeSymFilter" onchange="loadTrades()" style="padding:4px 8px;font-size:12px">
           <option value="">Усі валюти</option>
-          <option value="BTCUSDT">BTCUSDT</option>
-          <option value="ETHUSDT">ETHUSDT</option>
-          <option value="SOLUSDT">SOLUSDT</option>
-          <option value="BNBUSDT">BNBUSDT</option>
-          <option value="XRPUSDT">XRPUSDT</option>
         </select>
       </div>
       <div class="tbl-wrap">
@@ -513,6 +509,25 @@ async function loadState(){
     document.getElementById('kpiLeader').innerText = 'Лідер: ' + (t.top_leader || 'BTCUSDT');
     document.getElementById('breadthVal').innerText = (t.market_breadth || 0).toFixed(2);
     document.getElementById('newsVal').innerText = (t.news_sentiment || 0).toFixed(2);
+
+    const geoBadge = document.getElementById('geoShockBadge');
+    if (geoBadge) {
+      geoBadge.style.display = t.geo_shock_active ? 'inline-block' : 'none';
+    }
+
+    // Dynamic population of tradeSymFilter options from active coins
+    const filterEl = document.getElementById('tradeSymFilter');
+    if (filterEl && eng.coins && eng.coins.length > 0) {
+      const curVal = filterEl.value;
+      const coinSyms = (eng.coins || []).map(c => c.symbol).filter(Boolean);
+      const existingOpts = Array.from(filterEl.options).map(o => o.value);
+      const needsUpdate = coinSyms.some(s => !existingOpts.includes(s)) || existingOpts.length <= 1;
+      if (needsUpdate) {
+        filterEl.innerHTML = '<option value="">Усі валюти</option>' +
+          coinSyms.map(s => `<option value="${s}">${s}</option>`).join('');
+        filterEl.value = curVal;
+      }
+    }
 
     renderCoinsMatrix(eng.coins || []);
 

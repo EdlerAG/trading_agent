@@ -130,6 +130,7 @@ class V58GrandMasterCartridge(IAlphaCartridge):
         asset_bundle: Dict[str, Any],
         online_state: Dict[str, Any],
         news_sentiment: float = 0.0,
+        geo_shock_override: bool = False,
     ) -> Tuple[float, float, float, int, List[float]]:
         """
         Evaluates SOTA ML models or Autonomous Structural V58 fallback for a single asset.
@@ -252,7 +253,7 @@ class V58GrandMasterCartridge(IAlphaCartridge):
         breadth_z = float(last_row.get("cont_breadth_z", last_row.get("cross_dispersion_idx", 0.0)))
         geo_shock = float(last_row.get("geo_shock_idx", last_row.get("geo_macro_shock_z", 0.0)))
 
-        if geo_shock > 1.3 or breadth_z < -1.8 or news_sentiment < -0.65:
+        if geo_shock > 1.3 or breadth_z < -1.8 or news_sentiment < -0.65 or geo_shock_override:
             regime_id = 5  # R5: Geo-Macro Shock
         elif breadth_z < -0.8 and tsmom_96_val < -0.4:
             regime_id = 6  # R6: Bear Cascade
@@ -296,8 +297,12 @@ class V58GrandMasterCartridge(IAlphaCartridge):
         orchestrator_mode: str = "PORTFOLIO_SYNERGY",
         news_sentiment: float = 0.0,
         funding_rates_map: Optional[Dict[str, float]] = None,
+        geo_shock_override: bool = False,
+        coin_bias: Optional[Dict[str, float]] = None,
     ) -> PortfolioTargetDTO:
         btc_close, core_breadth, cont_breadth_z, cross_disp, geo_shock = compute_core_breadth_and_macro(candles_map)
+        if geo_shock_override:
+            geo_shock = pd.Series(np.maximum(geo_shock.values, 2.5), dtype=np.float32)
         latest_breadth = float(core_breadth.iloc[-1]) if len(core_breadth) > 0 else 0.0
         candle_ts = str(candles_map["BTCUSDT"] if "BTCUSDT" in candles_map else next(iter(candles_map.values()))["timestamp"].iloc[-1])
 
@@ -314,6 +319,9 @@ class V58GrandMasterCartridge(IAlphaCartridge):
         for sym in active_syms:
             df_s = candles_map[sym]
             fr_val = fr_map.get(sym)
+            sym_clean = sym.upper().replace("USDT", "")
+            asset_bias = (coin_bias or {}).get(sym_clean, 0.0)
+            asset_sent = float(np.clip(news_sentiment * 0.70 + asset_bias * 0.30, -1.0, 1.0))
             ortho_df, atr_14_ser = compute_v58_features_float32(
                 df=df_s,
                 btc_close=btc_close,
@@ -323,7 +331,7 @@ class V58GrandMasterCartridge(IAlphaCartridge):
                 cross_disp=cross_disp,
                 geo_shock=geo_shock,
                 funding_rate=fr_val,
-                macro_sentiment=news_sentiment,
+                macro_sentiment=asset_sent,
             )
             ortho_df_dict[sym] = ortho_df
             atr_dict[sym] = float(atr_14_ser.iloc[-1])
@@ -368,12 +376,16 @@ class V58GrandMasterCartridge(IAlphaCartridge):
             asset_b = self._assets_dict.get(sym, {})
             onl_s = online_weights.get(sym, {})
 
+            sym_clean = sym.upper().replace("USDT", "")
+            asset_bias = (coin_bias or {}).get(sym_clean, 0.0)
+            asset_sent = float(np.clip(news_sentiment * 0.70 + asset_bias * 0.30, -1.0, 1.0))
             raw_pos, alpha_sc, tb_win, reg_id, subpreds = self._predict_asset_signal(
                 sym=sym,
                 ortho_df=ortho_df,
                 asset_bundle=asset_b,
                 online_state=onl_s,
-                news_sentiment=news_sentiment,
+                news_sentiment=asset_sent,
+                geo_shock_override=geo_shock_override,
             )
 
             # Build 16-dim state vector for Cross-Asset MoE Policy Net
@@ -573,5 +585,6 @@ class V58GrandMasterCartridge(IAlphaCartridge):
                 "optimal_ensemble": "[3, 6, 7, 9, 11, 12]",
                 "regime_top": coin_calc[top_leader]["regime_id"] if top_leader in coin_calc else 1,
                 "orchestrator_mode": orchestrator_mode,
+                "geo_shock_active": geo_shock_override,
             },
         )

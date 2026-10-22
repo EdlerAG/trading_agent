@@ -81,6 +81,10 @@ class IExchangeGateway(IService):
         """Повертає 15m свічки з Ring-Buffer кешем (довантажуючи лише нові бари)."""
 
     @abstractmethod
+    async def fetch_funding_rates(self, symbols: Tuple[str, ...]) -> Dict[str, float]:
+        """Отримує актуальні ставки фінансування (funding rates) для переліку символів."""
+
+    @abstractmethod
     async def execute_smart_rebalance_order(
         self,
         symbol: str,

@@ -263,9 +263,18 @@ class MultiAssetExecutionOrchestrator(IService):
         if await self._check_daily_circuit_breaker(total_equity):
             return
 
-        # 3. Оцінка новинного фону Gemini AI та фандінгу
-        news_score = await self._news.get_sentiment_score()
+        # 3. Оцінка новинного фону Gemini AI (Macro + Per-Asset Bias + Geo-Macro Shock) та фандінгу
+        news_intel = await self._news.fetch_market_intelligence()
+        news_score = float(news_intel.get("macro_sentiment", 0.0))
+        geo_shock_active = bool(news_intel.get("is_geo_shock", False))
+        coin_bias_map = news_intel.get("coin_bias", {})
         funding_rates_map = await self._exchange.fetch_funding_rates(active_syms)
+
+        if geo_shock_active:
+            self._logger.warning(
+                f"🚨 [R5: GEO-MACRO SHOCK] Активовано екстрений захист від системного шоку! "
+                f"(geo_shock_prob={self._news.geo_shock_prob:.2f})"
+            )
 
         # 4. Запуск ШІ-картриджа для розрахунку цільового портфеля
         online_states = self._learner.get_all_learning_states()
@@ -278,6 +287,8 @@ class MultiAssetExecutionOrchestrator(IService):
             self._state.orchestrator_mode,
             news_score,
             funding_rates_map,
+            geo_shock_active,
+            coin_bias_map,
         )
 
         # Синхронізація лімітів та налаштувань монет через Currency Governor
@@ -541,6 +552,8 @@ class MultiAssetExecutionOrchestrator(IService):
             "net_leverage": portfolio_dto.net_leverage,
             "market_breadth": portfolio_dto.market_breadth,
             "news_sentiment": portfolio_dto.news_sentiment,
+            "geo_shock_active": geo_shock_active,
+            "geo_shock_prob": self._news.geo_shock_prob,
             "active_coins_count": active_coins_cnt,
             "top_leader": portfolio_dto.extra_telemetry.get("top_leader", "BTCUSDT"),
             "coin_prices": coin_prices,

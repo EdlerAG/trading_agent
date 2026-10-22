@@ -261,11 +261,13 @@ class TelegramBotService(IService):
     def _build_radar_text(self) -> str:
         radar = self._state.get_coins_radar_list()
         t = self._state.latest_telemetry
+        geo_status = "🚨 АКТИВОВАНО" if t.get("geo_shock_active") else "Нормальний"
         lines = [
-            f"🧬 <b>РАДАР 5 МЕЙДЖОРІВ V58.0 PURE SOTA</b>",
+            f"🧬 <b>РАДАР СВАРМУ МОНЕТ V58.0 PURE SOTA</b>",
             f"═══════════════════════",
             f"• <b>Ширина ринку (Breadth):</b> <code>{t.get('market_breadth', 0.0):+.2f}</code>",
             f"• <b>Новинний сентимент Gemini:</b> <code>{t.get('news_sentiment', 0.0):+.2f}</code>",
+            f"• <b>Гео-шок захист R5:</b> <code>{geo_status}</code>",
             f"───────────────────────",
         ]
         for c in radar:
