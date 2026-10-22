@@ -315,6 +315,12 @@ class MultiAssetExecutionOrchestrator(IService):
                     pnl_est = 0.0
                 note_str = f"V58 Phase {target_dto.phase} ({desired_w:+.2f}x | MWU:{c_st.mwu_trust:.2f}x)"
 
+            if reduce_only or is_closing_to_cash or is_flip:
+                await self._exchange.cancel_symbol_orders(sym)
+
+            if reduce_only or is_closing_to_cash or is_flip:
+                await self._exchange.cancel_symbol_orders(sym)
+
             ord_dto = await self._exchange.execute_smart_rebalance_order(
                 symbol=sym,
                 delta_qty=delta_qty,

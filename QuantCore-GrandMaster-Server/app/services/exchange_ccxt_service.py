@@ -350,9 +350,7 @@ class ExchangeCcxtService(IExchangeGateway):
                 )
             except Exception as e:
                 err_s = str(e)
-                if "-2022" in err_s or "ReduceOnly" in err_s:
-                    self._logger.info(f"ℹ️ [{clean_sym}] Позиція вже закрита на біржі (-2022 ReduceOnly).")
-                    return None
+                self._logger.debug(f"Maker limit order skipped for {clean_sym}: {err_s}")
                 maker_order = None
 
             filled = False
@@ -407,9 +405,18 @@ class ExchangeCcxtService(IExchangeGateway):
                     except Exception as e:
                         err_s = str(e)
                         if "-2022" in err_s or "ReduceOnly" in err_s:
-                            self._logger.info(f"ℹ️ [{clean_sym}] Позиція вже закрита на біржі (-2022 ReduceOnly).")
-                            return None
-                        raise e
+                            try:
+                                m_ord = self._exchange.create_market_order(ccxt_sym, side, m_qty)
+                                if m_ord and isinstance(m_ord, dict):
+                                    market_filled = float(m_ord.get("filled") or m_qty)
+                                    market_price = float(m_ord.get("average") or m_ord.get("price") or est_price)
+                                    fee_cost += float((m_ord.get("fee") or {}).get("cost") or (market_filled * market_price * 0.0005))
+                                    order_id = m_ord.get("id")
+                            except Exception as e2:
+                                self._logger.info(f"ℹ️ [{clean_sym}] Позиція вже закрита на біржі: {e2}")
+                                return None
+                        else:
+                            raise e
 
             tot_qty = maker_filled + market_filled
             if tot_qty <= 0.0:
