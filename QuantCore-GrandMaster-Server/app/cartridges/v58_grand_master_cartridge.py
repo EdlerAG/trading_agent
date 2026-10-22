@@ -4,9 +4,9 @@ Implements IAlphaCartridge contract with:
 - 55 orthogonal features.
 - Cross-Asset Attention 4-Expert MoE Policy Network (NumPy Float32 zero-latency).
 - 6 Cognitive Market Regimes (R1..R6).
-- Active 6-Pillar Ensemble [3, 6, 7, 9, 11, 12].
+- Active 12-Pillar Ensemble [3, 6, 7, 9, 11, 12] with Chamber A & Chamber B (R4 OU Harvester).
 - Intra-Candle ATR Stop-Loss (1.35 ATR) & Sub-Candle MFE Limit Harvester (+1.35 ATR).
-- Selective Alpha Gate (prioritizes high-Sharpe rockets, quarantines toxic coins).
+- Dynamic In-Sample Quality Multipliers (Zero Hardcoding).
 """
 import math
 from typing import Dict, Any, Tuple, List, Optional
@@ -20,10 +20,6 @@ from app.cartridges.feature_pipe_v58 import (
     compute_core_breadth_and_macro,
     compute_v58_features_float32,
 )
-
-# High-conviction rocket coins vs quarantined coins
-ROCKET_SYMBOLS = {"SOLUSDT", "NEARUSDT", "SUIUSDT", "LINKUSDT", "AVAXUSDT", "BTCUSDT"}
-QUARANTINE_SYMBOLS = {"FETUSDT", "BNBUSDT"}
 
 
 def _softmax_np(x: np.ndarray, axis: int = -1) -> np.ndarray:
@@ -193,8 +189,34 @@ class V58GrandMasterCartridge(IAlphaCartridge):
             ps = float(models.get("ps_h", 1.0))
             ml_sig = math.tanh(((pred_ens - pm) / (ps + 1e-8)) * 0.70)
 
+            # Tactical Models Integration (Colab Cell 4 exact _sig_scale)
+            if "multi_tactical_ridge" in models:
+                multi_r = models["multi_tactical_ridge"]
+                p_tact = multi_r.predict(X_scaled)  # shape [1, 7]
+                s6_n = float(math.tanh(p_tact[0, 1] * 0.70))
+                s6_p_comb = float(p_tact[0, 2])
+                if "v51_fast24_hgb" in models and models["v51_fast24_hgb"] is not None:
+                    gb24_p = float(models["v51_fast24_hgb"].predict(X_scaled)[0])
+                    s6_p_comb = 0.48 * s6_p_comb + 0.52 * gb24_p
+                s6_p = float(math.tanh(s6_p_comb * 0.70))
+
+                s24_n = float(math.tanh(p_tact[0, 4] * 0.70))
+                s24_p_comb = float(p_tact[0, 5])
+                if "v51_swing96_hgb" in models and models["v51_swing96_hgb"] is not None:
+                    gb96_p = float(models["v51_swing96_hgb"].predict(X_scaled)[0])
+                    s24_p_comb = 0.48 * s24_p_comb + 0.52 * gb96_p
+                s24_p = float(math.tanh(s24_p_comb * 0.70))
+
+                fast_ml = 0.45 * s6_n + 0.55 * s6_p
+                swing_ml = 0.45 * s24_n + 0.55 * s24_p
+                ml_sig = 0.40 * ml_sig + 0.35 * fast_ml + 0.25 * swing_ml
+
             if "meta_win_calibrator" in models:
                 tb_win = float(np.clip(models["meta_win_calibrator"].predict(X_scaled)[0], 0.20, 0.88))
+            if "meta_short_calibrator" in models:
+                tb_short = float(np.clip(models["meta_short_calibrator"].predict(X_scaled)[0], 0.20, 0.88))
+                if tb_short > 0.58 and ml_sig < 0.0:
+                    ml_sig = min(ml_sig, -0.45)
         else:
             # Autonomous Structural SOTA Kinematic Fallback
             tsmom_24 = float(last_row.get("tsmom_24", 0.0))
@@ -273,6 +295,7 @@ class V58GrandMasterCartridge(IAlphaCartridge):
         max_portfolio_lev: float,
         orchestrator_mode: str = "PORTFOLIO_SYNERGY",
         news_sentiment: float = 0.0,
+        funding_rates_map: Optional[Dict[str, float]] = None,
     ) -> PortfolioTargetDTO:
         btc_close, core_breadth, cont_breadth_z, cross_disp, geo_shock = compute_core_breadth_and_macro(candles_map)
         latest_breadth = float(core_breadth.iloc[-1]) if len(core_breadth) > 0 else 0.0
@@ -281,13 +304,16 @@ class V58GrandMasterCartridge(IAlphaCartridge):
         eth_df = candles_map.get("ETHUSDT")
         eth_close = eth_df["close"].astype(float).reset_index(drop=True) if eth_df is not None else btc_close
 
-        coin_calc: Dict[str, Dict[str, Any]] = {}
         active_syms = [s for s in self._symbols if s in candles_map and len(candles_map[s]) >= 200]
+        fr_map = funding_rates_map or {}
 
-        # 1. Feature extraction & Asset Level Evaluation
-        state_features_list = []
+        # 1. Feature extraction per coin with funding rates and news sentiment
+        ortho_df_dict: Dict[str, pd.DataFrame] = {}
+        atr_dict: Dict[str, float] = {}
+
         for sym in active_syms:
             df_s = candles_map[sym]
+            fr_val = fr_map.get(sym)
             ortho_df, atr_14_ser = compute_v58_features_float32(
                 df=df_s,
                 btc_close=btc_close,
@@ -296,9 +322,48 @@ class V58GrandMasterCartridge(IAlphaCartridge):
                 cont_breadth_z=cont_breadth_z,
                 cross_disp=cross_disp,
                 geo_shock=geo_shock,
+                funding_rate=fr_val,
+                macro_sentiment=news_sentiment,
             )
-            c_now = float(df_s["close"].iloc[-1])
-            atr_now = float(atr_14_ser.iloc[-1])
+            ortho_df_dict[sym] = ortho_df
+            atr_dict[sym] = float(atr_14_ser.iloc[-1])
+
+        # 2. Cross-Sectional Attention Ranks (Exact Colab Cell 3 math)
+        if len(active_syms) >= 2:
+            mom_mat_all = np.vstack([
+                0.40 * ortho_df_dict[s]["tsmom_96"].values +
+                0.35 * ortho_df_dict[s]["kalman_vel_z"].values +
+                0.25 * ortho_df_dict[s]["elastic_clock_mom"].values
+                for s in active_syms
+            ])
+            flow_mat_all = np.vstack([
+                ortho_df_dict[s]["quote_flow_imb_64"].values +
+                0.50 * ortho_df_dict[s]["hawkes_cascade_z"].values
+                for s in active_syms
+            ])
+
+            mom_cs_med = np.median(mom_mat_all, axis=0, keepdims=True)
+            mom_cs_mad = np.median(np.abs(mom_mat_all - mom_cs_med), axis=0, keepdims=True) * 1.4826 + 1e-5
+            mom_cs_std = 0.60 * mom_cs_mad + 0.40 * (np.std(mom_mat_all, axis=0, keepdims=True) + 1e-5)
+            cs_mom_z_mat = np.tanh((mom_mat_all - mom_cs_med) / mom_cs_std)
+
+            flow_cs_med = np.median(flow_mat_all, axis=0, keepdims=True)
+            flow_cs_mad = np.median(np.abs(flow_mat_all - flow_cs_med), axis=0, keepdims=True) * 1.4826 + 1e-5
+            flow_cs_std = 0.60 * flow_cs_mad + 0.40 * (np.std(flow_mat_all, axis=0, keepdims=True) + 1e-5)
+            cs_flow_z_mat = np.tanh((flow_mat_all - flow_cs_med) / flow_cs_std)
+
+            for idx, sym in enumerate(active_syms):
+                ortho_df_dict[sym]["cs_momentum_z"] = cs_mom_z_mat[idx].astype(np.float32)
+                ortho_df_dict[sym]["cs_orderflow_z"] = cs_flow_z_mat[idx].astype(np.float32)
+
+        # 3. Asset-Level Evaluation with true cross-sectional inputs
+        coin_calc: Dict[str, Dict[str, Any]] = {}
+        state_features_list = []
+
+        for sym in active_syms:
+            ortho_df = ortho_df_dict[sym]
+            c_now = float(candles_map[sym]["close"].iloc[-1])
+            atr_now = atr_dict[sym]
 
             asset_b = self._assets_dict.get(sym, {})
             onl_s = online_weights.get(sym, {})
@@ -326,17 +391,19 @@ class V58GrandMasterCartridge(IAlphaCartridge):
                 float(ortho_df["rs_vs_btc_96"].iloc[-1]),
                 float(ortho_df["kalman_vel_z"].iloc[-1]),
                 float(ortho_df["ehlers_roof_osc"].iloc[-1]),
-                float(ortho_df.get("vpin_toxicity_z", ortho_df.get("vpin_toxicity", pd.Series([0.0]))).iloc[-1]),
+                float(ortho_df.get("vpin_toxicity_z", pd.Series([0.0])).iloc[-1]),
                 float(alpha_sc),
                 float(raw_pos),
             ], dtype=np.float32)
             state_features_list.append(row16)
 
+            # Dynamic In-Sample Quality Multipliers (from .joblib, zero hardcoding)
             q_mult = float(self._insample_q_multipliers.get(sym, 1.0))
-            if sym in ROCKET_SYMBOLS:
-                q_mult = max(q_mult, 1.15)
-            elif sym in QUARANTINE_SYMBOLS:
-                q_mult = min(q_mult, 0.22)
+
+            # Pillar 11: Cornish-Fisher Tail-Parity Modulation
+            sortino_asym = float(ortho_df["sortino_asymmetry"].iloc[-1])
+            vpin_tox = float(ortho_df.get("vpin_toxicity_z", pd.Series([0.0])).iloc[-1])
+            cf_risk_mult = float(np.clip(1.0 + 0.18 * sortino_asym - 0.12 * vpin_tox, 0.75, 1.30))
 
             coin_calc[sym] = {
                 "price": c_now,
@@ -346,11 +413,12 @@ class V58GrandMasterCartridge(IAlphaCartridge):
                 "tb_win": tb_win,
                 "regime_id": reg_id,
                 "q_mult": q_mult,
+                "cf_risk_mult": cf_risk_mult,
                 "subpreds": subpreds,
                 "eff_rank_score": alpha_sc * q_mult,
             }
 
-        # 2. Cross-Asset Attention MoE Multipliers
+        # 4. Cross-Asset Attention MoE Multipliers
         if state_features_list:
             state_mat = np.vstack(state_features_list)
             neural_multipliers = self._evaluate_neural_moe_policy(state_mat)
@@ -360,34 +428,78 @@ class V58GrandMasterCartridge(IAlphaCartridge):
             for sym in active_syms:
                 coin_calc[sym]["neural_mult"] = 1.0
 
-        # 3. Dynamic Top-3 Sticky Allocation + Active Ensemble Pillars [3, 6, 7, 9, 11, 12]
-        # Rank by absolute directional conviction so both top longs AND top shorts get capital
+        # 5. Dynamic Chamber A / Chamber B Allocation (Optimal Flags [3, 6, 7, 9, 11, 12])
         ranked_syms = sorted(
             coin_calc.keys(), key=lambda s: abs(coin_calc[s]["eff_rank_score"]), reverse=True
         )
-        top3_set = set(ranked_syms[:3])
         raw_weights: Dict[str, float] = {s: 0.0 for s in coin_calc}
 
-        for rank_i, sym in enumerate(ranked_syms):
+        f2_dual_vault = bool(self._optimal_flags[1])
+        f6_lead_lag = bool(self._optimal_flags[5])
+        f10_predator = bool(self._optimal_flags[9])
+        f11_hot_streak = bool(self._optimal_flags[10])
+
+        chamber_a_allocated = 0.0
+        lev_scale = max(0.5, min(1.85, max_portfolio_lev / 2.0))
+
+        # --- Chamber A: High-Conviction Directional Winners (Top-1 & Top-2) ---
+        for rank_i in range(min(2, len(ranked_syms))):
+            sym = ranked_syms[rank_i]
             d = coin_calc[sym]
             pos_now = d["raw_pos"]
             q_mult = d["q_mult"]
             n_mult = d["neural_mult"]
+            cf_mult = d["cf_risk_mult"] if f11_hot_streak else 1.0
 
-            # Selective Alpha Gate: restrict quarantined coins in longs
-            if sym in QUARANTINE_SYMBOLS and pos_now > 0:
-                pos_now *= 0.22
+            if abs(pos_now) >= 0.03 and q_mult >= 0.35:
+                conv_boost = 1.45 if rank_i == 0 else 1.25
+                if f10_predator and abs(d["alpha_score"]) > 0.40:
+                    conv_boost *= 1.10
 
-            # Pillar 3: Slot Hysteresis & Conviction Bonus for Top-3
-            if rank_i in (0, 1, 2) and q_mult >= 0.50 and abs(pos_now) >= 0.03:
-                conv_boost = 1.40 if rank_i == 0 else (1.24 if rank_i == 1 else 1.12)
-                lev_scale = max(0.5, min(1.85, max_portfolio_lev / 2.0))
-                # Pillar 11: House-Money / Neural multiplier with dynamic leverage scaling
-                w_s = pos_now * (0.54 * lev_scale) * q_mult * conv_boost * n_mult
-                raw_weights[sym] = w_s
+                w_a = pos_now * (0.54 * lev_scale) * q_mult * conv_boost * n_mult * cf_mult
+                raw_weights[sym] = float(w_a)
+                chamber_a_allocated += abs(w_a)
+
+        # --- Chamber B: R4 OU-Zone Mean-Reversion Harvester (Flag 2) ---
+        chamber_b_target_cap = max(0.0, max_portfolio_lev - chamber_a_allocated - 0.20)
+        if f2_dual_vault and chamber_b_target_cap > 0.30:
+            best_ou_sym = None
+            best_ou_sc = -999.0
+
+            for sym in ranked_syms:
+                if raw_weights[sym] != 0.0:
+                    continue
+                d = coin_calc[sym]
+                if d["regime_id"] == 4 and abs(d["alpha_score"]) > 0.08:
+                    ou_sc = abs(d["alpha_score"]) * d["q_mult"]
+                    if ou_sc > best_ou_sc:
+                        best_ou_sc = ou_sc
+                        best_ou_sym = sym
+
+            if best_ou_sym is not None and best_ou_sc > 0.10:
+                d_ou = coin_calc[best_ou_sym]
+                ou_w = np.clip(
+                    d_ou["raw_pos"] * 0.45 * lev_scale * d_ou["q_mult"],
+                    -chamber_b_target_cap,
+                    chamber_b_target_cap,
+                )
+                raw_weights[best_ou_sym] = float(ou_w)
+
+        # Chamber C / Slot 3: Directional Third Runner (if Chamber B not utilized)
+        if len(ranked_syms) > 2 and raw_weights[ranked_syms[2]] == 0.0:
+            sym3 = ranked_syms[2]
+            d3 = coin_calc[sym3]
+            rem_cap = max(0.0, max_portfolio_lev - sum(abs(w) for w in raw_weights.values()))
+            if rem_cap > 0.35 and abs(d3["raw_pos"]) >= 0.03 and d3["q_mult"] >= 0.35:
+                w3 = np.clip(
+                    d3["raw_pos"] * (0.45 * lev_scale) * d3["q_mult"] * d3["neural_mult"],
+                    -rem_cap,
+                    rem_cap,
+                )
+                raw_weights[sym3] = float(w3)
 
         # Pillar 6: Lead-Lag Relay (if BTC is surging, boost ETH/SOL)
-        if self._optimal_flags[5] and "BTCUSDT" in coin_calc and coin_calc["BTCUSDT"]["alpha_score"] > 0.25:
+        if f6_lead_lag and "BTCUSDT" in coin_calc and coin_calc["BTCUSDT"]["alpha_score"] > 0.25:
             for alt in ("SOLUSDT", "NEARUSDT", "ETHUSDT"):
                 if alt in raw_weights and raw_weights[alt] > 0:
                     raw_weights[alt] *= 1.12
@@ -400,7 +512,7 @@ class V58GrandMasterCartridge(IAlphaCartridge):
                 raw_weights[s] *= scale_fac
             tot_abs = max_portfolio_lev
 
-        # 4. Intra-Candle ATR Stop-Loss & Sub-Candle MFE Harvester Prices
+        # 6. Intra-Candle ATR Stop-Loss & Sub-Candle MFE Harvester Prices
         targets_out: Dict[str, CoinTargetDTO] = {}
         gross_lev = 0.0
         net_lev = 0.0

@@ -182,12 +182,15 @@ class StateService(IService):
             if datetime.now(timezone.utc) >= self.pause_until:
                 self.is_paused = False
                 self.pause_until = None
+                self.daily_starting_equity = 0.0
                 self.save_snapshot()
                 return True
         return False
 
     def set_pause_state(self, paused: bool, hours: Optional[float] = None) -> Dict[str, Any]:
         self.is_paused = bool(paused)
+        if not self.is_paused:
+            self.daily_starting_equity = 0.0
         if self.is_paused and hours and hours > 0:
             self.pause_until = datetime.now(timezone.utc) + timedelta(hours=float(hours))
         else:

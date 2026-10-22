@@ -108,12 +108,14 @@ class MultiAssetExecutionOrchestrator(IService):
         if start_eq > 0:
             dd = (start_eq - total_equity) / start_eq
             if dd >= settings.MAX_DAILY_LOSS_PCT and not self._state.is_paused:
-                self._state.set_pause_state(paused=True, hours=24.0)
+                # Адаптивний 2-годинний кулдаун замість 24h повної зупинки
+                self._state.set_pause_state(paused=True, hours=2.0)
                 await self.emergency_close_all_positions()
                 msg = (
                     f"🛑 <b>CIRCUIT BREAKER АКТИВОВАНО!</b>\n\n"
                     f"• Просадка доби: <b>{dd:.2%}</b> (ліміт: {settings.MAX_DAILY_LOSS_PCT:.0%})\n"
-                    f"• Усі позиції закрито в USDT, торгівлю призупинено на 24 години."
+                    f"• Позиції закрито в кеш для зняття пікового ризику.\n"
+                    f"• Автоматичне відновлення через <b>2 години</b> (або введіть /resume у будь-який момент)."
                 )
                 await self._send_alert(msg)
                 return True
@@ -242,8 +244,9 @@ class MultiAssetExecutionOrchestrator(IService):
         if await self._check_daily_circuit_breaker(total_equity):
             return
 
-        # 3. Оцінка новинного фону Gemini AI
+        # 3. Оцінка новинного фону Gemini AI та фандінгу
         news_score = await self._news.get_sentiment_score()
+        funding_rates_map = await self._exchange.fetch_funding_rates(active_syms)
 
         # 4. Запуск ШІ-картриджа для розрахунку цільового портфеля
         online_states = self._learner.get_all_learning_states()
@@ -255,6 +258,7 @@ class MultiAssetExecutionOrchestrator(IService):
             self._state.max_portfolio_lev,
             self._state.orchestrator_mode,
             news_score,
+            funding_rates_map,
         )
 
         # Синхронізація лімітів та налаштувань монет через Currency Governor

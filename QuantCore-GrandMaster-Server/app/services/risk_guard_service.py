@@ -60,7 +60,7 @@ class RiskGuardService(IService):
         if start_eq > 0:
             dd = (start_eq - total_equity) / start_eq
             if dd >= settings.MAX_DAILY_LOSS_PCT and not self._state.is_paused:
-                self._state.set_pause_state(paused=True, hours=24.0)
+                self._state.set_pause_state(paused=True, hours=2.0)
                 if self._orchestrator is not None:
                     await self._orchestrator.emergency_close_all_positions()
                 return True

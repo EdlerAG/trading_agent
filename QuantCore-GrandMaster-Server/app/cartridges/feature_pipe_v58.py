@@ -5,7 +5,7 @@ Designed for sub-50ms real-time execution on 15m Binance Futures candles.
 Fully aligned with QuantCore V58 / V53 Quantum Leap production models.
 """
 import math
-from typing import Dict, Tuple, List
+from typing import Dict, Tuple, List, Optional
 import numpy as np
 import pandas as pd
 
@@ -48,8 +48,12 @@ def _wilder_rsi(close: pd.Series, window: int) -> pd.Series:
     return (100.0 - (100.0 / (1.0 + rs))).fillna(50.0)
 
 
-def bi_sym_log_modulus(arr: np.ndarray, scale: float = 3.0, hard_cap: float = 6.0) -> np.ndarray:
-    return np.clip(np.sign(arr) * np.log1p(np.abs(arr) * scale), -hard_cap, hard_cap).astype(np.float32)
+def bi_sym_log_modulus(arr: np.ndarray, scale: float = 2.5, hard_cap: float = 6.0) -> np.ndarray:
+    x = np.asarray(arr, dtype=np.float64)
+    x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    av = np.abs(x)
+    res = np.where(av <= scale, x, np.sign(x) * (scale + np.log1p(np.maximum(0.0, av - scale))))
+    return np.clip(res, -hard_cap, hard_cap).astype(np.float32)
 
 
 def compute_yang_zhang_volatility(
@@ -368,6 +372,8 @@ def compute_v58_features_float32(
     cont_breadth_z: pd.Series,
     cross_disp: pd.Series,
     geo_shock: pd.Series,
+    funding_rate: Optional[float] = None,
+    macro_sentiment: Optional[float] = None,
 ) -> Tuple[pd.DataFrame, pd.Series]:
     """
     Computes all 55 SOTA orthogonal features for a single coin in pure Float32.
@@ -384,7 +390,12 @@ def compute_v58_features_float32(
     tb = df["taker_base"].astype(float).reset_index(drop=True) if "taker_base" in df.columns else (v * 0.5)
     qv = df["quote_volume"].astype(float).reset_index(drop=True) if "quote_volume" in df.columns else (c * v)
     tq = df["taker_quote"].astype(float).reset_index(drop=True) if "taker_quote" in df.columns else (c * tb)
-    fr = df["funding_rate"].astype(float).reset_index(drop=True) if "funding_rate" in df.columns else pd.Series(np.full(n, 0.0001, dtype=np.float32))
+    if "funding_rate" in df.columns:
+        fr = df["funding_rate"].astype(float).reset_index(drop=True)
+    elif funding_rate is not None:
+        fr = pd.Series(np.full(n, float(funding_rate), dtype=np.float32))
+    else:
+        fr = pd.Series(np.full(n, 0.0001, dtype=np.float32))
 
     o_np = o.values
     h_np = h.values
@@ -438,7 +449,7 @@ def compute_v58_features_float32(
     # 6. Z-Score, RSI, VWAP, Vol Surge
     std_96 = c.rolling(96, min_periods=16).std().replace(0, np.nan).bfill()
     f["zscore_96"] = np.clip((c - ema_96) / std_96, -4.0, 4.0).fillna(0.0).values
-    f["rsi_14"] = ((_wilder_rsi(c, 14) - 50.0) / 25.0).fillna(0.0).values
+    f["rsi_14"] = ((_wilder_rsi(c, 14) - 50.0) / 50.0).fillna(0.0).values
 
     cum_vol_96 = v.rolling(96, min_periods=16).sum().replace(0, np.nan)
     cum_pv_96 = (c * v).rolling(96, min_periods=16).sum()
@@ -446,11 +457,12 @@ def compute_v58_features_float32(
     f["dist_vwap_96"] = np.clip((c - vwap_96) / safe_atr96, -4.5, 4.5).fillna(0.0).values
     f["vol_surge"] = np.clip(vol_surge.values, -1.0, 5.0)
 
-    # 7. Taker Orderflow Imbalance
+    # 7. Taker Orderflow Imbalance (Colab Cell 3 Exact)
     for w in (32, 96):
         t_buy = tb.rolling(w, min_periods=8).sum()
         t_tot = v.rolling(w, min_periods=8).sum().replace(0, np.nan)
-        f[f"taker_imb_{w}"] = np.clip((2.0 * (t_buy / t_tot) - 1.0).fillna(0.0), -1.0, 1.0).values
+        ratio = (t_buy / t_tot).fillna(0.5)
+        f[f"taker_imb_{w}"] = np.clip((ratio - 0.5) * 4.0, -1.0, 1.0).values.astype(np.float32)
 
     # 8. Lead-Lag & Relative Strength vs BTC
     if len(btc_close) >= n:
@@ -568,7 +580,10 @@ def compute_v58_features_float32(
     f["cross_dispersion_idx"] = cross_disp.iloc[-n:].values.astype(np.float32) if len(cross_disp) >= n else np.zeros(n, dtype=np.float32)
     f["cont_breadth_z"] = cont_breadth_z.iloc[-n:].values.astype(np.float32) if len(cont_breadth_z) >= n else np.zeros(n, dtype=np.float32)
     f["geo_shock_idx"] = geo_shock.iloc[-n:].values.astype(np.float32) if len(geo_shock) >= n else np.zeros(n, dtype=np.float32)
-    f["macro_fng_idx"] = np.zeros(n, dtype=np.float32)
+    fng_val = float(macro_sentiment) if macro_sentiment is not None else (
+        float(df["macro_fng_idx"].iloc[-1]) if "macro_fng_idx" in df.columns else 0.0
+    )
+    f["macro_fng_idx"] = np.full(n, fng_val, dtype=np.float32)
 
     # CS Momentum & CS Orderflow (local approximation for standalone asset, updated in cross-sectional pass)
     f["cs_momentum_z"] = np.tanh(f["tsmom_96"] * 0.5 + f["kalman_vel_z"] * 0.3).astype(np.float32)
