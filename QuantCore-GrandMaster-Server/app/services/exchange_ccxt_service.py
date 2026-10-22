@@ -1,7 +1,7 @@
 import time
 import asyncio
 import logging
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Any, List
 import ccxt
 import pandas as pd
 
@@ -140,7 +140,7 @@ class ExchangeCcxtService(IExchangeGateway):
                 order_id=str(last_order_id or ""),
                 pnl=tot_pnl,
                 fee=tot_fee,
-                note="STOP_LOSS_EXCHANGE",
+                note="MFE_HARVESTER_TP" if tot_pnl >= 0.0 else "STOP_LOSS_EXCHANGE",
             )
             return tot_qty, avg_price, tot_pnl
         except Exception as e:
@@ -338,9 +338,12 @@ class ExchangeCcxtService(IExchangeGateway):
             return None
 
         try:
-            ob = self._exchange.fetch_order_book(ccxt_sym, limit=5)
-            best_bid = float(ob["bids"][0][0]) if ob.get("bids") else mark_price
-            best_ask = float(ob["asks"][0][0]) if ob.get("asks") else mark_price
+            # 1. Глибина стакана та перевірка спреду (limit=20)
+            ob = self._exchange.fetch_order_book(ccxt_sym, limit=20)
+            bids = ob.get("bids") or []
+            asks = ob.get("asks") or []
+            best_bid = float(bids[0][0]) if bids else mark_price
+            best_ask = float(asks[0][0]) if asks else mark_price
             spread_pct = (best_ask - best_bid) / max(1e-8, best_bid)
 
             if not reduce_only and spread_pct > settings.MAX_ALLOWED_SPREAD_PCT:
@@ -351,104 +354,149 @@ class ExchangeCcxtService(IExchangeGateway):
             if (amount * est_price) < min_notional and not reduce_only:
                 return None
 
-            limit_price = self.safe_price(clean_sym, best_bid if side == "buy" else best_ask)
-            params = {"postOnly": True}
-            if reduce_only:
-                params["reduceOnly"] = True
+            # 2. Перевірка 30% ліквідності перших 3 рівнів стакана (TWAP-lite)
+            target_depth = asks[:3] if side == "buy" else bids[:3]
+            top3_liquidity = sum(float(lvl[1]) for lvl in target_depth if len(lvl) >= 2)
 
-            maker_order = None
-            try:
-                maker_order = self._exchange.create_order(
-                    symbol=ccxt_sym,
-                    type="limit",
-                    side=side,
-                    amount=amount,
-                    price=limit_price,
-                    params=params,
-                )
-            except Exception as e:
-                err_s = str(e)
-                self._logger.debug(f"Maker limit order skipped for {clean_sym}: {err_s}")
-                maker_order = None
+            tranches = [amount]
+            if top3_liquidity > 0 and amount > (0.30 * top3_liquidity):
+                t1 = self.safe_amount(clean_sym, amount * 0.5)
+                t2 = self.safe_amount(clean_sym, amount - t1)
+                if t1 >= min_qty and t2 >= min_qty:
+                    tranches = [t1, t2]
+                    self._logger.info(
+                        f"📊 [{clean_sym}] TWAP-lite: обсяг {amount} > 30% топ-3 стакана ({top3_liquidity:.2f}). "
+                        f"Розбито на 2 транші: {t1} та {t2} (інтервал 2с)."
+                    )
 
-            filled = False
-            maker_filled = 0.0
-            maker_price = limit_price
-            fee_cost = 0.0
-            order_id = None
+            total_maker_filled = 0.0
+            total_market_filled = 0.0
+            total_cost = 0.0
+            total_fee = 0.0
+            last_order_id = ""
 
-            if maker_order and isinstance(maker_order, dict) and "id" in maker_order:
-                order_id = maker_order["id"]
-                t0 = time.time()
-                while (time.time() - t0) < settings.MAKER_TIMEOUT_SEC:
-                    time.sleep(1.5)
-                    chk = self._exchange.fetch_order(order_id, ccxt_sym)
-                    if chk and isinstance(chk, dict) and chk.get("status") == "closed":
-                        filled = True
-                        maker_filled = float(chk.get("filled") or amount)
-                        maker_price = float(chk.get("average") or chk.get("price") or limit_price)
-                        fee_cost = float((chk.get("fee") or {}).get("cost") or (maker_filled * maker_price * 0.0002))
+            for t_idx, tranche_qty in enumerate(tranches):
+                if t_idx > 0:
+                    time.sleep(2.0)  # TWAP-lite інтервал 2 с між траншами
+
+                t_rem = tranche_qty
+                # 3. Адаптивний 2-ітераційний BBO Chaser (2 x 4.5 с = 9 с)
+                for iteration in (1, 2):
+                    if t_rem < min_qty:
                         break
 
-                if not filled:
-                    try:
-                        self._exchange.cancel_order(order_id, ccxt_sym)
-                    except Exception:
-                        pass
-                    try:
-                        canceled = self._exchange.fetch_order(order_id, ccxt_sym)
-                        if canceled and isinstance(canceled, dict):
-                            maker_filled = float(canceled.get("filled") or 0.0)
-                            if maker_filled > 0:
-                                maker_price = float(canceled.get("average") or canceled.get("price") or limit_price)
-                                fee_cost += float((canceled.get("fee") or {}).get("cost") or (maker_filled * maker_price * 0.0002))
-                    except Exception:
-                        pass
+                    # Отримуємо свіжий BBO перед кожною ітерацією чейзера
+                    cur_ob = self._exchange.fetch_order_book(ccxt_sym, limit=5)
+                    cur_bids = cur_ob.get("bids") or []
+                    cur_asks = cur_ob.get("asks") or []
+                    cur_bid = float(cur_bids[0][0]) if cur_bids else best_bid
+                    cur_ask = float(cur_asks[0][0]) if cur_asks else best_ask
+                    limit_price = self.safe_price(clean_sym, cur_bid if side == "buy" else cur_ask)
 
-            market_filled = 0.0
-            market_price = est_price
+                    params = {"postOnly": True}
+                    if reduce_only:
+                        params["reduceOnly"] = True
 
-            if not filled:
-                rem = max(0.0, amount - maker_filled)
-                m_qty = self.safe_amount(clean_sym, rem)
-                if m_qty >= min_qty and (reduce_only or (m_qty * est_price) >= min_notional):
+                    maker_order = None
+                    try:
+                        maker_order = self._exchange.create_order(
+                            symbol=ccxt_sym,
+                            type="limit",
+                            side=side,
+                            amount=t_rem,
+                            price=limit_price,
+                            params=params,
+                        )
+                    except Exception as e:
+                        self._logger.debug(f"Maker order attempt {iteration} for {clean_sym} skipped: {e}")
+                        maker_order = None
+
+                    if maker_order and isinstance(maker_order, dict) and "id" in maker_order:
+                        order_id = maker_order["id"]
+                        last_order_id = str(order_id)
+                        t0 = time.time()
+                        iter_filled = False
+
+                        # Очікуємо виконання до 4.5 секунд (перевірка кожні 1.0 с)
+                        while (time.time() - t0) < 4.5:
+                            time.sleep(1.0)
+                            chk = self._exchange.fetch_order(order_id, ccxt_sym)
+                            if chk and isinstance(chk, dict) and chk.get("status") == "closed":
+                                f_qty = float(chk.get("filled") or t_rem)
+                                f_price = float(chk.get("average") or chk.get("price") or limit_price)
+                                f_fee = float((chk.get("fee") or {}).get("cost") or (f_qty * f_price * 0.0002))
+                                total_maker_filled += f_qty
+                                total_cost += (f_qty * f_price)
+                                total_fee += f_fee
+                                t_rem = max(0.0, t_rem - f_qty)
+                                iter_filled = True
+                                break
+
+                        if not iter_filled:
+                            # Скасовуємо ордер для перестановки BBO на 2-й ітерації або маркету
+                            try:
+                                self._exchange.cancel_order(order_id, ccxt_sym)
+                            except Exception:
+                                pass
+                            try:
+                                canceled = self._exchange.fetch_order(order_id, ccxt_sym)
+                                if canceled and isinstance(canceled, dict):
+                                    f_qty = float(canceled.get("filled") or 0.0)
+                                    if f_qty > 0:
+                                        f_price = float(canceled.get("average") or canceled.get("price") or limit_price)
+                                        f_fee = float((canceled.get("fee") or {}).get("cost") or (f_qty * f_price * 0.0002))
+                                        total_maker_filled += f_qty
+                                        total_cost += (f_qty * f_price)
+                                        total_fee += f_fee
+                                        t_rem = max(0.0, t_rem - f_qty)
+                            except Exception:
+                                pass
+
+                # 4. Taker Fallback на залишок траншу
+                if t_rem >= min_qty:
+                    m_qty = self.safe_amount(clean_sym, t_rem)
                     m_params = {"reduceOnly": True} if reduce_only else {}
                     try:
                         m_ord = self._exchange.create_market_order(ccxt_sym, side, m_qty, params=m_params)
                         if m_ord and isinstance(m_ord, dict):
-                            market_filled = float(m_ord.get("filled") or m_qty)
-                            market_price = float(m_ord.get("average") or m_ord.get("price") or est_price)
-                            fee_cost += float((m_ord.get("fee") or {}).get("cost") or (market_filled * market_price * 0.0005))
-                            order_id = m_ord.get("id")
+                            f_qty = float(m_ord.get("filled") or m_qty)
+                            f_price = float(m_ord.get("average") or m_ord.get("price") or est_price)
+                            f_fee = float((m_ord.get("fee") or {}).get("cost") or (f_qty * f_price * 0.0005))
+                            total_market_filled += f_qty
+                            total_cost += (f_qty * f_price)
+                            total_fee += f_fee
+                            last_order_id = str(m_ord.get("id") or last_order_id)
                     except Exception as e:
                         err_s = str(e)
                         if "-2022" in err_s or "ReduceOnly" in err_s:
                             try:
                                 m_ord = self._exchange.create_market_order(ccxt_sym, side, m_qty)
                                 if m_ord and isinstance(m_ord, dict):
-                                    market_filled = float(m_ord.get("filled") or m_qty)
-                                    market_price = float(m_ord.get("average") or m_ord.get("price") or est_price)
-                                    fee_cost += float((m_ord.get("fee") or {}).get("cost") or (market_filled * market_price * 0.0005))
-                                    order_id = m_ord.get("id")
+                                    f_qty = float(m_ord.get("filled") or m_qty)
+                                    f_price = float(m_ord.get("average") or m_ord.get("price") or est_price)
+                                    f_fee = float((m_ord.get("fee") or {}).get("cost") or (f_qty * f_price * 0.0005))
+                                    total_market_filled += f_qty
+                                    total_cost += (f_qty * f_price)
+                                    total_fee += f_fee
+                                    last_order_id = str(m_ord.get("id") or last_order_id)
                             except Exception as e2:
                                 self._logger.info(f"ℹ️ [{clean_sym}] Позиція вже закрита на біржі: {e2}")
-                                return None
                         else:
-                            raise e
+                            self._logger.warning(f"⚠️ [{clean_sym}] Taker fallback помилка: {e}")
 
-            tot_qty = maker_filled + market_filled
+            tot_qty = total_maker_filled + total_market_filled
             if tot_qty <= 0.0:
                 return None
 
-            avg_p = ((maker_filled * maker_price) + (market_filled * market_price)) / tot_qty
+            avg_p = total_cost / tot_qty if tot_qty > 0 else est_price
             self._db.record_trade(
                 symbol=clean_sym,
                 side=side,
                 amount=tot_qty,
                 price=avg_p,
-                order_id=order_id,
+                order_id=last_order_id,
                 pnl=realized_pnl_est,
-                fee=fee_cost,
+                fee=total_fee,
                 note=note,
             )
             return OrderExecutionDTO(
@@ -456,9 +504,9 @@ class ExchangeCcxtService(IExchangeGateway):
                 side=side.upper(),
                 executed_qty=tot_qty,
                 avg_price=avg_p,
-                fee_usdt=fee_cost,
+                fee_usdt=total_fee,
                 realized_pnl_est=realized_pnl_est,
-                order_id=str(order_id or ""),
+                order_id=str(last_order_id),
                 note=note,
             )
         except Exception as e:
@@ -597,6 +645,30 @@ class ExchangeCcxtService(IExchangeGateway):
             return str(ord_res.get("id") or "")
         except Exception:
             return None
+
+    async def cancel_all_stink_bids(self, symbols: Optional[Any] = None) -> int:
+        return await asyncio.to_thread(self._cancel_all_stink_bids_sync, symbols)
+
+    def _cancel_all_stink_bids_sync(self, symbols: Optional[Any] = None) -> int:
+        if self._exchange is None:
+            return 0
+        syms_to_check = symbols or list(settings.SUPPORTED_SYMBOLS)
+        canceled_cnt = 0
+        for s in syms_to_check:
+            clean = ccxt_to_symbol(s)
+            ccxt_s = symbol_to_ccxt(clean)
+            try:
+                open_ords = self._exchange.fetch_open_orders(ccxt_s)
+                for o in open_ords:
+                    if str(o.get("type") or "").lower() == "limit":
+                        try:
+                            self._exchange.cancel_order(o["id"], ccxt_s)
+                            canceled_cnt += 1
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        return canceled_cnt
 
     async def cancel_symbol_orders(self, symbol: str) -> bool:
         return await asyncio.to_thread(self._cancel_symbol_orders_sync, symbol)

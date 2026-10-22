@@ -105,7 +105,7 @@ class Settings:
     MAX_ALLOWED_SPREAD_PCT: float = float(os.getenv("MAX_ALLOWED_SPREAD_PCT", "0.0055"))
     MAX_FUNDING_RATE: float = 0.0005
     FUNDING_BUFFER_MINUTES: int = 15
-    MAKER_TIMEOUT_SEC: int = 18
+    MAKER_TIMEOUT_SEC: int = 9
 
     # V58.0 Breakthrough: Intra-Candle ATR Stop-Loss & Sub-Candle MFE Harvester
     EMERGENCY_SL_ATR_MULT: float = 1.35

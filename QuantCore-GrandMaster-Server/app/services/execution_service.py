@@ -179,6 +179,13 @@ class MultiAssetExecutionOrchestrator(IService):
         self._state.active_cartridge = self._cartridges.active_name
         active_syms = cartridge.supported_symbols
 
+        # 0. Гарантоване скасування всіх застарілих пасивних stink-bid ордерів перед новим кроком
+        if hasattr(self._exchange, "cancel_all_stink_bids"):
+            await self._exchange.cancel_all_stink_bids(active_syms)
+        if self._ws_sentinel is not None:
+            self._ws_sentinel.clear_stink_bids()
+
+
         # 1. Високошвидкісне конкурентне завантаження свічок через MarketDataService (<1.5с)
         if self._market_data is not None:
             candles_map = await self._market_data.fetch_synchronized_candles(active_syms, min_bars=200)
@@ -229,11 +236,18 @@ class MultiAssetExecutionOrchestrator(IService):
                     sl_info = await self._exchange.sync_exchange_stop_closure(sym)
                     if sl_info:
                         closed_q, avg_p, r_pnl = sl_info
-                        await self._send_alert(
-                            f"🛡️ <b>[{sym}] Спрацював біржовий Stop-Loss!</b>\n"
-                            f"• Закрито: <code>{closed_q:.4f}</code> @ <code>${avg_p:,.4f}</code>\n"
-                            f"• Фіксований PnL: <b>{r_pnl:+.2f} USDT</b>"
-                        )
+                        if r_pnl >= 0.0:
+                            await self._send_alert(
+                                f"🎯 <b>[{sym}] Фіксація прибутку (Take-Profit / MFE)!</b>\n"
+                                f"• Закрито: <code>{closed_q:.4f}</code> @ <code>${avg_p:,.4f}</code>\n"
+                                f"• Фіксований PnL: <b>+{r_pnl:.2f} USDT</b>"
+                            )
+                        else:
+                            await self._send_alert(
+                                f"🛡️ <b>[{sym}] Спрацював біржовий Stop-Loss!</b>\n"
+                                f"• Закрито: <code>{closed_q:.4f}</code> @ <code>${avg_p:,.4f}</code>\n"
+                                f"• Фіксований PnL: <b>{r_pnl:+.2f} USDT</b>"
+                            )
                 c_st.current_pos_qty = 0.0
                 c_st.entry_price = 0.0
                 c_st.active_sl_price = 0.0
@@ -270,7 +284,7 @@ class MultiAssetExecutionOrchestrator(IService):
         if self._governor is not None:
             portfolio_dto = self._governor.enforce_currency_rules(portfolio_dto)
 
-        # 5. Онлайн-самонавчання + перевірка Breakeven + Виконання ордерів
+        # 5. Двофазна паралельна диспетчеризація ордерів (Фаза А: Звільнення маржі, Фаза Б: Нарощування)
         executed_orders_summary: List[str] = []
         coin_targets_map: Dict[str, float] = {}
         if self._ws_sentinel is not None:
@@ -278,6 +292,97 @@ class MultiAssetExecutionOrchestrator(IService):
             self._ws_sentinel.update_symbol_atrs(
                 {s: t.atr_14 for s, t in portfolio_dto.targets.items() if t.atr_14 > 0}
             )
+
+        async def _execute_single_order_plan(plan: Dict[str, Any]) -> Optional[str]:
+            sym = plan["sym"]
+            delta_qty = plan["delta_qty"]
+            cur_p = plan["cur_p"]
+            cur_atr = plan["cur_atr"]
+            pnl_est = plan["pnl_est"]
+            note_str = plan["note_str"]
+            reduce_only = plan["reduce_only"]
+            desired_w = plan["desired_w"]
+            is_closing_to_cash = plan["is_closing_to_cash"]
+            is_opening_from_cash = plan["is_opening_from_cash"]
+            is_flip = plan["is_flip"]
+
+            c_st = self._state.coins.get(sym)
+            if c_st is None:
+                return None
+
+            min_qty, _, _, _, _ = settings.get_symbol_spec(sym)
+
+            if reduce_only or is_closing_to_cash or is_flip:
+                await self._exchange.cancel_symbol_orders(sym)
+
+            ord_dto = await self._exchange.execute_smart_rebalance_order(
+                symbol=sym,
+                delta_qty=delta_qty,
+                mark_price=cur_p,
+                realized_pnl_est=pnl_est,
+                note=note_str,
+                reduce_only=reduce_only,
+            )
+
+            if ord_dto is None:
+                self._logger.warning(f"⚠️ [{sym}] Ордер ребалансу не виконано біржею (пропуск до наступної свічки).")
+                return None
+
+            old_qty = c_st.current_pos_qty
+            signed_exec = ord_dto.executed_qty if ord_dto.side == "BUY" else -ord_dto.executed_qty
+            new_pos_qty = 0.0 if is_closing_to_cash else (old_qty + signed_exec)
+
+            if abs(new_pos_qty) >= min_qty:
+                if is_opening_from_cash or is_flip:
+                    c_st.entry_price = ord_dto.avg_price
+                    c_st.bars_held = 1
+                    c_st.is_breakeven = False
+                elif (old_qty * signed_exec) > 0.0 and c_st.entry_price > 0.0:
+                    c_st.entry_price = (
+                        (abs(old_qty) * c_st.entry_price) + (ord_dto.executed_qty * ord_dto.avg_price)
+                    ) / max(1e-8, abs(new_pos_qty))
+
+                c_st.current_pos_qty = new_pos_qty
+
+                # Якщо вже був активований Breakeven — зберігаємо беззбитковий стоп!
+                if c_st.is_breakeven and c_st.entry_price > 0.0:
+                    raw_sl = (
+                        c_st.entry_price * (1.0 + settings.BREAKEVEN_BUFFER_PCT)
+                        if new_pos_qty > 0
+                        else c_st.entry_price * (1.0 - settings.BREAKEVEN_BUFFER_PCT)
+                    )
+                else:
+                    sl_dist = settings.EMERGENCY_SL_ATR_MULT * cur_atr
+                    raw_sl = (c_st.entry_price - sl_dist) if new_pos_qty > 0 else (c_st.entry_price + sl_dist)
+
+                sl_p = self._exchange.safe_price(sym, raw_sl)
+                c_st.active_sl_price = sl_p
+                await self._exchange.place_or_update_stop_loss(sym, new_pos_qty, sl_p)
+
+                # V58.0 Sub-Candle MFE Harvester: take-profit order at +1.35 ATR
+                tp_dist = settings.SUB_CANDLE_MFE_ATR_MULT * cur_atr
+                raw_tp = (c_st.entry_price + tp_dist) if new_pos_qty > 0 else (c_st.entry_price - tp_dist)
+                tp_p = self._exchange.safe_price(sym, raw_tp)
+                if hasattr(self._exchange, "place_or_update_take_profit"):
+                    await self._exchange.place_or_update_take_profit(sym, new_pos_qty, tp_p)
+
+                icon = "🟢" if ord_dto.side == "BUY" else "🔴"
+                return (
+                    f"{icon} <b>{sym}</b>: {ord_dto.side} <code>{ord_dto.executed_qty}</code> @ <code>${ord_dto.avg_price:,.2f}</code> "
+                    f"➔ <b>{desired_w:+.2f}x</b> (SL: <code>${sl_p:,.2f}</code> | TP: <code>${tp_p:,.2f}</code>)"
+                )
+            else:
+                c_st.current_pos_qty = 0.0
+                c_st.entry_price = 0.0
+                c_st.active_sl_price = 0.0
+                c_st.is_breakeven = False
+                c_st.bars_held = 0
+                if hasattr(self._exchange, "cancel_symbol_orders"):
+                    await self._exchange.cancel_symbol_orders(sym)
+                return f"⚪ <b>{sym}</b>: Вихід у КЕШ @ <code>${ord_dto.avg_price:,.2f}</code> (PnL: <b>{pnl_est:+.2f}$</b>)"
+
+        phase_a_plans: List[Dict[str, Any]] = []
+        phase_b_plans: List[Dict[str, Any]] = []
 
         for sym, target_dto in portfolio_dto.targets.items():
             c_st = self._state.coins.get(sym)
@@ -321,9 +426,21 @@ class MultiAssetExecutionOrchestrator(IService):
                 if abs(c_st.current_pos_qty) < min_qty:
                     continue
                 delta_qty = -c_st.current_pos_qty
-                reduce_only = True
                 pnl_est = coin_upnl.get(sym, 0.0)
                 note_str = f"Exit to Cash (F0 | Score:{target_dto.alpha_score:+.2f})"
+                phase_a_plans.append({
+                    "sym": sym,
+                    "delta_qty": delta_qty,
+                    "cur_p": cur_p,
+                    "cur_atr": cur_atr,
+                    "pnl_est": pnl_est,
+                    "note_str": note_str,
+                    "reduce_only": True,
+                    "desired_w": desired_w,
+                    "is_closing_to_cash": True,
+                    "is_opening_from_cash": False,
+                    "is_flip": False,
+                })
             else:
                 target_usdt = total_equity * desired_w
                 target_qty_raw = target_usdt / max(1e-8, cur_p)
@@ -334,86 +451,64 @@ class MultiAssetExecutionOrchestrator(IService):
                 if abs(delta_qty) < min_qty or (abs(delta_qty) * cur_p) < min_notional:
                     continue
                 is_partial_trim = (c_st.current_pos_qty * delta_qty) < 0.0 and not is_flip
-                reduce_only = is_partial_trim
-                if is_partial_trim and abs(c_st.current_pos_qty) > 0:
-                    trim_ratio = min(1.0, abs(delta_qty) / abs(c_st.current_pos_qty))
-                    pnl_est = coin_upnl.get(sym, 0.0) * trim_ratio
-                else:
-                    pnl_est = 0.0
                 note_str = f"V58 Phase {target_dto.phase} ({desired_w:+.2f}x | MWU:{c_st.mwu_trust:.2f}x)"
 
-            if reduce_only or is_closing_to_cash or is_flip:
-                await self._exchange.cancel_symbol_orders(sym)
-
-            ord_dto = await self._exchange.execute_smart_rebalance_order(
-                symbol=sym,
-                delta_qty=delta_qty,
-                mark_price=cur_p,
-                realized_pnl_est=pnl_est,
-                note=note_str,
-                reduce_only=reduce_only,
-            )
-
-            if ord_dto is None:
-                self._logger.warning(f"⚠️ [{sym}] Ордер ребалансу не виконано біржею (пропуск до наступної свічки).")
-                continue
-
-            if ord_dto is not None:
-                old_qty = c_st.current_pos_qty
-                signed_exec = ord_dto.executed_qty if ord_dto.side == "BUY" else -ord_dto.executed_qty
-                new_pos_qty = 0.0 if is_closing_to_cash else (old_qty + signed_exec)
-
-                if abs(new_pos_qty) >= min_qty:
-                    if is_opening_from_cash or is_flip:
-                        c_st.entry_price = ord_dto.avg_price
-                        c_st.bars_held = 1
-                        c_st.is_breakeven = False
-                    elif (old_qty * signed_exec) > 0.0 and c_st.entry_price > 0.0:
-                        # Додавання до існуючої позиції: середньозважена ціна входу
-                        c_st.entry_price = (
-                            (abs(old_qty) * c_st.entry_price) + (ord_dto.executed_qty * ord_dto.avg_price)
-                        ) / max(1e-8, abs(new_pos_qty))
-
-                    c_st.current_pos_qty = new_pos_qty
-
-                    # Якщо вже був активований Breakeven — зберігаємо беззбитковий стоп!
-                    if c_st.is_breakeven and c_st.entry_price > 0.0:
-                        raw_sl = (
-                            c_st.entry_price * (1.0 + settings.BREAKEVEN_BUFFER_PCT)
-                            if new_pos_qty > 0
-                            else c_st.entry_price * (1.0 - settings.BREAKEVEN_BUFFER_PCT)
-                        )
-                    else:
-                        sl_dist = settings.EMERGENCY_SL_ATR_MULT * cur_atr
-                        raw_sl = (c_st.entry_price - sl_dist) if new_pos_qty > 0 else (c_st.entry_price + sl_dist)
-
-                    sl_p = self._exchange.safe_price(sym, raw_sl)
-                    c_st.active_sl_price = sl_p
-                    await self._exchange.place_or_update_stop_loss(sym, new_pos_qty, sl_p)
-
-                    # V58.0 Sub-Candle MFE Harvester: take-profit order at +1.35 ATR
-                    tp_dist = settings.SUB_CANDLE_MFE_ATR_MULT * cur_atr
-                    raw_tp = (c_st.entry_price + tp_dist) if new_pos_qty > 0 else (c_st.entry_price - tp_dist)
-                    tp_p = self._exchange.safe_price(sym, raw_tp)
-                    if hasattr(self._exchange, "place_or_update_take_profit"):
-                        await self._exchange.place_or_update_take_profit(sym, new_pos_qty, tp_p)
-
-                    icon = "🟢" if ord_dto.side == "BUY" else "🔴"
-                    executed_orders_summary.append(
-                        f"{icon} <b>{sym}</b>: {ord_dto.side} <code>{ord_dto.executed_qty}</code> @ <code>${ord_dto.avg_price:,.2f}</code> "
-                        f"➔ <b>{desired_w:+.2f}x</b> (SL: <code>${sl_p:,.2f}</code> | TP: <code>${tp_p:,.2f}</code>)"
-                    )
+                if is_partial_trim:
+                    trim_ratio = min(1.0, abs(delta_qty) / max(1e-8, abs(c_st.current_pos_qty)))
+                    pnl_est = coin_upnl.get(sym, 0.0) * trim_ratio
+                    phase_a_plans.append({
+                        "sym": sym,
+                        "delta_qty": delta_qty,
+                        "cur_p": cur_p,
+                        "cur_atr": cur_atr,
+                        "pnl_est": pnl_est,
+                        "note_str": note_str,
+                        "reduce_only": True,
+                        "desired_w": desired_w,
+                        "is_closing_to_cash": False,
+                        "is_opening_from_cash": False,
+                        "is_flip": False,
+                    })
                 else:
-                    c_st.current_pos_qty = 0.0
-                    c_st.entry_price = 0.0
-                    c_st.active_sl_price = 0.0
-                    c_st.is_breakeven = False
-                    c_st.bars_held = 0
-                    if hasattr(self._exchange, "cancel_symbol_orders"):
-                        await self._exchange.cancel_symbol_orders(sym)
-                    executed_orders_summary.append(
-                        f"⚪ <b>{sym}</b>: Вихід у КЕШ @ <code>${ord_dto.avg_price:,.2f}</code> (PnL: <b>{pnl_est:+.2f}$</b>)"
-                    )
+                    pnl_est = 0.0
+                    phase_b_plans.append({
+                        "sym": sym,
+                        "delta_qty": delta_qty,
+                        "cur_p": cur_p,
+                        "cur_atr": cur_atr,
+                        "pnl_est": pnl_est,
+                        "note_str": note_str,
+                        "reduce_only": False,
+                        "desired_w": desired_w,
+                        "is_closing_to_cash": False,
+                        "is_opening_from_cash": is_opening_from_cash,
+                        "is_flip": is_flip,
+                    })
+
+        # --- ДВОФАЗНА ПАРАЛЕЛЬНА ДИСПЕТЧЕРИЗАЦІЯ ---
+        # Фаза А: Паралельне закриття / скорочення позицій (миттєве вивільнення USDT)
+        if phase_a_plans:
+            results_a = await asyncio.gather(
+                *[_execute_single_order_plan(p) for p in phase_a_plans],
+                return_exceptions=True,
+            )
+            for res in results_a:
+                if isinstance(res, str):
+                    executed_orders_summary.append(res)
+                elif isinstance(res, Exception):
+                    self._logger.error(f"❌ Помилка ордера Фази А: {res}")
+
+        # Фаза Б: Паралельне відкриття нових або нарощування позицій на звільнену маржу
+        if phase_b_plans:
+            results_b = await asyncio.gather(
+                *[_execute_single_order_plan(p) for p in phase_b_plans],
+                return_exceptions=True,
+            )
+            for res in results_b:
+                if isinstance(res, str):
+                    executed_orders_summary.append(res)
+                elif isinstance(res, Exception):
+                    self._logger.error(f"❌ Помилка ордера Фази Б: {res}")
 
         # 5b. Pillar 7: Margin-Backed Stink-Bids & VWAP Dip Sniper (використання 100% вільної маржі)
         rem_lev_budget = max(0.0, self._state.max_portfolio_lev - portfolio_dto.total_gross_leverage)
