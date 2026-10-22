@@ -1,331 +1,190 @@
-# ⚡ QuantCore GrandMaster Server (V23.0)
+# ⚡ QuantCore Sovereign Server (V58.0 Pure SOTA)
 
 [![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115%2B-009688?style=for-the-badge&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
-[![Pydantic](https://img.shields.io/badge/Pydantic-v2.8%2B-E92063?style=for-the-badge&logo=pydantic&logoColor=white)](https://docs.pydantic.dev/)
+[![Pydantic](https://img.shields.io/badge/Pydantic-v2.10%2B-E92063?style=for-the-badge&logo=pydantic&logoColor=white)](https://docs.pydantic.dev/)
 [![Binance Futures](https://img.shields.io/badge/Binance-Futures_USDT--M-F0B90B?style=for-the-badge&logo=binance&logoColor=black)](https://www.binance.com/)
-[![Google Gemini](https://img.shields.io/badge/Google_Gemini-2.5_Flash-8E75C2?style=for-the-badge&logo=googlegemini&logoColor=white)](https://ai.google.dev/)
+[![CI/CD](https://img.shields.io/badge/CI%2FCD-GitHub_Actions-2088FF?style=for-the-badge&logo=githubactions&logoColor=white)](.github/workflows/ci.yml)
 [![Docker](https://img.shields.io/badge/Docker-Containerized-2496ED?style=for-the-badge&logo=docker&logoColor=white)](https://www.docker.com/)
 [![Architecture](https://img.shields.io/badge/Architecture-Clean_%26_SOLID-10B981?style=for-the-badge)](#-архітектура-системи)
 
-**QuantCore GrandMaster Server** — високопродуктивний, суверенний автономний сервер кількісного алготрейдингу (Quantitative Trading Server) для біржі **Binance Futures (USDT-M)**. 
+**QuantCore Sovereign Server (V58.0 Pure SOTA)** — автономний сервер кількісного алготрейдингу інституційного рівня для біржі **Binance Futures (USDT-M)**.
 
-Побудований на принципах **Clean Architecture** та **SOLID**, сервер одночасно керує диверсифікованим портфелем із 5+ криптоактивів (`BTCUSDT`, `ETHUSDT`, `SOLUSDT`, `BNBUSDT`, `XRPUSDT`), використовуючи ансамблевий ML-стекінг, субсекундний інференс, адаптивне самонавчання в реальному часі та апаратний захист від вичерпання пам'яті на бюджетних VPS (**< 390 МБ RAM на 1 GB VPS**).
+Побудований на принципах **Clean Architecture** та **SOLID**, сервер автономно управляє диверсифікованим портфелем із **10 криптоактивів** (`BTCUSDT`, `ETHUSDT`, `SOLUSDT`, `LINKUSDT`, `NEARUSDT`, `SUIUSDT`, `BNBUSDT`, `AVAXUSDT`, `XRPUSDT`, `FETUSDT`), використовуючи **55 ортогональних факторів альфи**, субсекундний ML-інференс, паралельний збір маркет-даних, пасивні Stink-Bids та апаратну оптимізацію ресурсів (**< 290 МБ RAM на 1 GB VPS**).
 
 ---
 
 ## 📑 Зміст
 
-1. [Ключові технологічні переваги](#-ключові-технологічні-переваги)
-2. [Архітектура системи](#-архітектура-системи)
-3. [ШІ-Ядро V23 Grand-Master](#-ші-ядро-v23-grand-master)
+1. [Ключові технологічні переваги V58.0](#-ключові-технологічні-переваги-v580)
+2. [55 Ортогональних факторів альфи](#-55-ортогональних-факторів-альфи)
+3. [Архітектура системи](#-архітектура-системи)
 4. [Апаратний захист пам'яті та гібернація](#-апаратний-захист-памяті-та-гібернація)
-5. [REST API та Веб-Термінал](#-rest-api-та-веб-термінал)
-6. [Пульт керування в Telegram](#-пульт-керування-в-telegram)
+5. [REST API та Bento-UI Веб-Термінал](#-rest-api-та-bento-ui-веб-термінал)
+6. [Пульт керування в Telegram (OTA V58)](#-пульт-керування-в-telegram-ota-v58)
 7. [Швидкий старт та розгортання](#-швидкий-старт-та-розгортання)
 8. [Конфігурація (.env)](#-конфігурація-env)
-9. [Безпека та ізоляція даних](#-безпека-та-ізоляція-даних)
+9. [Безпека та ізоляція секретів](#-безпека-та-ізоляція-секретів)
 
 ---
 
-## ⚡ Ключові технологічні переваги
+## ⚡ Ключові технологічні переваги V58.0
 
-* **Мультивалютна синергія 5 активів**: Єдиний портфельний оптимізатор розраховує цільові експозиції монет із врахуванням індексу ринкової широти (Market Breadth: від `-1.00` до `+1.00`) та відносної сили активів проти Bitcoin (RS vs BTC).
-* **6-модельний ансамблевий ML-стекер**: Одночасне прогнозування альфи через **LightGBM**, **CatBoost**, **HistGradientBoosting**, **Ridge Regression**, **Multi-Layer Perceptron (MLP)** та **Huber Regressor**.
-* **Реал-тайм самонавчання без витоків пам'яті (Online Adaptation)**:
-  * *Multiplicative Weights Update (MWU)* адаптує довіру до кожної монети на кожному барі.
-  * *Contextual Bandit* безперервно коригує мета-ваги під-моделей ансамблю під зміну ринкового режиму.
-  * Атомарне скидання ваг у `storage/adaptive_weights.json` захищає від збоїв живлення.
-* **Extreme Memory Shield (< 390 МБ RAM)**:
-  * Вбудований низьколатентний Glassmorphism Bento-UI веб-термінал прямо у FastAPI (0 МБ додаткового RAM порівняно зі Streamlit).
-  * Повна оптимізація через `__slots__ = (...)` та `@dataclass(slots=True)`.
-  * Примусове повернення сторінок пам'яті ядру Linux через `libc.malloc_trim(0)`.
-  * Потоковий моніторинг логів через `collections.deque` ($O(1)$ RAM).
-* **Zero-Idle CPU Hibernation**: Процесор спить із **0.00% навантаженням на CPU** між 15-хвилинними свічками та миттєво прокидається через асинхронні події (`EventBus`).
-* **Гаряча заміна моделей (AI Cartridge Hot-Swap)**: Оновлення ШІ-моделей `.joblib` на льоту прямо через чат Telegram або Web UI без перезапуску сервера за 1.5 секунди.
+* **Мультивалютний портфель із 10 активів**:
+  Керування активами з динамічним розподілом ризику через індекс ринкової широти (Core Breadth & Continuous Thrust Z-Score: від `-2.50` до `+2.50`), крос-активну дисперсію та відносну силу до Bitcoin (`RS vs BTC`).
+* **Конкурентний збір даних (`asyncio.gather` < 2.5с)**:
+  Паралельне завантаження свічок для всіх 10 інструментів одночасно з ізольованими таймаутами. Час реакції на закриття 15m бару скорочено з 60 до **< 2.5 секунд**.
+* **Пасивні Margin Stink-Bids & Sub-Candle MFE Harvester**:
+  * *Stink-Bids*: Виставлення пасивних лімітних заявок у глибині тіней свічок (`-1.65 ATR` нижче ринку) на залишкове плече для збору панічної ліквідності з 0% комісією тейкера.
+  * *MFE Harvester*: Внутрішньосвічковий збір прибутку при імпульсному розширенні (`+1.35 ATR`) без очікування закриття свічки.
+* **Стійкість до біржових помилок (Self-Healing Execution)**:
+  Інтелектуальне опрацювання кодів Binance (`-2022 ReduceOnly Order is rejected`): якщо позиція вже закрита біржовим стопом, бот автоматично синхронізує нульову експозицію і знімає ордери без збоїв.
+* **Zero-Idle CPU Hibernation**:
+  Процесор перебуває у **0.00% CPU стані** між 15-хвилинними свічками, прокидаючись виключно на закритті бару або через асинхронні події `EventBus`.
+* **Гаряча заміна моделей (AI Cartridge Hot-Swap)**:
+  Миттєве оновлення навчених ШІ-картриджів `.joblib` через Telegram або Web API за **1.5 секунди** без зупинки торгового циклу.
 * **Інституційний ризик-менеджмент (CRO Watchdog)**:
-  * *Daily Circuit Breaker*: Аварійний стоп-кран при досягненні 6% денної просадки.
-  * *Dynamic ATR Breakeven*: Автоматичне переведення Stop-Loss у беззбиток (+0.07% буфер) при русі ціни на `+1.8x ATR`.
-  * *Funding Rate & Spread Filter*: Блокування входу в позицію при несприятливій ставці фінансування або розширенні спреду.
+  * *Daily Circuit Breaker*: Аварійне закриття позицій при досягненні 6% денної просадки.
+  * *Dynamic ATR Breakeven*: Переведення Stop-Loss у беззбиток (+0.07% буфер) при русі ціни на `+1.8x ATR`.
+  * *Spread & Volatility Filter*: Блокування входу при спреді > 0.08% або аномальному знеціненні ліквідності.
+
+---
+
+## 🔬 55 Ортогональних факторів альфи
+
+Конвеєр ознак [feature_pipe_v58.py](QuantCore-GrandMaster-Server/app/cartridges/feature_pipe_v58.py) обчислює **55 взаємно ортогональних факторів** у форматі Float32 за < 150 мс:
+
+| Категорія | Ознаки | Фізичний зміст |
+| :--- | :--- | :--- |
+| **Базовий імпульс (TSMOM)** | `tsmom_24`, `tsmom_96`, `tsmom_384`, `tsmom_1536` | Лог-прибутковість за 6г, 24г, 4д, 16д, нормована на Yang-Zhang волатильність |
+| **Ковзні спреди та нахили** | `spread_96_384`, `spread_384_1536`, `slope_768` | Нормовані розходження трендів та нахил 768 EMA |
+| **Ефективність руху (KER)** | `signed_ker_96`, `signed_ker_288` | Коефіцієнт Кауфмана (спрямованість без паразитного шуму) |
+| **Канали та рівні** | `donchian_96`, `donchian_384`, `zscore_96`, `rsi_14`, `dist_vwap_96` | Відносна позиція у Дончіан-каналі, Z-Score, RSI та відхилення від VWAP |
+| **Потік ордерів та об'єм** | `vol_surge`, `taker_imb_32`, `taker_imb_96` | Сплески об'єму та дельта тейкерських покупок/продажів |
+| **Відносна сила проти BTC** | `btc_lead_24`, `rs_vs_btc_96`, `rs_vs_btc_384` | Альфа-випередження та кумулятивна відносна сила до Bitcoin |
+| **Глибокі SOTA-тензори (35)** | `yz_vol_96`, `yz_vol_ratio`, `elastic_clock_mom`, `ehlers_roof_osc`, `ehlers_roof_vel`, `dist_anchored_vwap`, `frac_diff_z`, `kalman_vel_z`, `kalman_acc_z`, `kalman_gap_z`, `whale_ticket_z`, `quote_flow_imb_16`, `quote_flow_imb_64`, `vpin_toxicity_z`, `hawkes_cascade_z`, `dist_vp_poc_96`, `vp_poc_density`, `levy_path_area`, `wick_demand_pressure`, `institutional_absorption`, `sortino_asymmetry`, `shannon_entropy_96`, `hurst_vr_ratio`, `lead_lag_transfer_z`, `dyn_mom_rank`, `dyn_vol_rank`, `trend_quality_score`, `funding_rate_z`, `squeeze_thrust_idx`, `cross_dispersion_idx`, `cont_breadth_z`, `geo_shock_idx`, `macro_fng_idx`, `cs_momentum_z`, `cs_orderflow_z` | Адаптивний Калман (Qt/Rt), Zero-Lag Ehlers Roofing, Event-Anchored VWAP, дробове диференціювання d=0.35, VPIN & Hawkes, Volume Profile POC, сигнатури контуру Леві, дисбаланс тиску тіней свічок, ентропія Шеннона та крос-секційні ранги уваги |
 
 ---
 
 ## 🏛 Архітектура системи
 
-Проєкт реалізовано за стандартом **Clean Architecture & SOLID**: сервіси мають слабку зв'язаність (Decoupled), суворі інтерфейсні контракти (`interfaces.py`), інверсію залежностей (Dependency Injection Container) та ізольоване сховище.
+Сервіси побудовані за суворим стандартом інверсії залежностей:
 
 ```text
 📦 QuantCore-GrandMaster-Server
- ┣ 📜 .env.example                      # Еталонний шаблон ключів (Binance, TG, Gemini, паролі)
- ┣ 📜 .gitignore                        # Повна ізоляція (.env, storage/, *.joblib, *.db)
- ┣ 📜 deploy_native.sh                  # 1-клік інсталятор native systemd сервісу для Linux VPS
- ┣ 📜 Dockerfile                        # Легкий контейнер python:3.12-slim з оптимізацією C-аллокатора
- ┣ 📜 docker-compose.yml                # Запуск у Docker з жорстким лімітом пам'яті (mem_limit: 360m)
- ┣ 📜 requirements.txt                  # Сучасні асинхронні залежності (FastAPI 0.115+, orjson, ccxt...)
- ┣ 📜 main.py                           # Точка входу FastAPI + Lifespan-оркестратор фонових задач
- ┃
- ┣ 📂 storage                           # Ізольоване дискове сховище (автономна квота LRU, поза Git)
- ┃ ┣ 📂 cartridges                      # Каталог для гарячої заміни моделей (v23_grand_master.joblib)
- ┃ ┣ 📂 backups                         # Автоматичні щоденні бекапи SQLite для надсилання в Telegram
- ┃ ┣ 📜 trading_history.db              # SQLite база даних (WAL Mode, mmap_size=0, кеш 4 МБ)
- ┃ ┣ 📜 engine_state.json               # Атомарний зріз стану позицій, плечей та налаштувань валют
- ┃ ┗ 📜 adaptive_weights.json           # Живі ваги самонавчання (MWU + Bandit Meta-Weights)
- ┃
- ┗ 📂 app                               # Ядро системи (Clean Architecture & SOLID)
-   ┣ 📂 core                            # Системні утиліти, конфігурація та апаратний контроль
-   ┃ ┣ 📜 config.py                     # @dataclass(slots=True) Settings + валідований парсер .env
-   ┃ ┣ 📜 memory_guard.py               # Memory & Disk Guard: gc.collect() + glibc malloc_trim(0)
-   ┃ ┣ 📜 events.py                     # Асинхронна шина подій (AsyncEventBus) та wakeup-сигнали
-   ┃ ┣ 📜 security.py                   # Авторизація API/Web (X-Api-Key / Bearer / Session Cookie)
-   ┃ ┗ 📜 http_client.py                # Singleton-пул HTTP-з'єднань httpx.AsyncClient
-   ┃
-   ┣ 📂 domain                          # Доменні сутності, контракти та структури даних
-   ┃ ┣ 📜 enums.py                      # CoinMode (AUTO/LONG_ONLY/OFF), CascadePhase, RiskProfile
-   ┃ ┣ 📜 schemas.py                    # Внутрішні швидкі DTO з __slots__ та Pydantic v2 схеми API
-   ┃ ┗ 📜 interfaces.py                 # Чисті контракти SOLID (IService, IAlphaCartridge, IExchangeGateway)
-   ┃
-   ┣ 📂 cartridges                      # Шар ШІ-моделей (Open/Closed Principle — змінний без правок коду)
-   ┃ ┣ 📜 cartridge_loader.py           # Менеджер гарячого завантаження .joblib та відкату (Rollback)
-   ┃ ┣ 📜 feature_pipe_v23.py           # Векторизований float32 пайплайн 43 факторів без фрагментації RAM
-   ┃ ┗ 📜 v23_grand_master_cartridge.py # Реалізація IAlphaCartridge V23 (Team Alpha, Waterfall, 5 монет)
-   ┃
-   ┣ 📂 services                        # Незалежні бізнес-мікросервіси
-   ┃ ┣ 📜 service_registry.py           # DI-Контейнер мікросервісів з єдиним життєвим циклом (Lifespan)
-   ┃ ┣ 📜 state_service.py              # In-Memory шина стану валют з атомарним скиданням через orjson
-   ┃ ┣ 📜 execution_service.py          # Мультивалютний оркестратор ребалансу та виконання ордерів
-   ┃ ┣ 📜 exchange_ccxt_service.py      # Шлюз Binance Futures (One-Way Mode, Ring-Buffer свічок)
-   ┃ ┣ 📜 online_adaptation_service.py  # Дворівневе реал-тайм самонавчання (MWU + Contextual Bandit)
-   ┃ ┣ 📜 currency_governor_service.py  # Пульт валют: індивідуальні режими, пріоритети, ліміти плеча
-   ┃ ┣ 📜 risk_guard_service.py         # Незалежний CRO Watchdog: Circuit Breaker та Dynamic ATR Breakeven
-   ┃ ┣ 📜 market_data_service.py        # Дельта-завантажувач 15m свічок з кешуванням
-   ┃ ┣ 📜 news_ai_service.py            # RSS парсер + Google Gemini AI макро-сентимент аналізатор
-   ┃ ┣ 📜 database_service.py           # Асинхронний SQLite WAL журнал операцій та кривої Equity
-   ┃ ┗ 📜 telegram_bot_service.py       # Повнофункціональний пульт керування, графіки та OTA оновлення
-   ┃
-   ┣ 📂 api                             # Швидкі контролери FastAPI (ORJSONResponse, Swagger /docs)
-   ┃ ┣ 📜 router.py                     # Головний агрегатор маршрутів API
-   ┃ ┣ 📜 endpoints_telemetry.py        # GET /state, /radar, /equity, /trades, /logs
-   ┃ ┣ 📜 endpoints_control.py          # POST /coin, /risk, /pause, /wakeup, /panic, /restart
-   ┃ ┗ 📜 endpoints_cartridge.py        # GET /list, POST /upload, /activate, /rollback
-   ┃
-   ┗ 📂 web                             # Надлегкий Веб-Термінал (0 МБ додаткового RAM)
-     ┗ 📜 portal_html.py                # Glassmorphism Bento-UI термінал (HTML5 + Plotly.js CDN)
+ ┣ 📂 app
+ ┃ ┣ 📂 api                             # FastAPI контролери (Telemtry, Control, Cartridges)
+ ┃ ┣ 📂 cartridges                      # Pure SOTA ШІ-картриджі (v58, 55 ознак, Hot-Swap)
+ ┃ ┃ ┣ 📜 cartridge_loader.py           # Сервіс гарячої заміни моделей у пам'яті
+ ┃ ┃ ┣ 📜 feature_pipe_v58.py           # Векторизований розрахунок 55 ознак у Float32
+ ┃ ┃ ┗ 📜 v58_grand_master_cartridge.py # Мультивалютний оркестратор позицій
+ ┃ ┣ 📂 core                            # Ядро (Config, EventBus, MemoryGuard, Security)
+ ┃ ┣ 📂 domain                          # DTO-моделі (Pydantic v2), Enums та інтерфейси
+ ┃ ┣ 📂 services                        # Ізольовані мікросервіси бізнес-логіки
+ ┃ ┃ ┣ 📜 exchange_ccxt_service.py      # Шлюз Binance Futures (Smart Orders, Stink-Bids)
+ ┃ ┃ ┣ 📜 execution_service.py          # Верховний оркестратор виконання портфеля
+ ┃ ┃ ┣ 📜 market_data_service.py        # Конкурентний збір даних (asyncio.gather)
+ ┃ ┃ ┣ 📜 database_service.py           # SQLite WAL сервіс (кеш 4 МБ, нульовий I/O)
+ ┃ ┃ ┗ 📜 telegram_bot_service.py       # Long-polling бот керування та OTA-оновлень
+ ┃ ┗ 📂 web                             # Bento-UI веб-термінал прямо у пам'яті FastAPI
+ ┣ 📂 tests                             # Автоматичні юніт-тести та верифікація пайплайну
+ ┣ 📜 deploy_native.sh                  # 1-клік native systemd інсталятор для Linux VPS
+ ┣ 📜 Dockerfile                        # Оптимізований slim-контейнер з лімітом пам'яті
+ ┗ 📜 main.py                           # Точка входу FastAPI + Lifespan оркестратор
 ```
-
----
-
-## 🧠 ШІ-Ядро V23 Grand-Master
-
-ШІ-картридж реалізує контракт [`IAlphaCartridge`](file:///d:/Vlasne/code/trading_agent/QuantCore-GrandMaster-Server/app/domain/interfaces.py#L33-L67). Сервер взаємодіє з моделлю виключно через стандартизований виклик `compute_portfolio_targets()`, що дозволяє оновлювати математику моделі без переписування коду сервера.
-
-### 1. Векторизований пайплайн факторів (43 ознаки)
-* **Технічні індикатори**: RSI-14, MACD Hist, Bollinger Bandwidth, ATR-14, Kaufman Efficiency Ratio (KER), NATR.
-* **Режими та волатильність**: Multi-timeframe Z-Scores (96 барів = 24h, 288 барів = 72h), Parkinson Volatility, Rolling Kurtosis, Skewness.
-* **Міжринкова взаємодія**: Relative Strength проти BTC (`RS_BTC`), коваріація з ринковою широтою (`Core Breadth`), новинний макро-сентимент від Google Gemini.
-
-### 2. Каскадний скінченний автомат фаз (Cascade State Machine)
-Для кожної монети визначається фаза експозиції:
-* **`F0 (Scanning / Cash)`**: Поза ринком (100% кеш USDT). Позиція закривається.
-* **`F1 (Scout Ignition)`**: Розвідник мінімальним обсягом ($0.70x \dots 0.85x$).
-* **`F2 (Core Expansion)`**: Підтверджений тренд ($1.00x \dots 1.60x$).
-* **`F3 (Apex Overdrive)`**: Максимальний форсаж та імпульс ($1.65x \dots 2.50x$).
-* **`F4 (Short Cascade)`**: Хеджуючий або каскадний шорт.
-
-### 3. Профілі ризику портфеля (Portfolio Synergy)
-| Профіль | Базове плече | Макс. Gross плече | Стеля на одну монету |
-| :--- | :---: | :---: | :---: |
-| **`CONSERVATIVE`** | `0.75x` | `1.60x` | `1.20x` |
-| **`OPTIMAL`** *(рекомендовано)* | `1.00x` | `2.40x` | `1.65x` |
-| **`AGGRESSIVE`** | `1.15x` | `3.20x` | `2.10x` |
-| **`OVERDRIVE`** | `1.25x` | `3.50x` | `2.50x` |
 
 ---
 
 ## 🛡️ Апаратний захист пам'яті та гібернація
 
-Сервер спеціально спроєктований для стабільної цілодобової роботи на хмарних VPS з обмеженою пам'яттю (**1 GB RAM**):
-
-1. **Zero-Idle CPU Hibernation**:  
-   Оскільки аналіз проводиться на 15-хвилинних свічках, після виконання ребалансу оркестратор переходить у глибокий сон через `asyncio.wait_for(WAKEUP_EVENT, timeout)`. Навантаження на процесор падає до **0.00% CPU**, вивільняючи ресурси сервера.
-2. **Низькорівневе скидання C-пам'яті**:  
-   Після кожного торгового циклу викликається `gc.collect()`, а потім через `ctypes` викликається функція стандартної бібліотеки Linux C:
-   ```python
-   libc = ctypes.CDLL("libc.so.6")
-   libc.malloc_trim(0)
-   ```
-   Це повертає фрагментовані арени аллокатора назад операційній системі, утримуючи споживання **RAM у діапазоні 360–390 МБ**.
-3. **Потокове читання логів**:  
-   Ендпоінт читання журналу `/api/v1/logs` використовує `collections.deque(f, maxlen=lines)`, що забезпечує швидкість та фіксований $O(1)$ розмір буфера без зчитування всього файлу в пам'ять.
+* **Фіксований буфер пам'яті (< 290 МБ RAM)**:
+  Всі структури даних використовують `__slots__` та `@dataclass(slots=True)`.
+* **C-Memory Trim**:
+  Після кожного розрахунку викликається `libc.malloc_trim(0)`, повертаючи невикористані сторінки ядру ОС.
+* **Zero Disk Bloat**:
+  SQLite працює в режимі `PRAGMA journal_mode=WAL; PRAGMA cache_size=-4000; PRAGMA mmap_size=0;`.
+* **Zero-Idle CPU**:
+  Під час 15-хвилинної гібернації навантаження на vCPU дорівнює **0.00%**.
 
 ---
 
-## 🌐 REST API та Веб-Термінал
+## 🌐 REST API та Bento-UI Веб-Термінал
 
-Вбудований Веб-Термінал доступний за адресою `http://<IP_СЕРВЕРА>:8501`. Він виконаний в концепції **Glassmorphism Bento-UI**, транслюється напряму з пам'яті (0 МБ дискового/RAM оверхеду) і використовує бібліотеку Plotly.js через CDN.
-
-Авторизація відбувається автоматично за паролем `DASHBOARD_PASSWORD` зі збереженням захищеного `HttpOnly` Cookie `qc_session`.
-
-### Основні ендпоінти REST API
-
-| Метод | URL | Опис | Авторизація |
-| :--- | :--- | :--- | :---: |
-| `GET` | `/` | Головний Bento-UI Веб-термінал | Публічний / Cookie |
-| `POST` | `/api/v1/auth/login` | Вхід у веб-термінал (видача кукі) | Відкритий |
-| `GET` | `/health` | Моніторинг RAM, здоров'я та стану паузи | Відкритий |
-| `GET` | `/api/v1/state` | Повний зріз стану: баланс, 5 монет, пам'ять | `Bearer` / `Cookie` |
-| `GET` | `/api/v1/radar` | Live-радар фаз (F0..F4), ваг MWU та сигналів | `Bearer` / `Cookie` |
-| `GET` | `/api/v1/equity` | Векторні часові ряди кривої капіталу та просадки | `Bearer` / `Cookie` |
-| `GET` | `/api/v1/trades` | Журнал виконаних угод із фільтром за монетою | `Bearer` / `Cookie` |
-| `GET` | `/api/v1/logs` | Останні $N$ рядків системного логу (стримінг $O(1)$) | `Bearer` / `Cookie` |
-| `POST` | `/api/v1/control/coin` | Зміна налаштувань валюти (`AUTO`, `LONG_ONLY`, плече) | `Bearer` / `Cookie` |
-| `POST` | `/api/v1/control/risk` | Зміна профілю ризику (`OPTIMAL`, `AGGRESSIVE` тощо) | `Bearer` / `Cookie` |
-| `POST` | `/api/v1/control/pause` | Встановлення паузи (на $N$ годин або безстроково) | `Bearer` / `Cookie` |
-| `POST` | `/api/v1/control/wakeup` | Миттєве пробудження для позачергового перерахунку | `Bearer` / `Cookie` |
-| `POST` | `/api/v1/control/panic` | **Екстрена ліквідація всіх позицій у кеш USDT** | `Bearer` / `Cookie` |
-| `POST` | `/api/v1/control/restart`| Безпечний перезапуск сервера (systemd) | `Bearer` / `Cookie` |
-| `GET` | `/api/v1/cartridge/list` | Список доступних моделей .joblib на диску | `Bearer` / `Cookie` |
-| `POST` | `/api/v1/cartridge/upload`| Завантаження та **гаряча заміна (Hot-Swap)** моделі | `Bearer` / `Cookie` |
-| `POST` | `/api/v1/cartridge/rollback`| Миттєвий відкат на попередню модель | `Bearer` / `Cookie` |
-
-Інтерактивна OpenAPI документація доступна за адресою: `http://<IP_СЕРВЕРА>:8501/docs`.
+Вбудований високошвидкісний веб-термінал доступний на порті `8501`:
+* **URL:** `http://<IP_СЕРВЕРА>:8501`
+* **Авторизація:** Захист за сесійними токенами SHA-256 (`DASHBOARD_PASSWORD`).
+* **Можливості:**
+  * Живий радар 10 активів (експозиція, Stop-Loss, Take-Profit, Alpha Score).
+  * Графіки прибутковості та просадки (Plotly).
+  * Гаряча зміна ризик-профілю (`CONSERVATIVE`, `MODERATE`, `AGGRESSIVE`).
+  * Екстрене закриття позицій (Panic Button).
 
 ---
 
-## 📱 Пульт керування в Telegram
+## 📱 Пульт керування в Telegram (OTA V58)
 
-Telegram-бот надає повний контроль над сервером без необхідності входу в SSH-консоль:
-
-### Команди бота
-* `/status` — Загальний статус сервера, баланс, Equity, поточний лідер серед монет.
-* `/radar` — Детальна матриця стану всіх 5 активів (позиція, PnL, вага, Stop-Loss).
-* `/coins` — Інтерактивний пульт перемикання режимів монет (`AUTO`, `LONG_ONLY`, `OFF`).
-* `/risk` — Зміна глобального профілю плеча (`CONSERVATIVE`, `OPTIMAL`, `AGGRESSIVE`, `OVERDRIVE`).
-* `/chart` — Генерація та відправка PNG-графіка кривої капіталу з коефіцієнтами Шарпа та просадкою.
-* `/trades` — Журнал останніх виконаних операцій.
-* `/ota` — Інформація про активний картридж, пам'ять та меню оновлення.
-* `/pause` / `/resume` — Керування паузою торгівлі.
-* `/restart` — Безпечний перезапуск серверного процесу через `systemd`.
-* `/panic` — Аварійний вихід у 100% кеш USDT.
-
-### Оновлення «по повітрю» (OTA Updates прямо в чаті)
-1. **Гаряча заміна моделі**: Надішліть файл `*.joblib` у чат — бот валідує його, завантажить у пам'ять і миттєво активує нову модель без перезапуску сервера.
-2. **Оновлення коду**: Надішліть файл `*.py` або ZIP-архів з оновленими модулями — бот автоматично розкладе їх по відповідних папках `app/` та запропонує кнопку миттєвого перезапуску.
+Телеграм-бот підтримує повне двостороннє керування сервером:
+* `/status` — детальна телеметрія (експозиція, RAM, активний картридж, PnL).
+* `/radar` — поточний радар 10 активів з цільовими вагами.
+* `/coins` — інтерактивний пульт перемикання режимів для кожної монети (`AUTO`, `LONG_ONLY`, `OFF`).
+* **OTA (Over-The-Air) Оновлення:** Надішліть новий файл `.joblib` або `.py` прямо в чат — бот перевірить його, оновить код і виконає гарячу заміну за 1.5 секунди.
 
 ---
 
 ## 🚀 Швидкий старт та розгортання
 
-### Варіант 1: Native systemd сервіс на Linux VPS (Рекомендовано для 1GB VPS)
-
-Найбільш енергоефективний та стабільний варіант запуску без оверхеду віртуалізації Docker.
+### Варіант 1: Native 1-Клік інсталяція на Linux VPS (Рекомендовано)
 
 ```bash
-# 1. Клонування репозиторію
-cd ~
 git clone https://github.com/EdlerAG/trading_agent.git
 cd trading_agent/QuantCore-GrandMaster-Server
 
-# 2. Налаштування ключів API
+# Створіть конфігураційний файл .env з вашими ключами
 cp .env.example .env
-nano .env  # Заповніть ваші ключі Binance, Telegram, Gemini та пароль
+nano .env
 
-# 3. 1-клік інсталяція та автозапуск systemd
+# Запустіть автоматичний інсталятор native systemd сервісу
 chmod +x deploy_native.sh
 ./deploy_native.sh
 ```
 
-**Керування сервісом:**
-```bash
-sudo systemctl status trading_bot.service   # Перевірити статус
-sudo journalctl -u trading_bot.service -f   # Перегляд логів у реальному часі
-sudo systemctl restart trading_bot.service  # Перезапуск
-```
+Інсталятор автоматично створить віртуальне оточення, встановить залежності, налаштує systemd-службу з обмеженням пам'яті (`MemoryMax=450M`) та запустить бота.
 
----
-
-### Варіант 2: Розгортання через Docker Compose
+### Варіант 2: Запуск через Docker Compose
 
 ```bash
 cd QuantCore-GrandMaster-Server
-cp .env.example .env
-# Відредагуйте .env
-docker compose up -d --build
+docker-compose up -d --build
 ```
-
----
-
-### Варіант 3: Локальний запуск (Development / Windows / macOS)
-
-```bash
-cd QuantCore-GrandMaster-Server
-
-# Створення віртуального оточення
-python -m venv .venv
-
-# Активація
-# На Windows:
-.\.venv\Scripts\Activate.ps1
-# На Linux / macOS:
-source .venv/bin/activate
-
-# Встановлення залежностей
-pip install -r requirements.txt
-
-# Запуск
-python main.py
-```
-
-Після запуску відкрийте браузер: `http://localhost:8501`.
 
 ---
 
 ## ⚙️ Конфігурація (.env)
 
-Усі параметри конфігуруються через єдиний файл `.env` у корені сервера:
+Зразок конфігураційного файлу знаходиться в [.env.example](QuantCore-GrandMaster-Server/.env.example):
 
-```env
-# --- 1. Binance Futures API (Demo / Testnet та Live) ---
-TESTNET_API_KEY="your_binance_api_key_here"
-TESTNET_SECRET_KEY="your_binance_secret_key_here"
-USE_DEMO_TRADING="true"                  # "true" для тестнету/демо, "false" для реального рахунку
-EXCHANGE_LEVERAGE="3"                    # Встановлене кредитне плече на біржі
+```ini
+# --- Binance Futures API ---
+BINANCE_API_KEY=your_binance_api_key
+BINANCE_API_SECRET=your_binance_api_secret
+BINANCE_TESTNET=false
+IS_PAPER_TRADING=true
+MAX_ACCOUNT_LEVERAGE=3.0
 
-# --- 2. Telegram Bot Alert & Remote Terminal ---
-TELEGRAM_TOKEN="your_telegram_bot_token"
-TELEGRAM_CHAT_ID="your_telegram_chat_id"
+# --- Telegram Bot ---
+TELEGRAM_BOT_TOKEN=your_telegram_bot_token
+TELEGRAM_CHAT_ID=your_telegram_user_id
 
-# --- 3. Google Gemini AI (Macro News Sentiment) ---
-GEMINI_API_KEY="your_gemini_api_key"
-GEMINI_MODEL="gemini-2.5-flash"          # gemini-2.5-flash або gemini-3.5-flash-lite
-ENABLE_NEWS_SENTIMENT="true"
-
-# --- 4. Web Terminal & FastAPI Gateway ---
-DASHBOARD_URL="http://your-server-ip:8501"
-DASHBOARD_PASSWORD="change_this_secure_password"
-SERVER_HOST="0.0.0.0"
-SERVER_PORT="8501"
-
-# --- 5. Мультивалютний портфель та профіль ризику ---
-RISK_PROFILE="OPTIMAL"                   # CONSERVATIVE | OPTIMAL | AGGRESSIVE | OVERDRIVE
-ORCHESTRATOR_MODE="PORTFOLIO_SYNERGY"    # PORTFOLIO_SYNERGY або SOLO_MAX
-ACTIVE_SYMBOLS="BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT"
-ENABLE_ONLINE_LEARNING="true"
-
-# --- 6. Захист капіталу та диска (1GB RAM VPS) ---
-MAX_DAILY_LOSS_PCT="0.06"                # 6% денний стоп-кран (Circuit Breaker)
-MAX_STORAGE_MB="250"                     # Авто-квота сховища storage/
+# --- Web Terminal Access ---
+DASHBOARD_PASSWORD=your_secure_password
+PORT=8501
+HOST=0.0.0.0
 ```
 
 ---
 
-## 🔒 Безпека та ізоляція даних
+## 🔒 Безпека та ізоляція секретів
 
-* **Zero-Leak репозиторій**: Конфіденційні файли (`.env`, `storage/`, `*.joblib`, `*.db`, `*.log`) повністю виключені з контролю версій через `.gitignore`.
-* **Захист від несанкціонованого доступу**: Будь-які зміни конфігурації через REST API або Web UI захищені паролем з криптографічним порівнянням `secrets.compare_digest()` (захист від Timing Attacks) та сесійними `HttpOnly` cookie.
-* **Автономні щоденні бекапи**: SQLite база даних щоночі автоматично архівується та надсилається власнику в захищений чат Telegram.
-
----
-
-## 📄 Ліцензія та відмова від відповідальності
-
-Цей проєкт створено для дослідницьких та алгоритмічних цілей. Торгівля криптовалютними деривативами на Binance Futures пов'язана з високим рівнем фінансового ризику. Завжди ретельно тестуйте стратегії в режимі Demo (`USE_DEMO_TRADING="true"`) перед переходом на реальний капітал.
+* Жодні API-ключі, приватні ключі, токени ботів або навчені файли моделей `.joblib` **ніколи не потрапляють у Git**.
+* Репозиторій містить виключно код рушія, конфігураційні шаблони `.env.example` та тести.
+* Пайплайн **GitHub Actions** автоматично перевіряє код на відсутність застарілих компонентів і секретів при кожному пуші.
