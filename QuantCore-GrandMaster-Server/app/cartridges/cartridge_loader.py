@@ -121,10 +121,14 @@ class CartridgeLoaderService(IService):
         freed_bytes = memory_guard.enforce_disk_quota(active_cartridge_filename=safe_name)
         rss_mb = memory_guard.trim_ram()
 
+        symbols_list = list(new_cartridge.supported_symbols)
         meta = {
+            "ok": True,
             "filename": safe_name,
+            "active_cartridge": safe_name,
             "architecture": new_cartridge.architecture_name,
-            "symbols": list(new_cartridge.supported_symbols),
+            "symbols": symbols_list,
+            "supported_symbols": symbols_list,
             "ram_after_mb": rss_mb,
             "freed_bytes": freed_bytes,
         }
@@ -134,10 +138,39 @@ class CartridgeLoaderService(IService):
         )
         return meta
 
-    def rollback_to_previous(self) -> Dict[str, Any]:
+    def get_metadata(self) -> Dict[str, Any]:
+        cart = self.cartridge
+        symbols_list = list(cart.supported_symbols)
+        return {
+            "ok": True,
+            "active_cartridge": self._active_filename,
+            "architecture": cart.architecture_name,
+            "supported_symbols": symbols_list,
+            "symbols": symbols_list,
+            "available_cartridges": self.list_available_cartridges(),
+            "previous_cartridge": self._previous_filename,
+        }
+
+    async def hot_swap_from_bytes(self, filename: str, content: bytes) -> Dict[str, Any]:
+        safe_name = os.path.basename(filename)
+        if not safe_name.endswith(".joblib"):
+            safe_name += ".joblib"
+        target_path = os.path.join(settings.CARTRIDGES_DIR, safe_name)
+        with open(target_path, "wb") as f:
+            f.write(content)
+        info = self.load_cartridge_by_name(safe_name)
+        info["ok"] = True
+        info["active_cartridge"] = safe_name
+        info["supported_symbols"] = info.get("symbols", [])
+        return info
+
+    async def rollback_to_previous(self) -> Dict[str, Any]:
         if not self._previous_filename:
             raise RuntimeError("Немає попереднього картриджа для відкату.")
         self._logger.warning(f"🔄 Відкат до попереднього картриджа '{self._previous_filename}'...")
         res = self.load_cartridge_by_name(self._previous_filename)
         self._previous_filename = ""
+        res["ok"] = True
+        res["active_cartridge"] = self._active_filename
+        res["supported_symbols"] = res.get("symbols", [])
         return res

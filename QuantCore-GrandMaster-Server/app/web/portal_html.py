@@ -382,7 +382,7 @@ function renderCoinsMatrix(coins){
           <option value="3" ${c.mode===3?'selected':''}>📉 SHORT ONLY</option>
           <option value="0" ${c.mode===0?'selected':''}>🔴 OFF (Вимк)</option>
         </select>
-        <input type="number" step="0.05" min="0.2" max="2.5" value="${c.base_weight}"
+        <input type="number" step="0.05" min="0.2" max="3.5" value="${c.base_weight}"
                style="width:64px;padding:5px" title="Базовий пріоритет капіталу"
                onchange="updateCoinWeight('${c.symbol}', this.value)">
       </div>
@@ -413,11 +413,19 @@ async function updateCoinWeight(sym, wVal){
 async function changeRiskProfile(){
   const prof = document.getElementById('riskSelect').value;
   const om = document.getElementById('orchModeSelect').value;
-  await apiFetch('/api/v1/control/risk', {
-    method:'POST',
-    body: JSON.stringify({risk_profile: prof, orchestrator_mode: om})
-  });
-  showToast(`⚙️ Встановлено профіль ${prof} (${om})!`);
+  try{
+    const r = await apiFetch('/api/v1/control/risk', {
+      method:'POST',
+      body: JSON.stringify({risk_profile: prof, orchestrator_mode: om})
+    });
+    if(r && r.ok){
+      showToast(`⚙️ Збережено профіль: ${prof} (${om})!`);
+    } else {
+      showToast(`❌ Помилка: ${r?.detail || 'Відхилено'}`, true);
+    }
+  }catch(e){
+    showToast(`❌ Помилка: ${e.message}`, true);
+  }
   loadState();
 }
 
@@ -493,13 +501,13 @@ async function loadState(){
     document.getElementById('statusDot').className = 'pulse ' + (isPausedState ? 'warn' : 'on');
     document.getElementById('statusText').innerText = isPausedState ? 'PAUSED (Торгівля на паузі)' : 'ONLINE (Zero-Idle Hibernation)';
     document.getElementById('pauseBtn').innerText = isPausedState ? '▶️ Старт' : '⏸️ Пауза';
-    document.getElementById('cartridgeBadge').innerText = d.cartridge.active_cartridge;
-    document.getElementById('ramBadge').innerText = res.ram_rss_mb + ' MB';
-    document.getElementById('diskBadge').innerText = res.storage_used_mb + ' MB';
+    document.getElementById('cartridgeBadge').innerText = (d.cartridge && d.cartridge.active_cartridge) ? d.cartridge.active_cartridge : 'Active';
+    document.getElementById('ramBadge').innerText = (res.ram_rss_mb || '--') + ' MB';
+    document.getElementById('diskBadge').innerText = (res.storage_used_mb || '--') + ' MB';
     document.getElementById('candleBadge').innerText = t.timestamp || eng.last_candle_ts || '--';
 
-    document.getElementById('riskSelect').value = eng.risk_profile;
-    document.getElementById('orchModeSelect').value = eng.orchestrator_mode;
+    if(eng && eng.risk_profile) document.getElementById('riskSelect').value = eng.risk_profile;
+    if(eng && eng.orchestrator_mode) document.getElementById('orchModeSelect').value = eng.orchestrator_mode;
 
     document.getElementById('kpiLev').innerText = (t.gross_leverage || 0).toFixed(2) + 'x';
     document.getElementById('kpiLeader').innerText = 'Лідер: ' + (t.top_leader || 'BTCUSDT');

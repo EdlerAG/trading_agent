@@ -97,9 +97,9 @@ class CoinControlUpdateRequest(BaseModel):
     symbol: str = Field(..., min_length=5, max_length=16, description="Наприклад BTCUSDT")
     enabled: Optional[bool] = None
     mode: Optional[int] = Field(None, ge=0, le=4, description="0=OFF, 1=AUTO, 2=LONG_ONLY, 3=SHORT_ONLY, 4=CORE_ONLY")
-    base_weight: Optional[float] = Field(None, ge=0.10, le=2.50)
+    base_weight: Optional[float] = Field(None, ge=0.10, le=3.50)
     max_long_lev: Optional[float] = Field(None, ge=0.20, le=3.50)
-    max_short_lev: Optional[float] = Field(None, ge=0.00, le=2.50)
+    max_short_lev: Optional[float] = Field(None, ge=0.00, le=3.50)
 
 
 class RiskProfileUpdateRequest(BaseModel):
