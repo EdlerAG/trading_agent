@@ -49,7 +49,7 @@ echo "🔧 Генерація $SERVICE_FILE..."
 
 sudo bash -c "cat > $SERVICE_FILE" <<EOF
 [Unit]
-Description=QuantCore V23 GrandMaster Multi-Asset Server
+Description=QuantCore V58.0 Pure SOTA Server
 After=network.target network-online.target
 Wants=network-online.target
 

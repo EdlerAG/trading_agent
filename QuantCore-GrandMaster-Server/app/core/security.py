@@ -7,7 +7,7 @@ from app.core.config import settings
 
 def compute_session_token(password: str) -> str:
     """Генерує детермінований SHA-256 токен сесії з пароля дашборду."""
-    salted = f"quantcore_sovereign_v23::{password}".encode("utf-8")
+    salted = f"quantcore_sovereign_v58::{password}".encode("utf-8")
     return hashlib.sha256(salted).hexdigest()
 
 

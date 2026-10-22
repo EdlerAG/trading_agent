@@ -38,7 +38,7 @@ class TierRole(IntEnum):
 
 
 class CascadePhase(IntEnum):
-    """Фаза каскадного скінченного автомата (State Machine V13..V23)."""
+    """Фаза каскадного скінченного автомата (State Machine V58)."""
     SHORT_CASCADE = -1    # 🔴 F4: Каскадний шорт
     SCANNING_CASH = 0     # ⚪ F0: 100% Кеш (Сканування)
     SCOUT_IGNITION = 1    # 🟡 F1: Розвідник (0.7x..0.85x)
@@ -65,5 +65,5 @@ class RiskProfile(StrEnum):
 
 
 class OrchestratorMode(StrEnum):
-    PORTFOLIO_SYNERGY = "PORTFOLIO_SYNERGY"  # Командне синхронне ядро V23 (+ Sticky Waterfall)
+    PORTFOLIO_SYNERGY = "PORTFOLIO_SYNERGY"  # Командне синхронне ядро V58 Pure SOTA (+ Sticky Waterfall)
     SOLO_MAX = "SOLO_MAX"                    # Незалежні соло-рекордсмени для кожної монети

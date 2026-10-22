@@ -188,8 +188,7 @@ async def lifespan(app: FastAPI):
 # --- ІНІЦІАЛІЗАЦІЯ FASTAPI ЗАСТОСУНКУ ---
 app = FastAPI(
     title="QuantCore Sovereign Multi-Asset Terminal",
-    version="23.0-GrandMaster",
-    default_response_class=ORJSONResponse,
+    version="58.0-PureSOTA",
     lifespan=lifespan,
 )
 

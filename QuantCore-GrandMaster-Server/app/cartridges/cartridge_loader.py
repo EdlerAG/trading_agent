@@ -9,14 +9,14 @@ from app.core.config import settings
 from app.core.memory_guard import memory_guard
 from app.core.events import event_bus, EventType
 from app.domain.interfaces import IService, IAlphaCartridge
-from app.cartridges.v23_grand_master_cartridge import V23GrandMasterCartridge
+from app.cartridges.v58_grand_master_cartridge import V58GrandMasterCartridge
 
 
 class CartridgeLoaderService(IService):
     """
-    Сервіс керування картриджами ШІ-моделей (.joblib) покоління V23+ Grand-Master:
+    Сервіс керування картриджами ШІ-моделей (.joblib) покоління QuantCore V58.0 Pure SOTA:
     - Автоматично знаходить та завантажує найновіший мультивалютний бандл при старті.
-    - Якщо файлу .joblib на диску ще немає — запускає автономне структурне ядро V23 на 5 валют.
+    - Якщо файлу .joblib на диску ще немає — запускає автономне ядро V58 Pure SOTA.
     - Підтримує гарячу заміну (Hot-Swap) моделі з Telegram або Web-інтерфейсу за 1.5 сек без рестарту.
     """
 
@@ -25,7 +25,7 @@ class CartridgeLoaderService(IService):
     def __init__(self, logger: logging.Logger) -> None:
         self._logger = logger
         self._active_cartridge: Optional[IAlphaCartridge] = None
-        self._active_filename: str = "v23_autonomous_structural"
+        self._active_filename: str = "v58_autonomous_sota"
         self._previous_filename: str = ""
 
     @property
@@ -39,8 +39,8 @@ class CartridgeLoaderService(IService):
     @property
     def cartridge(self) -> IAlphaCartridge:
         if self._active_cartridge is None:
-            self._active_cartridge = V23GrandMasterCartridge(
-                filename="v23_autonomous_structural",
+            self._active_cartridge = V58GrandMasterCartridge(
+                filename="v58_autonomous_sota",
                 bundle={"symbols": list(settings.DEFAULT_SYMBOLS), "assets": {}},
             )
         return self._active_cartridge
@@ -56,16 +56,17 @@ class CartridgeLoaderService(IService):
 
         candidates = self.list_available_cartridges()
         if not candidates:
-            self._logger.info("ℹ️ Зовнішніх .joblib у storage/cartridges/ поки немає. Активовано автономне 5-валютне ядро V23.")
-            self._active_cartridge = V23GrandMasterCartridge(
-                filename="v23_autonomous_structural",
+            self._logger.info("ℹ️ Зовнішніх .joblib у storage/cartridges/ поки немає. Активовано автономне SOTA ядро V58.0.")
+            self._active_cartridge = V58GrandMasterCartridge(
+                filename="v58_autonomous_sota",
                 bundle={"symbols": list(settings.DEFAULT_SYMBOLS), "assets": {}},
             )
             return
 
         preferred = candidates[0]
         for cand in candidates:
-            if "v23" in cand.lower() or "grand_master" in cand.lower():
+            c_low = cand.lower()
+            if any(k in c_low for k in ("v58", "v53", "v52", "v51", "pure_sota", "sota", "quantum")):
                 preferred = cand
                 break
 
@@ -91,11 +92,10 @@ class CartridgeLoaderService(IService):
     def _instantiate_adapter(filename: str, raw_bundle: Any) -> IAlphaCartridge:
         if isinstance(raw_bundle, IAlphaCartridge):
             return raw_bundle
-        if not isinstance(raw_bundle, dict) or "assets" not in raw_bundle:
-            raise ValueError(
-                f"Файл '{filename}' не є мультивалютним картриджем QuantCore V23+ (відсутній ключ 'assets')."
-            )
-        return V23GrandMasterCartridge(filename=filename, bundle=raw_bundle)
+        if not isinstance(raw_bundle, dict):
+            raise ValueError(f"Файл '{filename}' не є коректним словником картриджа QuantCore.")
+
+        return V58GrandMasterCartridge(filename=filename, bundle=raw_bundle)
 
     def load_cartridge_by_name(self, filename: str) -> Dict[str, Any]:
         safe_name = os.path.basename(filename)
@@ -109,7 +109,7 @@ class CartridgeLoaderService(IService):
 
         if (
             self._active_filename
-            and self._active_filename != "v23_autonomous_structural"
+            and self._active_filename != "v58_autonomous_sota"
             and self._active_filename != safe_name
         ):
             self._previous_filename = self._active_filename
@@ -121,62 +121,23 @@ class CartridgeLoaderService(IService):
         freed_bytes = memory_guard.enforce_disk_quota(active_cartridge_filename=safe_name)
         rss_mb = memory_guard.trim_ram()
 
-        info = {
-            "ok": True,
-            "active_cartridge": self._active_filename,
+        meta = {
+            "filename": safe_name,
             "architecture": new_cartridge.architecture_name,
-            "supported_symbols": list(new_cartridge.supported_symbols),
-            "ram_rss_mb": rss_mb,
-            "disk_freed_kb": round(freed_bytes / 1024.0, 1),
+            "symbols": list(new_cartridge.supported_symbols),
+            "ram_after_mb": rss_mb,
+            "freed_bytes": freed_bytes,
         }
         self._logger.info(
             f"✅ Картридж '{safe_name}' ({new_cartridge.architecture_name}) активовано! "
             f"Валюти: {', '.join(new_cartridge.supported_symbols)} | RAM: {rss_mb:.1f} MB"
         )
-        return info
+        return meta
 
-    async def hot_swap_from_bytes(self, filename: str, content: bytes) -> Dict[str, Any]:
-        clean_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", os.path.basename(filename))
-        if not clean_name.endswith(".joblib"):
-            clean_name += ".joblib"
-
-        tmp_path = os.path.join(settings.CARTRIDGES_DIR, clean_name + ".tmp")
-        final_path = os.path.join(settings.CARTRIDGES_DIR, clean_name)
-
-        with open(tmp_path, "wb") as f:
-            f.write(content)
-
-        try:
-            test_bundle = joblib.load(tmp_path)
-            _ = self._instantiate_adapter(clean_name, test_bundle)
-            del test_bundle
-        except Exception as e:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-            memory_guard.trim_ram()
-            raise ValueError(f"Файл пошкоджено або несумісний із V23+ IAlphaCartridge: {e}")
-
-        os.replace(tmp_path, final_path)
-        res = self.load_cartridge_by_name(clean_name)
-        await event_bus.publish(EventType.CARTRIDGE_HOT_SWAPPED, res, wake_engine=True)
+    def rollback_to_previous(self) -> Dict[str, Any]:
+        if not self._previous_filename:
+            raise RuntimeError("Немає попереднього картриджа для відкату.")
+        self._logger.warning(f"🔄 Відкат до попереднього картриджа '{self._previous_filename}'...")
+        res = self.load_cartridge_by_name(self._previous_filename)
+        self._previous_filename = ""
         return res
-
-    async def rollback_to_previous(self) -> Dict[str, Any]:
-        available = [f for f in self.list_available_cartridges() if f != self._active_filename]
-        target = self._previous_filename if self._previous_filename in available else (available[0] if available else "")
-        if not target:
-            raise ValueError("Попередній картридж для відкату відсутній на диску.")
-
-        res = self.load_cartridge_by_name(target)
-        await event_bus.publish(EventType.CARTRIDGE_HOT_SWAPPED, res, wake_engine=True)
-        return res
-
-    def get_metadata(self) -> Dict[str, Any]:
-        c = self.cartridge
-        return {
-            "active_cartridge": self._active_filename,
-            "previous_cartridge": self._previous_filename,
-            "architecture": c.architecture_name,
-            "supported_symbols": list(c.supported_symbols),
-            "available_on_disk": self.list_available_cartridges(),
-        }

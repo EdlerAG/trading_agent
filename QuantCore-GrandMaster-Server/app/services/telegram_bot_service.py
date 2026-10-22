@@ -24,7 +24,7 @@ from app.cartridges.cartridge_loader import CartridgeLoaderService
 
 class TelegramBotService(IService):
     """
-    Повнофункціональний пульт керування QuantCore V23 у Telegram:
+    Повнофункціональний пульт керування QuantCore V58.0 Pure SOTA у Telegram:
     1. Керування 5 валютами в 1 клік (AUTO / LONG_ONLY / CORE_ONLY / OFF).
     2. Прийом файлів прямо в чаті (як OTA у SmartLamp):
        - *.joblib -> миттєва гаряча заміна моделі ШІ (Hot-Swap) без зупинки!
@@ -54,8 +54,10 @@ class TelegramBotService(IService):
         "enums.py": "app/domain",
         "schemas.py": "app/domain",
         "interfaces.py": "app/domain",
-        "feature_pipe_v23.py": "app/cartridges",
-        "v23_grand_master_cartridge.py": "app/cartridges",
+        "feature_pipe_v58.py": "app/cartridges",
+        "v58_grand_master_cartridge.py": "app/cartridges",
+        "feature_pipe_v58.py": "app/cartridges",
+        "v58_grand_master_cartridge.py": "app/cartridges",
         "cartridge_loader.py": "app/cartridges",
         "state_service.py": "app/services",
         "online_adaptation_service.py": "app/services",
@@ -107,7 +109,7 @@ class TelegramBotService(IService):
         return {
             "inline_keyboard": [
                 [
-                    {"text": "📊 Статус V23", "callback_data": "cmd_status"},
+                    {"text": "📊 Статус V58", "callback_data": "cmd_status"},
                     {"text": "🧬 Радар 5 Валют", "callback_data": "cmd_radar"},
                 ],
                 [
@@ -242,7 +244,7 @@ class TelegramBotService(IService):
                 coin_lines.append(f"• <b>{sym}</b>: ⚪ Кеш (<code>${p:,.2f}</code>) | {m_str}")
 
         return (
-            f"👑 <b>QUANTCORE V23 GRAND-MASTER</b>\n"
+            f"👑 <b>QUANTCORE V58.0 PURE SOTA</b>\n"
             f"═══════════════════════\n"
             f"• <b>Статус:</b> {status_str}\n"
             f"• <b>Картридж:</b> <code>{self._cartridges.active_name}</code>\n"
@@ -260,7 +262,7 @@ class TelegramBotService(IService):
         radar = self._state.get_coins_radar_list()
         t = self._state.latest_telemetry
         lines = [
-            f"🧬 <b>РАДАР 5 МЕЙДЖОРІВ V23 GRAND-MASTER</b>",
+            f"🧬 <b>РАДАР 5 МЕЙДЖОРІВ V58.0 PURE SOTA</b>",
             f"═══════════════════════",
             f"• <b>Ширина ринку (Breadth):</b> <code>{t.get('market_breadth', 0.0):+.2f}</code>",
             f"• <b>Новинний сентимент Gemini:</b> <code>{t.get('news_sentiment', 0.0):+.2f}</code>",
@@ -304,11 +306,11 @@ class TelegramBotService(IService):
             btc_r = chart["btc_ret_pct"]
             dd_r = chart["drawdown_pct"]
 
-            ax1.plot(x_idx, eq_r, color="#10b981", linewidth=2.2, label=f"QuantCore V23 ({kpis.get('total_pnl_pct', 0):+.2f}%)")
+            ax1.plot(x_idx, eq_r, color="#10b981", linewidth=2.2, label=f"QuantCore V58.0 Pure SOTA ({kpis.get('total_pnl_pct', 0):+.2f}%)")
             ax1.plot(x_idx, btc_r, color="#f59e0b", linewidth=1.3, linestyle="--", label=f"BTC B&H ({kpis.get('btc_bh_pct', 0):+.2f}%)")
             ax1.set_ylabel("Дохідність (%)", color="#cbd5e1", fontsize=9)
             ax1.legend(loc="upper left", facecolor="#070b14", edgecolor="#334155", labelcolor="white", fontsize=8.5)
-            ax1.set_title("QUANTCORE V23 GRAND-MASTER: MULTI-ASSET EQUITY vs BTC", color="#f8fafc", fontsize=10.5, weight="bold")
+            ax1.set_title("QUANTCORE V58.0 PURE SOTA: MULTI-ASSET EQUITY vs BTC", color="#f8fafc", fontsize=10.5, weight="bold")
 
             ax2.plot(x_idx, dd_r, color="#ef4444", linewidth=1.3, label="Drawdown %")
             ax2.fill_between(x_idx, dd_r, 0, color="#ef4444", alpha=0.18)
@@ -330,9 +332,9 @@ class TelegramBotService(IService):
         memory_guard.trim_ram()
 
         url = f"https://api.telegram.org/bot{settings.TELEGRAM_TOKEN}/sendPhoto"
-        files = {"photo": ("quantcore_v23.png", png_bytes, "image/png")}
+        files = {"photo": ("quantcore_v58.png", png_bytes, "image/png")}
         caption = (
-            f"📈 <b>Звіт QuantCore V23 Grand-Master:</b>\n"
+            f"📈 <b>Звіт QuantCore V58.0 Pure SOTA:</b>\n"
             f"• Equity: <b>${kpis.get('latest_equity', 0):,.2f}</b> (<b>{kpis.get('total_pnl_pct', 0):+.2f}%</b>)\n"
             f"• Чиста Альфа vs BTC: <b>{kpis.get('alpha_vs_btc_pct', 0):+.2f}%</b>\n"
             f"• Sharpe: <b>{kpis.get('sharpe_ratio', 0):.2f}</b> | Calmar: <b>{kpis.get('calmar_ratio', 0):.2f}</b> | MaxDD: <b>{kpis.get('max_drawdown_pct', 0):.2f}%</b>"
@@ -450,7 +452,7 @@ class TelegramBotService(IService):
 
         elif cmd in ("/coins", "cmd_coins_menu"):
             await self.send_alert(
-                "🎛️ <b>ПУЛЬТ КЕРУВАННЯ ВАЛЮТАМИ V23:</b>\n"
+                "🎛️ <b>ПУЛЬТ КЕРУВАННЯ ВАЛЮТАМИ V58:</b>\n"
                 "Натисніть на валюту, щоб перемкнути її режим по колу:\n"
                 "<code>🟢 AUTO ➔ 📈 LONG ONLY ➔ 🛡️ CORE ONLY ➔ 🔴 OFF</code>",
                 reply_markup=self._coins_menu_keyboard(),
@@ -493,7 +495,7 @@ class TelegramBotService(IService):
             if not trades:
                 await self.send_alert("📜 Журнал угод поки порожній.")
             else:
-                lines = ["📜 <b>ОСТАННІ ОПЕРАЦІЇ V23 GRAND-MASTER:</b>\n═══════════════════════"]
+                lines = ["📜 <b>ОСТАННІ ОПЕРАЦІЇ V58.0 PURE SOTA:</b>\n═══════════════════════"]
                 for t in trades:
                     ic = "🟢 BUY" if t["side"] == "BUY" else "🔴 SELL"
                     pnl_s = f" | PnL: <b>{t['net_pnl']:+.2f}$</b>" if t["pnl"] != 0 else ""
@@ -539,7 +541,7 @@ class TelegramBotService(IService):
         elif cmd == "cmd_dl_db":
             b_path = self._db.cleanup_old_records_and_backup()
             if b_path:
-                await self.send_document(b_path, caption="📦 Актуальний зріз бази даних QuantCore V23")
+                await self.send_document(b_path, caption="📦 Актуальний зріз бази даних QuantCore V58.0 Pure SOTA")
 
         elif cmd == "cmd_wakeup":
             await event_bus.publish(EventType.FORCE_RECALC, {}, wake_engine=True)
@@ -607,9 +609,9 @@ class TelegramBotService(IService):
             self._logger.warning("⚠️ TELEGRAM_TOKEN не налаштовано. Telegram-бот вимкнено.")
             return
 
-        self._logger.info("📱 Telegram Long-Polling слухач V23 (OTA + Multi-Coin Control) активовано.")
+        self._logger.info("📱 Telegram Long-Polling слухач V58 (OTA + Multi-Coin Control) активовано.")
         await self.send_alert(
-            f"👑 <b>QuantCore V23.0 Grand-Master запущено!</b>\n"
+            f"👑 <b>QuantCore V58.0 Pure SOTA запущено!</b>\n"
             f"• Картридж: <code>{self._cartridges.active_name}</code>\n"
             f"• Профіль: <code>{self._state.risk_profile} ({self._state.max_portfolio_lev:.1f}x)</code>\n"
             f"• RAM: <code>{memory_guard.get_rss_mb():.1f} MB</code>"

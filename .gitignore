@@ -63,3 +63,6 @@ quant_core_production.joblib
 build/
 dist/
 *.egg-info/
+
+# --- Local Junctions & Symlinks ---
+oracle/

@@ -16,7 +16,7 @@ from app.cartridges.cartridge_loader import CartridgeLoaderService
 
 class MultiAssetExecutionOrchestrator(IService):
     """
-    Верховний Оркестратор Виконання (V23 Grand-Master & Universal Cartridge Runner):
+    Верховний Оркестратор Виконання (QuantCore V58.0 Pure SOTA Runner):
     - Керує кошиком із 5+ валют одночасно на єдиному ф'ючерсному рахунку USDT.
     - Фіксує спрацювання біржових стопів у SQLite та зберігає захист Breakeven при ребалансах.
     """
@@ -145,7 +145,7 @@ class MultiAssetExecutionOrchestrator(IService):
         t0 = time.time()
 
         if self._state.check_and_auto_resume_pause():
-            await self._send_alert("▶️ <b>Час паузи вичерпано!</b> QuantCore V23 відновив штатну торгівлю.")
+            await self._send_alert("▶️ <b>Час паузи вичерпано!</b> QuantCore V58.0 відновив штатну торгівлю.")
 
         if self._state.force_step:
             force_recalc = True
@@ -170,7 +170,7 @@ class MultiAssetExecutionOrchestrator(IService):
         candles_map: Dict[str, pd.DataFrame] = {}
         for sym in active_syms:
             df = await self._exchange.fetch_delta_candles(sym, limit=settings.CANDLES_FETCH_LIMIT)
-            if df is not None and len(df) >= 1650:
+            if df is not None and len(df) >= 200:
                 candles_map[sym] = df
 
         if "BTCUSDT" not in candles_map:
@@ -313,7 +313,7 @@ class MultiAssetExecutionOrchestrator(IService):
                     pnl_est = coin_upnl.get(sym, 0.0) * trim_ratio
                 else:
                     pnl_est = 0.0
-                note_str = f"V23 Phase {target_dto.phase} ({desired_w:+.2f}x | MWU:{c_st.mwu_trust:.2f}x)"
+                note_str = f"V58 Phase {target_dto.phase} ({desired_w:+.2f}x | MWU:{c_st.mwu_trust:.2f}x)"
 
             ord_dto = await self._exchange.execute_smart_rebalance_order(
                 symbol=sym,
@@ -323,6 +323,16 @@ class MultiAssetExecutionOrchestrator(IService):
                 note=note_str,
                 reduce_only=reduce_only,
             )
+
+            if ord_dto is None:
+                if is_closing_to_cash:
+                    c_st.current_pos_qty = 0.0
+                    c_st.entry_price = 0.0
+                    c_st.active_sl_price = 0.0
+                    c_st.bars_held = 0
+                    c_st.is_breakeven = False
+                    await self._exchange.cancel_symbol_orders(sym)
+                continue
 
             if ord_dto is not None:
                 old_qty = c_st.current_pos_qty
@@ -357,10 +367,17 @@ class MultiAssetExecutionOrchestrator(IService):
                     c_st.active_sl_price = sl_p
                     await self._exchange.place_or_update_stop_loss(sym, new_pos_qty, sl_p)
 
+                    # V58.0 Sub-Candle MFE Harvester: take-profit order at +1.35 ATR
+                    tp_dist = settings.SUB_CANDLE_MFE_ATR_MULT * cur_atr
+                    raw_tp = (c_st.entry_price + tp_dist) if new_pos_qty > 0 else (c_st.entry_price - tp_dist)
+                    tp_p = self._exchange.safe_price(sym, raw_tp)
+                    if hasattr(self._exchange, "place_or_update_take_profit"):
+                        await self._exchange.place_or_update_take_profit(sym, new_pos_qty, tp_p)
+
                     icon = "🟢" if ord_dto.side == "BUY" else "🔴"
                     executed_orders_summary.append(
                         f"{icon} <b>{sym}</b>: {ord_dto.side} <code>{ord_dto.executed_qty}</code> @ <code>${ord_dto.avg_price:,.2f}</code> "
-                        f"➔ <b>{desired_w:+.2f}x</b> (SL: <code>${sl_p:,.2f}</code>)"
+                        f"➔ <b>{desired_w:+.2f}x</b> (SL: <code>${sl_p:,.2f}</code> | TP: <code>${tp_p:,.2f}</code>)"
                     )
                 else:
                     c_st.current_pos_qty = 0.0
@@ -368,9 +385,24 @@ class MultiAssetExecutionOrchestrator(IService):
                     c_st.active_sl_price = 0.0
                     c_st.is_breakeven = False
                     c_st.bars_held = 0
+                    if hasattr(self._exchange, "cancel_symbol_orders"):
+                        await self._exchange.cancel_symbol_orders(sym)
                     executed_orders_summary.append(
                         f"⚪ <b>{sym}</b>: Вихід у КЕШ @ <code>${ord_dto.avg_price:,.2f}</code> (PnL: <b>{pnl_est:+.2f}$</b>)"
                     )
+
+        # 5b. Pillar 7: Margin-Backed Stink-Bids & VWAP Dip Sniper (використання 100% вільної маржі)
+        rem_lev_budget = max(0.0, self._state.max_portfolio_lev - portfolio_dto.total_gross_leverage)
+        if rem_lev_budget >= 0.40 and hasattr(self._exchange, "place_passive_stink_bid"):
+            top_sym = portfolio_dto.extra_telemetry.get("top_leader")
+            if top_sym and top_sym in portfolio_dto.targets and portfolio_dto.targets[top_sym].desired_weight > 0:
+                t_info = portfolio_dto.targets[top_sym]
+                stink_p = t_info.current_price - 2.20 * t_info.atr_14
+                stink_usdt = total_equity * min(0.35, rem_lev_budget * 0.5)
+                stink_qty = stink_usdt / max(1e-8, stink_p)
+                min_q, _, min_not, _, _ = settings.get_symbol_spec(top_sym)
+                if stink_qty >= min_q and (stink_qty * stink_p) >= min_not:
+                    await self._exchange.place_passive_stink_bid(top_sym, stink_qty, stink_p)
 
         # 6. Збереження телеметрії, стану та SQLite зрізу
         self._learner.save_state()
@@ -420,7 +452,7 @@ class MultiAssetExecutionOrchestrator(IService):
 
         if executed_orders_summary:
             alert_txt = (
-                f"⚡ <b>QuantCore V23 Grand-Master: Ребаланс виконано!</b>\n"
+                f"⚡ <b>QuantCore V58.0 Pure SOTA: Ребаланс виконано!</b>\n"
                 f"═══════════════════════\n"
                 + "\n".join(executed_orders_summary)
                 + f"\n───────────────────────\n"

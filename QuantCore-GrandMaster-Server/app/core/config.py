@@ -32,14 +32,20 @@ RISK_PROFILES_MAP: Dict[str, Tuple[float, float, float]] = {
     "OVERDRIVE":    (1.25, 3.50, 0.25),
 }
 
+# (min_qty, step_size, min_notional, tier_role, base_weight)
 SYMBOL_SPECS: Dict[str, Tuple[float, float, float, int, float]] = {
     "BTCUSDT":  (0.001, 0.001, 5.0, 1, 1.22),
     "ETHUSDT":  (0.005, 0.001, 5.0, 1, 1.22),
-    "SOLUSDT":  (0.1,   0.1,   5.0, 1, 1.12),
-    "BNBUSDT":  (0.01,  0.01,  5.0, 2, 0.90),
+    "SOLUSDT":  (0.1,   0.1,   5.0, 1, 1.20),
+    "BNBUSDT":  (0.01,  0.01,  5.0, 3, 0.50),   # Quarantined in longs
     "XRPUSDT":  (4.0,   0.1,   5.0, 2, 0.95),
-    "AVAXUSDT": (0.2,   0.1,   5.0, 2, 0.85),
-    "LINKUSDT": (0.4,   0.1,   5.0, 2, 0.85),
+    "DOGEUSDT": (1.0,   1.0,   5.0, 2, 0.85),
+    "ADAUSDT":  (1.0,   0.1,   5.0, 2, 0.85),
+    "AVAXUSDT": (0.2,   0.1,   5.0, 2, 1.05),
+    "LINKUSDT": (0.4,   0.1,   5.0, 2, 1.15),
+    "SUIUSDT":  (0.1,   0.1,   5.0, 2, 1.15),
+    "NEARUSDT": (0.1,   0.1,   5.0, 1, 1.20),
+    "FETUSDT":  (0.1,   0.1,   5.0, 3, 0.22),   # Quarantined in longs
 }
 
 
@@ -56,8 +62,8 @@ def ccxt_to_symbol(ccxt_sym: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class Settings:
-    PROJECT_NAME: str = "QuantCore Grand-Master Server"
-    VERSION: str = "23.0-GrandMaster"
+    PROJECT_NAME: str = "QuantCore Sovereign Server"
+    VERSION: str = "58.0-PureSOTA"
 
     BASE_DIR: str = BASE_DIR
     STORAGE_DIR: str = os.path.join(BASE_DIR, "storage")
@@ -92,8 +98,8 @@ class Settings:
 
     CANDLES_FETCH_LIMIT: int = 1950
     CASH_ZONE_THRESHOLD: float = 0.06
-    ACTION_DEADZONE: float = 0.25
-    STICKY_RANK_BONUS: float = 0.03
+    ACTION_DEADZONE: float = 0.18
+    STICKY_RANK_BONUS: float = 0.05
 
     MAX_DAILY_LOSS_PCT: float = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.06"))
     MAX_ALLOWED_SPREAD_PCT: float = 0.0010
@@ -101,8 +107,10 @@ class Settings:
     FUNDING_BUFFER_MINUTES: int = 15
     MAKER_TIMEOUT_SEC: int = 18
 
-    EMERGENCY_SL_ATR_MULT: float = 3.5
-    ATR_BREAKEVEN_TRIGGER: float = 1.8
+    # V58.0 Breakthrough: Intra-Candle ATR Stop-Loss & Sub-Candle MFE Harvester
+    EMERGENCY_SL_ATR_MULT: float = 1.35
+    SUB_CANDLE_MFE_ATR_MULT: float = 1.35
+    ATR_BREAKEVEN_TRIGGER: float = 1.20
     BREAKEVEN_BUFFER_PCT: float = 0.0007
 
     MAX_STORAGE_MB: int = int(os.getenv("MAX_STORAGE_MB", "250"))
@@ -114,7 +122,10 @@ class Settings:
     DEFAULT_SYMBOLS: Tuple[str, ...] = field(
         default_factory=lambda: tuple(
             s.strip().upper()
-            for s in os.getenv("ACTIVE_SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT").split(",")
+            for s in os.getenv(
+                "ACTIVE_SYMBOLS",
+                "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,AVAXUSDT,LINKUSDT,SUIUSDT"
+            ).split(",")
             if s.strip()
         )
     )

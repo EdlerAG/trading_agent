@@ -348,7 +348,11 @@ class ExchangeCcxtService(IExchangeGateway):
                     price=limit_price,
                     params=params,
                 )
-            except Exception:
+            except Exception as e:
+                err_s = str(e)
+                if "-2022" in err_s or "ReduceOnly" in err_s:
+                    self._logger.info(f"ℹ️ [{clean_sym}] Позиція вже закрита на біржі (-2022 ReduceOnly).")
+                    return None
                 maker_order = None
 
             filled = False
@@ -393,12 +397,19 @@ class ExchangeCcxtService(IExchangeGateway):
                 m_qty = self.safe_amount(clean_sym, rem)
                 if m_qty >= min_qty and (reduce_only or (m_qty * est_price) >= min_notional):
                     m_params = {"reduceOnly": True} if reduce_only else {}
-                    m_ord = self._exchange.create_market_order(ccxt_sym, side, m_qty, params=m_params)
-                    if m_ord and isinstance(m_ord, dict):
-                        market_filled = float(m_ord.get("filled") or m_qty)
-                        market_price = float(m_ord.get("average") or m_ord.get("price") or est_price)
-                        fee_cost += float((m_ord.get("fee") or {}).get("cost") or (market_filled * market_price * 0.0005))
-                        order_id = m_ord.get("id")
+                    try:
+                        m_ord = self._exchange.create_market_order(ccxt_sym, side, m_qty, params=m_params)
+                        if m_ord and isinstance(m_ord, dict):
+                            market_filled = float(m_ord.get("filled") or m_qty)
+                            market_price = float(m_ord.get("average") or m_ord.get("price") or est_price)
+                            fee_cost += float((m_ord.get("fee") or {}).get("cost") or (market_filled * market_price * 0.0005))
+                            order_id = m_ord.get("id")
+                    except Exception as e:
+                        err_s = str(e)
+                        if "-2022" in err_s or "ReduceOnly" in err_s:
+                            self._logger.info(f"ℹ️ [{clean_sym}] Позиція вже закрита на біржі (-2022 ReduceOnly).")
+                            return None
+                        raise e
 
             tot_qty = maker_filled + market_filled
             if tot_qty <= 0.0:
@@ -467,6 +478,86 @@ class ExchangeCcxtService(IExchangeGateway):
             return True
         except Exception as e:
             self._logger.warning(f"⚠️ [{clean_sym}] Не вдалося виставити SL @ {sl_p}: {e}")
+            return False
+
+    async def place_or_update_take_profit(self, symbol: str, position_qty: float, tp_price: float) -> bool:
+        return await asyncio.to_thread(self._place_take_profit_sync, symbol, position_qty, tp_price)
+
+    def _place_take_profit_sync(self, symbol: str, position_qty: float, tp_price: float) -> bool:
+        if self._exchange is None:
+            return False
+        clean_sym = ccxt_to_symbol(symbol)
+        ccxt_sym = symbol_to_ccxt(clean_sym)
+        qty = self.safe_amount(clean_sym, abs(position_qty))
+        tp_p = self.safe_price(clean_sym, tp_price)
+        if qty <= 0.0 or tp_p <= 0.0:
+            return False
+
+        close_side = "sell" if position_qty > 0 else "buy"
+        try:
+            open_ords = self._exchange.fetch_open_orders(ccxt_sym)
+            for o in open_ords:
+                if str(o.get("type") or "").lower() in ("take_profit_market", "take_profit"):
+                    try:
+                        self._exchange.cancel_order(o["id"], ccxt_sym)
+                    except Exception:
+                        pass
+
+            self._exchange.create_order(
+                symbol=ccxt_sym,
+                type="TAKE_PROFIT_MARKET",
+                side=close_side,
+                amount=qty,
+                price=None,
+                params={
+                    "stopPrice": tp_p,
+                    "reduceOnly": True,
+                    "workingType": "MARK_PRICE",
+                },
+            )
+            return True
+        except Exception as e:
+            self._logger.warning(f"⚠️ [{clean_sym}] Не вдалося виставити TP @ {tp_p}: {e}")
+            return False
+
+    async def place_passive_stink_bid(self, symbol: str, qty: float, price: float) -> Optional[str]:
+        return await asyncio.to_thread(self._place_passive_stink_bid_sync, symbol, qty, price)
+
+    def _place_passive_stink_bid_sync(self, symbol: str, qty: float, price: float) -> Optional[str]:
+        if self._exchange is None:
+            return None
+        clean = ccxt_to_symbol(symbol)
+        ccxt_sym = symbol_to_ccxt(clean)
+        q = self.safe_amount(clean, qty)
+        p = self.safe_price(clean, price)
+        if q <= 0.0 or p <= 0.0:
+            return None
+        try:
+            ord_res = self._exchange.create_order(
+                symbol=ccxt_sym,
+                type="limit",
+                side="buy",
+                amount=q,
+                price=p,
+                params={"postOnly": True},
+            )
+            return str(ord_res.get("id") or "")
+        except Exception:
+            return None
+
+    async def cancel_symbol_orders(self, symbol: str) -> bool:
+        return await asyncio.to_thread(self._cancel_symbol_orders_sync, symbol)
+
+    def _cancel_symbol_orders_sync(self, symbol: str) -> bool:
+        if self._exchange is None:
+            return False
+        clean = ccxt_to_symbol(symbol)
+        ccxt_sym = symbol_to_ccxt(clean)
+        try:
+            self._exchange.cancel_all_orders(ccxt_sym)
+            return True
+        except Exception as e:
+            self._logger.warning(f"⚠️ [{clean}] Помилка скасування ордерів: {e}")
             return False
 
     async def emergency_liquidate_all(self, symbols: Tuple[str, ...]) -> str:

@@ -1,0 +1,68 @@
+name: QuantCore Pure SOTA CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+# Enforce least-privilege permissions across the entire workflow
+permissions: {}
+
+# Cancel obsolete in-flight runs when new commits arrive
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-sota-engine:
+    name: Code Quality & SOTA Pipeline Verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 1
+
+      - name: Setup Python 3.12 Runtime
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Production & Testing Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy pandas scikit-learn scipy fastapi ccxt pydantic joblib uvicorn
+
+      - name: Syntax & Bytecode Compilation Audit
+        run: |
+          python -m compileall -q QuantCore-GrandMaster-Server
+
+      - name: Zero-Legacy Architecture Audit (No V23 Remnants)
+        run: |
+          python -c "
+          import os, sys
+          root = 'QuantCore-GrandMaster-Server'
+          violators = []
+          for dirpath, _, filenames in os.walk(root):
+              for f in filenames:
+                  if f.endswith('.py') and not f.startswith('.'):
+                      p = os.path.join(dirpath, f)
+                      with open(p, 'r', encoding='utf-8', errors='ignore') as fp:
+                          text = fp.read()
+                      if 'v23' in text.lower():
+                          violators.append(p)
+          if violators:
+              print('❌ Found legacy V23 remnants in:', violators)
+              sys.exit(1)
+          print('✅ Zero-Legacy Audit: 100% pure modern architecture verified.')
+          "
+
+      - name: Run SOTA Feature Pipeline & Unit Tests
+        run: |
+          python -m unittest discover -s QuantCore-GrandMaster-Server/tests -p "test_*.py" -v

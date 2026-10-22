@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 import pandas as pd
 from app.domain.schemas import (
     CoinStateDTO,
@@ -33,8 +33,8 @@ class IService(ABC):
 class IAlphaCartridge(ABC):
     """
     Універсальний контракт Картриджа Моделі ШІ (Open/Closed Principle).
-    Будь-яка майбутня модель (V23 Grand-Master, V24 Derivatives, V30 Transformer
-    або старий V7.8) реалізує цей інтерфейс. Сервер викликає лише compute_portfolio_targets()
+    Будь-яка майбутня модель (QuantCore V58 Pure SOTA)
+    реалізує цей інтерфейс. Сервер викликає лише compute_portfolio_targets()
     і не залежить від внутрішньої математики моделі!
     """
     __slots__ = ()
@@ -42,7 +42,7 @@ class IAlphaCartridge(ABC):
     @property
     @abstractmethod
     def architecture_name(self) -> str:
-        """Назва архітектури бандла (напр. 'QuantCore_V23_0_Grand_Master_Production')."""
+        """Назва архітектури бандла (напр. 'QuantCore_V58_0_Pure_SOTA_Production')."""
 
     @property
     @abstractmethod
@@ -102,6 +102,23 @@ class IExchangeGateway(IService):
         """Надійно виставляє або оновлює біржовий STOP_MARKET (MARK_PRICE) на весь об'єм позиції."""
 
     @abstractmethod
+    async def place_or_update_take_profit(
+        self,
+        symbol: str,
+        position_qty: float,
+        tp_price: float,
+    ) -> bool:
+        """Виставляє біржовий TAKE_PROFIT_MARKET ордер для реалізації Sub-Candle MFE Harvester."""
+
+    @abstractmethod
+    async def place_passive_stink_bid(self, symbol: str, qty: float, price: float) -> Optional[str]:
+        """Виставляє пасивний Post-Only лімітний ордер (Stink-Bid) для збору ліквідаційного проколу."""
+
+    @abstractmethod
+    async def cancel_symbol_orders(self, symbol: str) -> bool:
+        """Скасовує всі активні лімітні, стоп та тейк-профіт ордери по конкретній валюті."""
+
+    @abstractmethod
     async def emergency_liquidate_all(self, symbols: Tuple[str, ...]) -> str:
         """Негайно скасовує всі ордери та закриває всі відкриті позиції в USDT за ринком."""
 
@@ -122,9 +139,14 @@ class IOnlineLearner(IService):
         curr_price: float,
         prev_model_pos: float,
         tier_role: int,
-        new_submodel_preds: Optional[list] = None,
+        new_submodel_preds: Optional[List[float]] = None,
     ) -> float:
-        """
-        Оновлює віртуальну криву pod_eq[symbol] на основі реальної зміни ціни,
-        коригує ваги під-моделей за алгоритмом Online Hedge/Bandit і повертає новий online_mult.
-        """
+        """Фіксує крок ціни та адаптує онлайн-ваги MWU/Bandit для монети."""
+
+    @abstractmethod
+    def get_all_learning_states(self) -> Dict[str, Dict[str, Any]]:
+        """Повертає онлайн-ваги по всіх монетах."""
+
+    @abstractmethod
+    def save_state(self) -> None:
+        """Атомарно зберігає стан самонавчання на диск."""

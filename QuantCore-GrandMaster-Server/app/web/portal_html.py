@@ -3,7 +3,7 @@ PORTAL_HTML: str = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-<title>QuantCore V23 Grand-Master | Sovereign Multi-Asset Terminal</title>
+<title>QuantCore V58.0 Pure SOTA | Sovereign Multi-Asset Terminal</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700;800&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
@@ -138,7 +138,7 @@ td{padding:8px 10px;border-bottom:1px solid rgba(255,255,255,0.05);font-family:'
 <div id="loginModal">
   <div class="login-box">
     <div style="font-size:40px;margin-bottom:8px">👑</div>
-    <h2 style="margin-bottom:4px">QUANTCORE V23</h2>
+    <h2 style="margin-bottom:4px">QUANTCORE V58.0 PURE SOTA</h2>
     <p style="font-size:12.5px;color:#94a3b8;margin-bottom:18px">Sovereign Multi-Asset Institutional Terminal</p>
     <input type="password" id="loginPass" placeholder="Введіть пароль термінала..." style="width:100%;margin-bottom:12px;padding:11px">
     <button class="btn btn-sky" style="width:100%;justify-content:center;padding:11px" onclick="doLogin()">🔓 Авторизувати термінал</button>
@@ -153,7 +153,7 @@ td{padding:8px 10px;border-bottom:1px solid rgba(255,255,255,0.05);font-family:'
       <div>
         <div style="display:flex;align-items:center;gap:8px">
           <span id="statusDot" class="pulse on"></span>
-          <span id="statusText" style="font-weight:800;font-size:14.5px">ONLINE (V23 GRAND-MASTER)</span>
+          <span id="statusText" style="font-weight:800;font-size:14.5px">ONLINE (V58.0 PURE SOTA)</span>
           <span style="color:#475569">|</span>
           <span class="mono" style="font-size:12.5px;color:var(--sky)" id="cartridgeBadge">Cartridge: loading...</span>
         </div>
@@ -220,7 +220,7 @@ td{padding:8px 10px;border-bottom:1px solid rgba(255,255,255,0.05);font-family:'
   <!-- ROW 2: 5-CURRENCY CONTROL MATRIX & LIVE RADAR -->
   <div class="bento-card">
     <div class="card-hdr">
-      <span class="card-title">🎛️ Пульт керування 5 валютами та Радар Каскаду V23 (Sticky Waterfall Top-3)</span>
+      <span class="card-title">🎛️ Пульт керування 10 валютами та Радар Каскаду V58 (Sticky Waterfall Top-3)</span>
       <span class="mono" style="font-size:12.5px;color:var(--muted)">
         Breadth: <b id="breadthVal" style="color:#fff">0.00</b> &nbsp;|&nbsp;
         Gemini News: <b id="newsVal" style="color:var(--sky)">0.00</b>
@@ -233,7 +233,7 @@ td{padding:8px 10px;border-bottom:1px solid rgba(255,255,255,0.05);font-family:'
   <div class="split-2">
     <div class="bento-card">
       <div class="card-hdr">
-        <span class="card-title">📈 Крива Капіталу V23 vs Buy & Hold BTC та Просадка (Drawdown %)</span>
+        <span class="card-title">📈 Крива Капіталу V58 vs Buy & Hold BTC та Просадка (Drawdown %)</span>
         <div style="display:flex;gap:6px">
           <button class="btn" style="padding:4px 9px;font-size:11.5px" onclick="loadCharts(1)">24г</button>
           <button class="btn" style="padding:4px 9px;font-size:11.5px" onclick="loadCharts(7)">7д</button>
@@ -369,7 +369,7 @@ function renderCoinsMatrix(coins){
         <div class="coin-metrics">
           <div>Позиція: <b>${posStr}</b></div>
           <div>Unrealized PnL: <b style="color:${pnlColor}">${c.unrealized_pnl >= 0 ? '+' : ''}${c.unrealized_pnl.toFixed(2)} USDT</b></div>
-          <div>Ціль V23: <b>${c.target_weight >= 0 ? '+' : ''}${c.target_weight.toFixed(2)}x</b> | SL: <b>${slStr}</b></div>
+          <div>Ціль V58: <b>${c.target_weight >= 0 ? '+' : ''}${c.target_weight.toFixed(2)}x</b> | SL: <b>${slStr}</b></div>
           <div>Alpha Score: <b>${c.alpha_score >= 0 ? '+' : ''}${c.alpha_score.toFixed(3)}</b> | MWU: <b>${c.effective_weight.toFixed(2)}x</b></div>
         </div>
         <div class="bar-bg"><div class="bar-fill" style="width:${normScore}%"></div></div>
@@ -549,7 +549,7 @@ async function loadCharts(days){
 
     if(ch && ch.times && ch.times.length > 0){
       Plotly.react('equityChart', [
-        {x: ch.times, y: ch.equity_ret_pct, name:'QuantCore V23 (%)', type:'scatter', mode:'lines', line:{color:'#10b981', width:2.5}, yaxis:'y1'},
+        {x: ch.times, y: ch.equity_ret_pct, name:'QuantCore V58.0 (%)', type:'scatter', mode:'lines', line:{color:'#10b981', width:2.5}, yaxis:'y1'},
         {x: ch.times, y: ch.btc_ret_pct, name:'Buy & Hold BTC (%)', type:'scatter', mode:'lines', line:{color:'#f59e0b', width:1.5, dash:'dot'}, yaxis:'y1'},
         {x: ch.times, y: ch.drawdown_pct, name:'Drawdown (%)', type:'scatter', mode:'lines', fill:'tozeroy', fillcolor:'rgba(239,68,68,0.16)', line:{color:'#ef4444', width:1.2}, yaxis:'y2'}
       ], {
