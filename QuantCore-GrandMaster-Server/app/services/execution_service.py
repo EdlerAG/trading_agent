@@ -190,7 +190,7 @@ class MultiAssetExecutionOrchestrator(IService):
         cartridge = self._cartridges.cartridge
         self._state.active_cartridge = self._cartridges.active_name
         active_syms = cartridge.supported_symbols
-        is_v23_family = (
+        is_multi_sleeve_family = (
             settings.CARTRIDGE_ENGINE in ("v2", "v3", "v4", "v5")
             or "v2" in str(self._cartridges.active_name).lower()
             or "v3" in str(self._cartridges.active_name).lower()
@@ -202,13 +202,13 @@ class MultiAssetExecutionOrchestrator(IService):
         )
 
         # 0. Скасування застарілих stink-bid ордерів ТІЛЬКИ для V58 (у V2/V3 економить 58 приватних REST-запитів щогодини!)
-        if (not is_v23_family) and hasattr(self._exchange, "cancel_all_stink_bids"):
+        if (not is_multi_sleeve_family) and hasattr(self._exchange, "cancel_all_stink_bids"):
             await self._exchange.cancel_all_stink_bids(active_syms)
         if self._ws_sentinel is not None:
             self._ws_sentinel.clear_stink_bids()
 
         # 1. Конкурентне завантаження свічок (для V2/V3 вимагаємо >=365 барів прогріву 360h фіч із фолбеком для коротких моків)
-        req_min_bars = 365 if is_v23_family else 200
+        req_min_bars = 365 if is_multi_sleeve_family else 200
         if self._market_data is not None:
             candles_map = await self._market_data.fetch_synchronized_candles(active_syms, min_bars=req_min_bars)
             if not candles_map and req_min_bars > 200:
