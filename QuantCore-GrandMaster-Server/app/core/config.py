@@ -194,6 +194,8 @@ class Settings:
 
     DASHBOARD_URL: str = os.getenv("DASHBOARD_URL", "http://localhost:8501").rstrip("/")
     DASHBOARD_PASSWORD: str = os.getenv("DASHBOARD_PASSWORD") or secrets.token_hex(24)
+    DASHBOARD_VIEW_PASSWORD: str = os.getenv("DASHBOARD_VIEW_PASSWORD", "").strip()
+    DASHBOARD_ADMIN_KEY_FILE: str = os.getenv("DASHBOARD_ADMIN_KEY_FILE", os.path.join(BASE_DIR, ".admin_key"))
     SERVER_HOST: str = os.getenv("SERVER_HOST", "0.0.0.0")
     SERVER_PORT: int = int(os.getenv("SERVER_PORT", "8501"))
     COOKIE_SECURE: bool = os.getenv("COOKIE_SECURE", "false").lower() in ("1", "true", "yes")

@@ -478,6 +478,65 @@ class TestStep3Execution(unittest.TestCase):
         # Оскільки єдиний шорт XRPUSDT відсіяно спредом 120 bps, лонг SOLUSDT теж симетрично стиснуто до 0 -> 0 голих ордерів!
         ex.execute_smart_rebalance_order.assert_not_called()
 
+    def test_rbac_viewer_read_only_vs_admin_and_rate_limit(self):
+        """RBAC: viewer читає телеметрію, але отримує 403 на всі керуючі/завантажувальні роути."""
+        import tempfile
+        from fastapi.testclient import TestClient
+        from app.core.config import settings
+        from app.core.security import reset_login_failures
+        from main import app
+
+        orig_view = settings.DASHBOARD_VIEW_PASSWORD
+        orig_pw = settings.DASHBOARD_PASSWORD
+        orig_key_file = settings.DASHBOARD_ADMIN_KEY_FILE
+        client = TestClient(app)
+        try:
+            with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as tf:
+                tf.write("admin_file_secret_999\n")
+                key_path = tf.name
+            object.__setattr__(settings, "DASHBOARD_ADMIN_KEY_FILE", key_path)
+            object.__setattr__(settings, "DASHBOARD_PASSWORD", "fallback_admin")
+            object.__setattr__(settings, "DASHBOARD_VIEW_PASSWORD", "view_only_123")
+            reset_login_failures("testclient")
+
+            # 1. Логін як viewer
+            r_v = client.post("/api/v1/auth/login", json={"password": "view_only_123"})
+            self.assertEqual(r_v.status_code, 200)
+            self.assertEqual(r_v.json().get("role"), "viewer")
+            self.assertNotIn("token", r_v.json())
+
+            # Перегляд дозволено (200) + роль viewer у сесії та /state
+            self.assertEqual(client.get("/api/v1/auth/session").json().get("role"), "viewer")
+            st_resp = client.get("/api/v1/state")
+            self.assertEqual(st_resp.status_code, 200)
+            self.assertEqual(st_resp.json().get("auth_role"), "viewer")
+
+            # Будь-які керуючі/небезпечні дії для viewer блокуються з 403
+            self.assertEqual(client.post("/api/v1/system/wakeup").status_code, 403)
+            self.assertEqual(client.post("/api/v1/control/pause", json={"paused": True}).status_code, 403)
+            self.assertEqual(client.post("/api/v1/cartridge/upload", content=b"123").status_code, 403)
+            self.assertEqual(client.get("/api/v1/v2/export").status_code, 403)
+
+            # 2. Логін як admin через окремий файл ключа (.admin_key)
+            r_a = client.post("/api/v1/auth/login", json={"password": "admin_file_secret_999"})
+            self.assertEqual(r_a.status_code, 200)
+            self.assertEqual(r_a.json().get("role"), "admin")
+            self.assertEqual(client.post("/api/v1/system/wakeup").status_code, 200)
+
+            # 3. Rate limit (5 невдач -> 429)
+            client.post("/api/v1/auth/logout")
+            reset_login_failures("testclient")
+            for _ in range(5):
+                self.assertEqual(client.post("/api/v1/auth/login", json={"password": "bad"}).status_code, 401)
+            self.assertEqual(client.post("/api/v1/auth/login", json={"password": "bad"}).status_code, 429)
+        finally:
+            reset_login_failures("testclient")
+            object.__setattr__(settings, "DASHBOARD_VIEW_PASSWORD", orig_view)
+            object.__setattr__(settings, "DASHBOARD_PASSWORD", orig_pw)
+            object.__setattr__(settings, "DASHBOARD_ADMIN_KEY_FILE", orig_key_file)
+            if "key_path" in locals() and os.path.exists(key_path):
+                os.remove(key_path)
+
 
 if __name__ == "__main__":
     unittest.main()

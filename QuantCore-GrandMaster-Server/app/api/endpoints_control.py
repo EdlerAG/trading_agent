@@ -2,7 +2,7 @@ import os
 import signal
 import asyncio
 from fastapi import APIRouter, Depends, Request, HTTPException
-from app.core.security import verify_api_access
+from app.core.security import verify_admin_access
 from app.core.events import event_bus, EventType
 from app.domain.schemas import (
     CoinControlUpdateRequest,
@@ -17,7 +17,7 @@ router = APIRouter(prefix="/api/v1/control", tags=["Multi-Currency & Risk Contro
 async def update_coin_control(
     request: Request,
     payload: CoinControlUpdateRequest,
-    _: str = Depends(verify_api_access),
+    _: str = Depends(verify_admin_access),
 ):
     """
     Індивідуальне налаштування конкретної валюти на льоту:
@@ -46,7 +46,7 @@ async def update_coin_control(
 async def update_portfolio_risk_profile(
     request: Request,
     payload: RiskProfileUpdateRequest,
-    _: str = Depends(verify_api_access),
+    _: str = Depends(verify_admin_access),
 ):
     """
     Змінює глобальний профіль ризику портфеля (CONSERVATIVE 1.6x, OPTIMAL 2.4x,
@@ -71,7 +71,7 @@ async def update_portfolio_risk_profile(
 async def set_trading_pause(
     request: Request,
     payload: PauseControlRequest,
-    _: str = Depends(verify_api_access),
+    _: str = Depends(verify_admin_access),
 ):
     """Ставить торгівлю на паузу (на N годин або безстроково) чи відновлює роботу."""
     container = getattr(request.app.state, "container", None)
@@ -85,7 +85,7 @@ async def set_trading_pause(
 
 
 @router.post("/wakeup")
-async def force_candle_recalculation(request: Request, _: str = Depends(verify_api_access)):
+async def force_candle_recalculation(request: Request, _: str = Depends(verify_admin_access)):
     """Миттєво будить торговий оркестратор для позачергового перерахунку всіх валют."""
     container = getattr(request.app.state, "container", None)
     if container is not None:
@@ -97,7 +97,7 @@ async def force_candle_recalculation(request: Request, _: str = Depends(verify_a
 
 
 @router.post("/reset-history")
-async def reset_and_clean_history(request: Request, _: str = Depends(verify_api_access)):
+async def reset_and_clean_history(request: Request, _: str = Depends(verify_admin_access)):
     """Архівує старі неактивні дні/логи та починає чисті графіки з поточного балансу."""
     container = getattr(request.app.state, "container", None)
     if container is None:
@@ -123,7 +123,7 @@ async def reset_and_clean_history(request: Request, _: str = Depends(verify_api_
 
 
 @router.post("/panic")
-async def emergency_panic_close_all(request: Request, _: str = Depends(verify_api_access)):
+async def emergency_panic_close_all(request: Request, _: str = Depends(verify_admin_access)):
     """Аварійна ліквідація позицій по всіх валютах у 100% кеш USDT та постановка на паузу."""
     container = getattr(request.app.state, "container", None)
     if container is None:
@@ -135,7 +135,7 @@ async def emergency_panic_close_all(request: Request, _: str = Depends(verify_ap
 
 
 @router.post("/restart")
-async def restart_server_from_web(request: Request, _: str = Depends(verify_api_access)):
+async def restart_server_from_web(request: Request, _: str = Depends(verify_admin_access)):
     """Безпечний перезапуск сервера з веб-термінала (systemd-сумісний)."""
     container = getattr(request.app.state, "container", None)
     if container is not None and getattr(container, "telegram_bot", None) is not None:

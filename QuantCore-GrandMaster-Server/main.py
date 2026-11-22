@@ -181,7 +181,7 @@ async def lifespan(app: FastAPI):
 
 # --- ІНІЦІАЛІЗАЦІЯ FASTAPI ЗАСТОСУНКУ (GZip для економії трафіку дашборда) ---
 from app.core.config import settings as _app_settings
-from app.core.security import verify_api_access
+from app.core.security import verify_admin_access
 
 app = FastAPI(
     title="QuantCore Sovereign Multi-Asset Terminal",
@@ -239,7 +239,7 @@ async def health_check():
 
 
 @app.post("/api/v1/system/wakeup", tags=["System"])
-async def trigger_immediate_wakeup(_: str = Depends(verify_api_access)):
+async def trigger_immediate_wakeup(_: str = Depends(verify_admin_access)):
     """Миттєво будить торговий цикл для позачергового перерахунку свічки."""
     WAKEUP_EVENT.set()
     return {"ok": True, "message": "Сигнал негайного перерахунку відправлено!"}

@@ -2,7 +2,7 @@ import re
 from typing import Tuple
 from fastapi import APIRouter, Depends, Request, HTTPException
 from app.core.config import settings
-from app.core.security import verify_api_access
+from app.core.security import verify_api_access, verify_admin_access
 from app.domain.schemas import CartridgeSelectRequest
 
 router = APIRouter(prefix="/api/v1/cartridge", tags=["AI Cartridge Hot-Swap"])
@@ -53,7 +53,7 @@ async def list_cartridges_and_online_weights(request: Request, _: str = Depends(
 @router.post("/upload")
 async def upload_and_hotswap_cartridge(
     request: Request,
-    _: str = Depends(verify_api_access),
+    _: str = Depends(verify_admin_access),
 ):
     """
     Завантажує новий .joblib файл моделі (multipart/form-data або raw body)
@@ -93,7 +93,7 @@ async def upload_and_hotswap_cartridge(
 async def activate_existing_cartridge(
     request: Request,
     payload: CartridgeSelectRequest,
-    _: str = Depends(verify_api_access),
+    _: str = Depends(verify_admin_access),
 ):
     """Перемикає активну модель між збереженими файлами .joblib у storage/cartridges/."""
     container = getattr(request.app.state, "container", None)
@@ -111,7 +111,7 @@ async def activate_existing_cartridge(
 
 
 @router.post("/rollback")
-async def rollback_cartridge(request: Request, _: str = Depends(verify_api_access)):
+async def rollback_cartridge(request: Request, _: str = Depends(verify_admin_access)):
     """Миттєвий відкат на попередню робочу модель .joblib."""
     container = getattr(request.app.state, "container", None)
     if container is None:

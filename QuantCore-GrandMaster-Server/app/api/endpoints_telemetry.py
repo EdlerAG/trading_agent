@@ -4,7 +4,7 @@ import time
 from collections import deque
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from fastapi.responses import FileResponse
-from app.core.security import verify_api_access
+from app.core.security import verify_api_access, verify_admin_access
 from app.core.config import settings
 from app.core.memory_guard import memory_guard
 
@@ -29,11 +29,11 @@ def _read_heartbeat_snapshot() -> dict:
 
 
 @router.get("/state")
-async def get_terminal_state(request: Request, _: str = Depends(verify_api_access)):
+async def get_terminal_state(request: Request, auth_role: str = Depends(verify_api_access)):
     """Повний зріз стану сервера, всіх активів, V2/V3 телеметрії, новин та ресурсів."""
     container = getattr(request.app.state, "container", None)
     if container is None:
-        return {"ok": False, "error": "Container initializing"}
+        return {"ok": False, "auth_role": auth_role, "error": "Container initializing"}
 
     st_data = container.state_service.get_full_state_dict()
     cart_meta = container.cartridge_service.get_metadata()
@@ -49,6 +49,7 @@ async def get_terminal_state(request: Request, _: str = Depends(verify_api_acces
 
     return {
         "ok": True,
+        "auth_role": auth_role,
         "demo_trading": settings.USE_DEMO_TRADING,
         "virtual_equity_cap": settings.VIRTUAL_EQUITY_CAP if settings.USE_DEMO_TRADING else 0.0,
         "cartridge_engine": settings.CARTRIDGE_ENGINE,
@@ -137,7 +138,7 @@ async def get_v2_testnet_telemetry(
 @router.get("/v2/export")
 async def download_v2_research_bundle(
     request: Request,
-    _: str = Depends(verify_api_access),
+    _: str = Depends(verify_admin_access),
 ):
     """Експортує SQLite + JSONL аудит-логи Testnet у ZIP для quant_v2/testnet_reconcile.py."""
     container = getattr(request.app.state, "container", None)
@@ -179,7 +180,7 @@ async def get_shadow_arena_leaderboard(request: Request, _: str = Depends(verify
 
 
 @router.get("/system/preflight")
-async def get_system_preflight_check(request: Request, _: str = Depends(verify_api_access)):
+async def get_system_preflight_check(request: Request, _: str = Depends(verify_admin_access)):
     """Перевірка повної передстартової готовності сервера, ключів, One-Way Mode, BNB/BFUSD та RAM."""
     container = getattr(request.app.state, "container", None)
     if container is None or getattr(container, "exchange_service", None) is None:

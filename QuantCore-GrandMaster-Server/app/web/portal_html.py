@@ -194,6 +194,7 @@ button:active:not(:disabled){transform:translateY(1px)}
   background:var(--accent-soft);color:var(--accent);border-color:var(--accent);
 }
 .nav-toggle{display:none}
+button:disabled,select:disabled,input:disabled{opacity:.42;cursor:not-allowed}
 
 /* Banner for global error / stale warning */
 .alert-banner{
@@ -473,6 +474,7 @@ tbody tr:hover td{background:var(--surface-2)}
           <span id="cartridgeBadge" class="status-chip chip-accent mono">V6.1</span>
           <span id="regimeBadge" class="status-chip mono">CHOP</span>
           <span id="tierBadge" class="status-chip mono">N/A</span>
+          <span id="roleBadge" class="status-chip mono">AUTH</span>
         </div>
         <div class="sys-strip mono">
           <span>Свічка (<span id="tfBadge">1h</span>): <strong id="candleBadge">очікування</strong></span>
@@ -487,7 +489,7 @@ tbody tr:hover td{background:var(--surface-2)}
       <div class="ctrl-cluster">
         <div class="field-inline">
           <label for="riskSelect">Профіль:</label>
-          <select id="riskSelect" onchange="changeRiskProfile()">
+          <select id="riskSelect" data-admin-ctrl="1" onchange="changeRiskProfile()">
             <option value="CONSERVATIVE">Conservative (1.6x)</option>
             <option value="OPTIMAL">Optimal (2.25x cap)</option>
             <option value="AGGRESSIVE">Aggressive (2.25x cap)</option>
@@ -496,16 +498,17 @@ tbody tr:hover td{background:var(--surface-2)}
         </div>
         <div class="field-inline">
           <label for="orchModeSelect">Режим:</label>
-          <select id="orchModeSelect" onchange="changeRiskProfile()">
+          <select id="orchModeSelect" data-admin-ctrl="1" onchange="changeRiskProfile()">
             <option value="PORTFOLIO_SYNERGY">Portfolio Synergy</option>
             <option value="SOLO_MAX">Solo Max</option>
           </select>
         </div>
         <button type="button" id="themeToggleBtn" aria-pressed="false" onclick="toggleTheme()">Темна тема</button>
-        <button type="button" onclick="runPreflight()">Pre-Flight</button>
-        <button type="button" class="btn-primary" onclick="triggerWakeup()">Перерахувати</button>
-        <button type="button" class="btn-caution" id="pauseBtn" onclick="togglePause()">Пауза</button>
-        <button type="button" class="btn-danger" onclick="confirmPanicClose()">Закрити все в USDT</button>
+        <button type="button" id="switchRoleBtn" onclick="switchRoleLogin()">Змінити роль</button>
+        <button type="button" data-admin-ctrl="1" onclick="runPreflight()">Pre-Flight</button>
+        <button type="button" class="btn-primary" data-admin-ctrl="1" onclick="triggerWakeup()">Перерахувати</button>
+        <button type="button" class="btn-caution" id="pauseBtn" data-admin-ctrl="1" onclick="togglePause()">Пауза</button>
+        <button type="button" class="btn-danger" data-admin-ctrl="1" onclick="confirmPanicClose()">Закрити все в USDT</button>
       </div>
     </div>
   </header>
@@ -520,9 +523,9 @@ tbody tr:hover td{background:var(--surface-2)}
       <li><a href="#sec-ops" onclick="markNav(this)">Виконання, новини та логи</a></li>
     </ul>
     <div style="display:flex;gap:6px;flex-wrap:wrap">
-      <button type="button" onclick="downloadV2Zip()">Експорт ZIP</button>
-      <button type="button" onclick="confirmCleanHistory()">Архівувати графік</button>
-      <button type="button" onclick="confirmRestartServer()">Рестарт служби</button>
+      <button type="button" data-admin-ctrl="1" onclick="downloadV2Zip()">Експорт ZIP</button>
+      <button type="button" data-admin-ctrl="1" onclick="confirmCleanHistory()">Архівувати графік</button>
+      <button type="button" data-admin-ctrl="1" onclick="confirmRestartServer()">Рестарт служби</button>
     </div>
   </nav>
 
@@ -825,9 +828,9 @@ tbody tr:hover td{background:var(--surface-2)}
           <pre class="log-pre mono" id="logBox">Завантаження останніх рядків trading_bot.log...</pre>
           <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
             <label for="joblibFile" style="font-size:12px;font-weight:600;color:var(--muted)">Пакет моделі (.joblib):</label>
-            <input type="file" id="joblibFile" accept=".joblib" style="font-size:12px;flex:1;min-width:160px">
-            <button type="button" class="btn-primary" onclick="uploadCartridge()">Завантажити модель</button>
-            <button type="button" onclick="confirmRollbackCartridge()">Відкотити</button>
+            <input type="file" id="joblibFile" accept=".joblib" data-admin-ctrl="1" style="font-size:12px;flex:1;min-width:160px">
+            <button type="button" class="btn-primary" data-admin-ctrl="1" onclick="uploadCartridge()">Завантажити модель</button>
+            <button type="button" data-admin-ctrl="1" onclick="confirmRollbackCartridge()">Відкотити</button>
           </div>
         </div>
       </div>
@@ -952,6 +955,33 @@ function showToast(msg, isErr=false){
   t._tid = setTimeout(() => { t.style.display = 'none'; }, 3200);
 }
 
+let authRoleState = 'admin';
+
+function applyAuthRoleUi(role){
+  const cleanRole = (role === 'viewer') ? 'viewer' : 'admin';
+  const changed = (authRoleState !== cleanRole);
+  authRoleState = cleanRole;
+  const isViewer = (cleanRole === 'viewer');
+  const badge = document.getElementById('roleBadge');
+  if(badge){
+    badge.className = 'status-chip mono ' + (isViewer ? 'chip-caution' : 'chip-accent');
+    badge.textContent = isViewer ? 'READ-ONLY' : 'ADMIN';
+  }
+  document.querySelectorAll('[data-admin-ctrl="1"]').forEach(el => {
+    el.disabled = isViewer;
+    el.title = isViewer ? 'Лише перегляд (потрібен Admin пароль)' : '';
+  });
+  if(changed && cachedCoins && cachedCoins.length) renderCoinsMatrix();
+}
+
+async function switchRoleLogin(){
+  try{ await fetch('/api/v1/auth/logout', {method:'POST', credentials:'same-origin'}); }catch(e){}
+  const pEl = document.getElementById('loginPass');
+  if(pEl) pEl.value = '';
+  document.getElementById('loginModal').classList.add('open');
+  if(pEl) pEl.focus();
+}
+
 function getHeaders(){
   return {'Content-Type':'application/json'};
 }
@@ -963,6 +993,10 @@ async function apiFetch(url, opts={}){
     document.getElementById('loginModal').classList.add('open');
     document.getElementById('loginPass').focus();
     throw new Error('Unauthorized');
+  }
+  if(resp.status === 403){
+    showToast('Тільки перегляд: потрібні права адміністратора.', true);
+    throw new Error('Forbidden');
   }
   if(!resp.ok){
     throw new Error(`HTTP ${resp.status}`);
@@ -981,8 +1015,9 @@ async function doLogin(){
       body: JSON.stringify({password: pwd})
     });
     if(r.ok){
-      await r.json();
+      const d = await r.json();
       localStorage.removeItem('qc_token');
+      applyAuthRoleUi(d.role || 'admin');
       document.getElementById('loginModal').classList.remove('open');
       refreshAll();
     } else if(r.status === 429){
@@ -1465,7 +1500,7 @@ function renderCoinsMatrix(coinsArg){
         </div>
       </div>
       <div class="coin-ctrl-row">
-        <select aria-label="Режим торгівлі ${sym}" onchange="updateCoinMode('${sym}', this.value)">
+        <select aria-label="Режим торгівлі ${sym}" ${authRoleState==='viewer'?'disabled':''} onchange="updateCoinMode('${sym}', this.value)">
           <option value="1" ${c.mode===1?'selected':''}>AUTO (L+S)</option>
           <option value="2" ${c.mode===2?'selected':''}>LONG ONLY</option>
           <option value="3" ${c.mode===3?'selected':''}>SHORT ONLY</option>
@@ -1473,7 +1508,7 @@ function renderCoinsMatrix(coinsArg){
           <option value="0" ${c.mode===0?'selected':''}>OFF (Вимк.)</option>
         </select>
         <input type="number" step="0.05" min="0.2" max="3.5" value="${Number(c.base_weight||1).toFixed(2)}"
-               aria-label="Вага пріоритету ${sym}" onchange="updateCoinWeight('${sym}', this.value)">
+               aria-label="Вага пріоритету ${sym}" ${authRoleState==='viewer'?'disabled':''} onchange="updateCoinWeight('${sym}', this.value)">
       </div>
     </article>`;
   }).join('');
@@ -1720,6 +1755,7 @@ async function loadState(){
   try{
     const d = await apiFetch('/api/v1/state');
     if(!d.ok) return;
+    if(d.auth_role) applyAuthRoleUi(d.auth_role);
     const eng = d.engine || {};
     const res = d.resources || {};
     const t = eng.telemetry || {};

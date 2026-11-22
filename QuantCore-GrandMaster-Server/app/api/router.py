@@ -1,9 +1,9 @@
-from fastapi import APIRouter, Request, Response, HTTPException
+from fastapi import APIRouter, Depends, Request, Response, HTTPException
 from fastapi.responses import HTMLResponse
 from app.core.config import settings
 from app.core.security import (
-    verify_password_raw,
-    EXPECTED_SESSION_TOKEN,
+    authenticate_login_password,
+    verify_api_access,
     check_login_rate_limit,
     record_login_failure,
     reset_login_failures,
@@ -34,20 +34,35 @@ async def serve_web_terminal():
 
 @api_router.post("/api/v1/auth/login", tags=["Auth"])
 async def login_terminal(payload: AuthLoginRequest, request: Request, response: Response):
-    """Авторизація у веб-терміналі зі встановленням захищеного HttpOnly сесійного кукі."""
+    """Авторизація у веб-терміналі (admin або viewer) зі встановленням HttpOnly кукі."""
     client_ip = request.client.host if request.client else "unknown"
     check_login_rate_limit(client_ip)
-    if not verify_password_raw(payload.password):
+    auth_res = authenticate_login_password(payload.password)
+    if auth_res is None:
         record_login_failure(client_ip)
         raise HTTPException(status_code=401, detail="Невірний пароль доступу")
 
+    role, session_token = auth_res
     reset_login_failures(client_ip)
     response.set_cookie(
         key="qc_session",
-        value=EXPECTED_SESSION_TOKEN,
+        value=session_token,
         max_age=30 * 24 * 3600,
         httponly=True,
         samesite="lax",
         secure=settings.COOKIE_SECURE,
     )
+    return {"ok": True, "role": role}
+
+
+@api_router.post("/api/v1/auth/logout", tags=["Auth"])
+async def logout_terminal(response: Response):
+    """Скидає HttpOnly сесію веб-термінала для перемикання ролі."""
+    response.delete_cookie(key="qc_session")
     return {"ok": True}
+
+
+@api_router.get("/api/v1/auth/session", tags=["Auth"])
+async def get_session_role(role: str = Depends(verify_api_access)):
+    """Повертає поточну роль автентифікованого клієнта (admin або viewer)."""
+    return {"ok": True, "role": role}
