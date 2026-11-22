@@ -49,6 +49,8 @@ mkdir -p "$SCRIPT_DIR/storage/backups"
 mkdir -p "$SCRIPT_DIR/storage/v2_telemetry"
 mkdir -p "$SCRIPT_DIR/storage/market_cache"
 chmod -R 750 "$SCRIPT_DIR/storage"
+[ -f "$SCRIPT_DIR/.env" ] && chmod 600 "$SCRIPT_DIR/.env"
+[ -f "$SCRIPT_DIR/.admin_key" ] && chmod 600 "$SCRIPT_DIR/.admin_key"
 if [ -f "$SCRIPT_DIR/deploy/notify_systemd_failure.sh" ]; then
     chmod +x "$SCRIPT_DIR/deploy/notify_systemd_failure.sh"
 fi

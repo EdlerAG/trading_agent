@@ -10,6 +10,9 @@ catboost_info/
 # Secrets & Environment
 .env
 QuantCore-GrandMaster-Server/.env
+.admin_key
+QuantCore-GrandMaster-Server/.admin_key
+*.key
 
 # Runtime Storage, Logs & Raw Download Cache
 *.log

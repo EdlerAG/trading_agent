@@ -1,0 +1,6 @@
+# Приклад конфігурації Caddy (автоматичний HTTPS через Let's Encrypt)
+# Скопіюйте у /etc/caddy/Caddyfile та замініть <DOMAIN_OR_SSLIP_HOST> на свій домен або <IP-WITH-DASHES>.sslip.io
+
+<DOMAIN_OR_SSLIP_HOST> {
+    reverse_proxy 127.0.0.1:8501
+}
