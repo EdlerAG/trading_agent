@@ -141,7 +141,7 @@ def _resolve_default_symbols() -> Tuple[str, ...]:
     if raw_env:
         return tuple(s.strip().upper() for s in raw_env.split(",") if s.strip())
     eng = os.getenv("CARTRIDGE_ENGINE", "v58").strip().lower()
-    if eng in ("v3", "v4", "v5"):
+    if eng in ("v3", "v4", "v5", "v6", "qv3", "qv3_convex"):
         return UNIVERSE_58_SYMBOLS
     if eng == "v2":
         return UNIVERSE_32_SYMBOLS
@@ -169,6 +169,8 @@ class Settings:
     CARTRIDGES_DIR: str = os.path.join(BASE_DIR, "storage", "cartridges")
     BACKUPS_DIR: str = os.path.join(BASE_DIR, "storage", "backups")
     V2_TELEMETRY_DIR: str = os.path.join(BASE_DIR, "storage", "v2_telemetry")
+    MARKET_CACHE_DIR: str = os.path.join(BASE_DIR, "storage", "market_cache")
+    HEARTBEAT_FILE: str = os.path.join(BASE_DIR, "storage", "heartbeat.json")
     DB_PATH: str = os.path.join(BASE_DIR, "storage", "trading_history.db")
     LOG_PATH: str = os.path.join(BASE_DIR, "storage", "trading_bot.log")
     STATE_FILE: str = os.path.join(BASE_DIR, "storage", "engine_state.json")
@@ -184,7 +186,10 @@ class Settings:
 
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
     GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
-    ENABLE_NEWS_SENTIMENT: bool = os.getenv("ENABLE_NEWS_SENTIMENT", "true").lower() == "true"
+    ENABLE_NEWS_SENTIMENT: bool = os.getenv(
+        "ENABLE_NEWS_SENTIMENT",
+        "false" if os.getenv("CARTRIDGE_ENGINE", "v58").strip().lower() in ("v2", "v3", "v4", "v5", "v6", "qv3", "qv3_convex") else "true",
+    ).lower() == "true"
     NEWS_REQUEST_TIMEOUT: int = 10
 
     DASHBOARD_URL: str = os.getenv("DASHBOARD_URL", "http://localhost:8501").rstrip("/")
@@ -194,7 +199,10 @@ class Settings:
 
     DEFAULT_RISK_PROFILE: str = os.getenv("RISK_PROFILE", "OPTIMAL").upper()
     DEFAULT_ORCHESTRATOR_MODE: str = os.getenv("ORCHESTRATOR_MODE", "PORTFOLIO_SYNERGY").upper()
-    ENABLE_ONLINE_LEARNING: bool = os.getenv("ENABLE_ONLINE_LEARNING", "true").lower() == "true"
+    ENABLE_ONLINE_LEARNING: bool = os.getenv(
+        "ENABLE_ONLINE_LEARNING",
+        "false" if os.getenv("CARTRIDGE_ENGINE", "v58").strip().lower() in ("v2", "v3", "v4", "v5", "v6", "qv3", "qv3_convex") else "true",
+    ).lower() == "true"
 
     CANDLES_FETCH_LIMIT: int = 1950
     # V2: ядро рахує 1h-фічі. V58 очікує 15m, тому дефолт лишається 15m.
@@ -212,19 +220,37 @@ class Settings:
     ACTION_DEADZONE: float = float(os.getenv("ACTION_DEADZONE", "0.10"))
     STICKY_RANK_BONUS: float = 0.05
 
-    MAX_DAILY_LOSS_PCT: float = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.06"))
+    MAX_DAILY_LOSS_PCT: float = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.05"))
+    MAX_TOTAL_DRAWDOWN_PCT: float = float(os.getenv("MAX_TOTAL_DRAWDOWN_PCT", "0.20"))
+    MAX_GROSS_LEVERAGE_CAP: float = float(os.getenv("MAX_GROSS_LEVERAGE_CAP", "2.25"))
     MAX_ALLOWED_SPREAD_PCT: float = float(os.getenv("MAX_ALLOWED_SPREAD_PCT", "0.0055"))
+    PROTECTED_IOC_MAX_SLIP_PCT: float = float(os.getenv("PROTECTED_IOC_MAX_SLIP_PCT", "0.0025"))
     MAX_FUNDING_RATE: float = 0.0005
+    MAX_ADVERSE_FUNDING_BLEED: float = float(os.getenv("MAX_ADVERSE_FUNDING_BLEED", "0.0030"))
     FUNDING_BUFFER_MINUTES: int = 15
     MAKER_TIMEOUT_SEC: int = 9
     V2_MAKER_WAIT_SEC: float = float(os.getenv("V2_MAKER_WAIT_SEC", "3.5"))
     V3_URGENT_MAKER_WAIT_SEC: float = float(os.getenv("V3_URGENT_MAKER_WAIT_SEC", "1.8"))
-    V3_SHORT_SQUEEZE_ATR_MULT: float = float(os.getenv("V3_SHORT_SQUEEZE_ATR_MULT", "5.2"))
+    V3_SHORT_SQUEEZE_ATR_MULT: float = float(os.getenv("V3_SHORT_SQUEEZE_ATR_MULT", "4.8"))
+    V6_LONG_CRASH_ATR_MULT: float = float(os.getenv("V6_LONG_CRASH_ATR_MULT", "12.0"))
     ENABLE_V3_AUX_CHANNELS: bool = os.getenv("ENABLE_V3_AUX_CHANNELS", "true").lower() == "true"
     VIRTUAL_EQUITY_CAP: float = float(os.getenv("VIRTUAL_EQUITY_CAP", "0.0") or "0.0")
-    ENABLE_SHADOW_ARENA: bool = os.getenv("ENABLE_SHADOW_ARENA", "true").lower() == "true"
-    MAX_CANDLE_STALENESS_MULT: float = float(os.getenv("MAX_CANDLE_STALENESS_MULT", "2.3"))
-    NEUTRALITY_IMBALANCE_LIMIT: float = float(os.getenv("NEUTRALITY_IMBALANCE_LIMIT", "0.25"))
+    ENABLE_SHADOW_ARENA: bool = os.getenv(
+        "ENABLE_SHADOW_ARENA",
+        "false" if os.getenv("CARTRIDGE_ENGINE", "v58").strip().lower() in ("v6", "qv3", "qv3_convex") else "true",
+    ).lower() == "true"
+    ENABLE_WS_SENTINEL: bool = os.getenv(
+        "ENABLE_WS_SENTINEL",
+        "false" if os.getenv("CARTRIDGE_ENGINE", "v58").strip().lower() in ("v2", "v3", "v4", "v5", "v6", "qv3", "qv3_convex") else "true",
+    ).lower() == "true"
+    MAX_MARKET_CACHE_MB: int = int(os.getenv("MAX_MARKET_CACHE_MB", "200"))
+    MAX_CANDLE_STALENESS_MULT: float = float(os.getenv("MAX_CANDLE_STALENESS_MULT", "1.8"))
+    NEUTRALITY_IMBALANCE_LIMIT: float = float(os.getenv("NEUTRALITY_IMBALANCE_LIMIT", "0.05"))
+    MAX_NTP_CLOCK_SKEW_MS: int = int(os.getenv("MAX_NTP_CLOCK_SKEW_MS", "1000"))
+    DELISTING_BUFFER_HOURS: float = float(os.getenv("DELISTING_BUFFER_HOURS", "72.0"))
+    POSITION_DRIFT_ALERT_PCT: float = float(os.getenv("POSITION_DRIFT_ALERT_PCT", "0.01"))
+    EXTERNAL_HEARTBEAT_URL: str = os.getenv("EXTERNAL_HEARTBEAT_URL", "").strip()
+    STRICT_STARTUP_PREFLIGHT: bool = os.getenv("STRICT_STARTUP_PREFLIGHT", "true").lower() == "true"
 
     # V58.0 Breakthrough: Intra-Candle ATR Stop-Loss & Sub-Candle MFE Harvester
     EMERGENCY_SL_ATR_MULT: float = 1.35
@@ -250,13 +276,13 @@ class Settings:
 
     @property
     def effective_candles_limit(self) -> int:
-        # Для 1h V2/V3 достатньо 520 барів (360h warmup + запас) замість 1950 -> в 3.7 раза менше RAM та трафіку!
-        if self.CARTRIDGE_ENGINE in ("v2", "v3", "v4", "v5") and self.CANDLE_TIMEFRAME == "1h":
-            return int(os.getenv("V2_CANDLES_FETCH_LIMIT", "520"))
+        # Для 1h V6 потрібно >= 720 барів для 30-денної Shrunk Downside Beta та Ledoit-Wolf sigma_30d (820 вміщується в 1 сторінку REST!).
+        if self.CARTRIDGE_ENGINE in ("v2", "v3", "v4", "v5", "v6", "qv3", "qv3_convex") and self.CANDLE_TIMEFRAME == "1h":
+            return int(os.getenv("V2_CANDLES_FETCH_LIMIT", "820"))
         return self.CANDLES_FETCH_LIMIT
 
 
 settings = Settings()
 
-for _d in (settings.STORAGE_DIR, settings.CARTRIDGES_DIR, settings.BACKUPS_DIR, settings.V2_TELEMETRY_DIR):
+for _d in (settings.STORAGE_DIR, settings.CARTRIDGES_DIR, settings.BACKUPS_DIR, settings.V2_TELEMETRY_DIR, settings.MARKET_CACHE_DIR):
     os.makedirs(_d, exist_ok=True)

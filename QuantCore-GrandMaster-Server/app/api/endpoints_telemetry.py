@@ -1,4 +1,6 @@
+import json
 import os
+import time
 from collections import deque
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from fastapi.responses import FileResponse
@@ -9,9 +11,26 @@ from app.core.memory_guard import memory_guard
 router = APIRouter(prefix="/api/v1", tags=["Telemetry & Analytics"])
 
 
+def _read_heartbeat_snapshot() -> dict:
+    hb_path = getattr(settings, "HEARTBEAT_FILE", "")
+    if not hb_path or not os.path.exists(hb_path):
+        return {"present": False}
+    try:
+        with open(hb_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            ts_u = float(data.get("ts_unix", 0.0) or 0.0)
+            data["present"] = True
+            data["age_sec"] = round(max(0.0, time.time() - ts_u), 1) if ts_u > 0 else None
+            return data
+    except Exception:
+        pass
+    return {"present": False}
+
+
 @router.get("/state")
 async def get_terminal_state(request: Request, _: str = Depends(verify_api_access)):
-    """Повний зріз стану сервера, всіх активів, V2 телеметрії, новин та ресурсів."""
+    """Повний зріз стану сервера, всіх активів, V2/V3 телеметрії, новин та ресурсів."""
     container = getattr(request.app.state, "container", None)
     if container is None:
         return {"ok": False, "error": "Container initializing"}
@@ -34,6 +53,14 @@ async def get_terminal_state(request: Request, _: str = Depends(verify_api_acces
         "virtual_equity_cap": settings.VIRTUAL_EQUITY_CAP if settings.USE_DEMO_TRADING else 0.0,
         "cartridge_engine": settings.CARTRIDGE_ENGINE,
         "candle_timeframe": settings.CANDLE_TIMEFRAME,
+        "heartbeat": _read_heartbeat_snapshot(),
+        "risk_limits": {
+            "daily_dd_limit_pct": round(float(getattr(settings, "DAILY_DRAWDOWN_LIMIT_PCT", 0.05)) * 100.0, 2),
+            "max_total_dd_pct": round(float(getattr(settings, "MAX_TOTAL_DRAWDOWN_PCT", 0.20)) * 100.0, 2),
+            "hard_gross_cap": float(getattr(settings, "MAX_GROSS_LEVERAGE_CAP", 2.25)),
+            "max_spread_bps": round(float(getattr(settings, "MAX_ALLOWED_SPREAD_PCT", 0.0035)) * 10_000.0, 1),
+            "neutrality_imbalance_limit": float(getattr(settings, "NEUTRALITY_IMBALANCE_LIMIT", 0.05)),
+        },
         "engine": st_data,
         "cartridge": cart_meta,
         "online_learning": online_meta,

@@ -250,6 +250,234 @@ class TestStep3Execution(unittest.TestCase):
         self.assertIsNotNone(res_close)
         self.mock_ccxt.create_market_order.assert_called_once()
 
+    def test_v6_risk_guard_hard_caps_and_signal_isolation(self):
+        """Step 4: RiskGuard enforces <=2.25x gross, >5% daily DD, >15% total DD, stale data & news/online isolation."""
+        import pandas as pd
+        from app.domain.schemas import CoinTargetDTO, PortfolioTargetDTO
+        from app.services.risk_guard_service import RiskGuardService
+        from app.services.state_service import StateService
+
+        st = StateService()
+        db_m = MagicMock()
+        db_m.get_daily_realized_pnl = MagicMock(return_value=0.0)
+        ex_m = MagicMock()
+        orch_m = MagicMock()
+        orch_m.emergency_close_all_positions = AsyncMock(return_value="closed")
+
+        rg = RiskGuardService(logger=MagicMock(), state_service=st, db_service=db_m, exchange_service=ex_m)
+        rg.bind_orchestrator(orch_m)
+
+        # 1. Hard Gross Leverage Cap <= 2.25x
+        dto = PortfolioTargetDTO(
+            cartridge_name="v5_multi_sleeve", architecture="QuantCore_V5_AllRegime_58Assets",
+            candle_timestamp="2026-11-21T00:00:00Z", market_breadth=0.5, news_sentiment=0.0,
+            total_gross_leverage=3.0, net_leverage=0.0,
+            targets={
+                "ETHUSDT": CoinTargetDTO(
+                    symbol="ETHUSDT", desired_weight=1.5, raw_model_pos=1.5, phase=2,
+                    alpha_score=1.0, signal_macro=0.0, signal_ml=0.0, ker_purity=0.0,
+                    zscore_96=0.0, rs_vs_btc=0.0, current_price=3000.0, atr_14=50.0,
+                ),
+                "SOLUSDT": CoinTargetDTO(
+                    symbol="SOLUSDT", desired_weight=-1.5, raw_model_pos=-1.5, phase=-1,
+                    alpha_score=-1.0, signal_macro=0.0, signal_ml=0.0, ker_purity=0.0,
+                    zscore_96=0.0, rs_vs_btc=0.0, current_price=150.0, atr_14=3.0,
+                ),
+            },
+        )
+        capped = rg.enforce_gross_leverage_cap(dto)
+        self.assertAlmostEqual(capped.total_gross_leverage, 2.25, places=6)
+        self.assertAlmostEqual(abs(capped.targets["ETHUSDT"].desired_weight) + abs(capped.targets["SOLUSDT"].desired_weight), 2.25, places=6)
+
+        # 2. Stale Market Data Guard
+        df_stale = pd.DataFrame({"open_ms": [1_700_000_000_000], "close": [90000.0]})
+        is_st, rsn = rg.check_stale_market_data({"BTCUSDT": df_stale}, now_ts=1_700_000_000.0 + 14400.0)
+        self.assertTrue(is_st)
+        self.assertIn("stale_btcusdt", rsn)
+        is_ok, _ = rg.check_stale_market_data({"BTCUSDT": df_stale}, now_ts=1_700_000_000.0 + 600.0)
+        self.assertFalse(is_ok)
+
+        # 3. Daily Drawdown > 5% Breaker & Total Drawdown > 15% Hard Stop
+        with patch.object(StateService, "save_snapshot", return_value=None):
+            tripped0, _ = asyncio.run(rg.check_circuit_breaker(500.0))
+            self.assertFalse(tripped0)
+            # -5.4% daily loss -> trips daily breaker (pause_until is set)
+            tripped_d, _ = asyncio.run(rg.check_circuit_breaker(473.0))
+            self.assertTrue(tripped_d)
+            self.assertTrue(st.is_paused)
+            self.assertIsNotNone(st.pause_until)
+
+            # Unpause, new day baseline 410, peak is still 500 -> equity 395 is -3.66% daily (<5%) BUT -21.0% from peak (>20%)!
+            st.is_paused = False
+            st.pause_until = None
+            st.daily_starting_equity = 410.0
+            st.peak_equity = 500.0
+            tripped_tot, _ = asyncio.run(rg.check_circuit_breaker(395.0))
+            self.assertTrue(tripped_tot)
+            self.assertTrue(st.is_paused)
+            self.assertIsNone(st.pause_until)  # Hard manual-review stop (no auto-resume!)
+
+    def test_minus_2022_reduce_only_never_reopens_reverse_position(self):
+        """Критичний тест безпеки V6.1: помилка -2022 на reduceOnly НІКОЛИ не відкриває голу зустрічну позицію!"""
+        self.mock_ccxt.fetch_order_book = MagicMock(return_value={
+            "bids": [[100.0, 50.0]], "asks": [[100.05, 50.0]],
+        })
+        self.mock_ccxt.create_market_order = MagicMock(
+            side_effect=Exception("binance {'code': -2022, 'msg': 'ReduceOnly Order is rejected.'}")
+        )
+        self.mock_ccxt.create_order = MagicMock()
+
+        res = self.exchange_service._execute_smart_order_sync(
+            symbol="SOLUSDT", delta_qty=2.0, mark_price=100.0,
+            realized_pnl_est=0.0, note="Close short after SL already fired",
+            reduce_only=True, maker_first=False, taker_fallback=True,
+        )
+        self.assertIsNone(res)
+        # create_market_order викликано РІВНО 1 раз із reduceOnly=True (жодного повторного виклику без reduceOnly!)
+        self.assertEqual(self.mock_ccxt.create_market_order.call_count, 1)
+        _, kwargs = self.mock_ccxt.create_market_order.call_args
+        self.assertTrue(kwargs["params"].get("reduceOnly"))
+        self.assertIn("newClientOrderId", kwargs["params"])
+        self.assertEqual(self.exchange_service.get_last_order_diag("SOLUSDT").get("order_status"), "ALREADY_CLOSED_2022")
+
+    def test_protected_ioc_entry_and_client_order_id_idempotency(self):
+        """V6.1 вхід використовує Protected Limit IOC (BBO ± max_slip) та детермінований newClientOrderId."""
+        self.mock_ccxt.fetch_order_book = MagicMock(return_value={
+            "bids": [[200.0, 50.0]], "asks": [[200.10, 50.0]],
+        })
+        self.mock_ccxt.create_order = MagicMock(return_value={
+            "id": "ioc_999", "type": "limit", "filled": 1.0, "average": 200.12, "fee": {"cost": 0.10},
+        })
+        self.mock_ccxt.create_market_order = MagicMock()
+
+        res = self.exchange_service._execute_smart_order_sync(
+            symbol="SOLUSDT", delta_qty=1.0, mark_price=200.05,
+            realized_pnl_est=0.0, note="V6.1 IOC entry",
+            reduce_only=False, maker_first=False, taker_fallback=True,
+        )
+        self.assertIsNotNone(res)
+        self.assertAlmostEqual(res.executed_qty, 1.0)
+        self.mock_ccxt.create_market_order.assert_not_called()
+        self.mock_ccxt.create_order.assert_called_once()
+        _, c_kwargs = self.mock_ccxt.create_order.call_args
+        self.assertEqual(c_kwargs.get("type"), "limit")
+        self.assertEqual(c_kwargs["params"].get("timeInForce"), "IOC")
+        self.assertTrue(str(c_kwargs["params"].get("newClientOrderId", "")).startswith("qc6_SOLUSDT_BO_"))
+        # Захисна ціна IOC не перевищує best_ask * (1 + 0.0025)
+        self.assertLessEqual(float(c_kwargs.get("price")), 200.10 * 1.0026)
+
+    def test_conditional_trigger_orphan_sl_cleanup_and_delisting_guard(self):
+        """Прибирання умовних Algo/Trigger SL (params={'trigger': True}) та детектор делістингу deliveryDate."""
+        def _mock_open_orders(sym, params=None):
+            if params and params.get("trigger"):
+                return [{"id": "algo_sl_77", "type": "stop_market"}]
+            return [{"id": "reg_lim_11", "type": "limit"}]
+
+        self.mock_ccxt.fetch_open_orders = MagicMock(side_effect=_mock_open_orders)
+        self.mock_ccxt.cancel_order = MagicMock()
+
+        cleaned = self.exchange_service._cleanup_orphan_orders_sync(
+            {"SOLUSDT": 0.0, "ETHUSDT": 0.5}, candidate_symbols=("SOLUSDT", "ETHUSDT")
+        )
+        self.assertEqual(cleaned, 2)
+        cancel_calls = self.mock_ccxt.cancel_order.call_args_list
+        self.assertEqual(len(cancel_calls), 2)
+        self.assertEqual(cancel_calls[1].kwargs.get("params"), {"trigger": True})
+
+        # Перевірка детектора делістингу deliveryDate
+        now_ms = 1_760_000_000_000
+        self.mock_ccxt.markets = {
+            "BTC/USDT:USDT": {"active": True, "info": {"status": "TRADING", "deliveryDate": "4133404800000"}},
+            "OMG/USDT:USDT": {"active": True, "info": {"status": "TRADING", "deliveryDate": str(now_ms + 24 * 3_600_000)}},
+        }
+        delist = self.exchange_service.get_delisting_symbols(("BTCUSDT", "OMGUSDT"), buffer_hours=72.0, now_ms=now_ms)
+        self.assertNotIn("BTCUSDT", delist)
+        self.assertIn("OMGUSDT", delist)
+
+    def test_v6_fail_closed_and_pre_spread_neutrality_scaling(self):
+        """Fail-Closed блокує сліпу деградацію у V2 без OI, а Pre-Spread Filter симетрично масштабує протилежний бік."""
+        import numpy as np
+        import pandas as pd
+        try:
+            from app.cartridges.v2_multi_sleeve_cartridge import V2MultiSleeveCartridge
+        except ImportError:
+            V2MultiSleeveCartridge = None
+        from app.domain.schemas import CoinStateDTO, CoinTargetDTO, PortfolioTargetDTO
+        from app.services.state_service import StateService
+        from app.services.execution_service import MultiAssetExecutionOrchestrator
+
+        # 1. Fail-Closed на V6 без колонки oi_usd (якщо пропрієтарний картридж встановлено локально)
+        ts = np.arange(400, dtype=np.int64) * 3_600_000 + 1_700_000_000_000
+        candles_no_oi = {
+            s: pd.DataFrame({
+                "open_ms": ts, "timestamp": pd.to_datetime(ts, unit="ms", utc=True),
+                "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0,
+                "volume": 1000.0, "quote_volume": 100000.0, "funding_rate": 0.0001,
+            })
+            for s in ("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT")
+        }
+        if V2MultiSleeveCartridge is not None:
+            coins = {s: CoinStateDTO(symbol=s, current_pos_qty=1.0 if s == "SOLUSDT" else 0.0) for s in candles_no_oi}
+            cart_v6 = V2MultiSleeveCartridge(symbols=tuple(candles_no_oi), engine_ver="v6")
+            dto_fc = cart_v6.compute_portfolio_targets(
+                candles_no_oi, coins, {}, 2.0, "PORTFOLIO_SYNERGY", 0.0, {}, False, {}, account_equity=500.0
+            )
+            self.assertTrue(dto_fc.extra_telemetry.get("fail_closed"))
+            self.assertEqual(len(dto_fc.targets), 0)  # Жодного примусового закриття або сліпого V2 ребалансу!
+
+        # 2. Pre-Spread Filter: якщо шорт-нога має широкий спред (120 bps > 55 bps), лонг-нога симетрично скасовується/стискається
+        st = StateService()
+        for s in ("BTCUSDT", "SOLUSDT", "XRPUSDT"):
+            st.coins[s] = CoinStateDTO(symbol=s, enabled=True, current_pos_qty=0.0)
+        dto_sp = PortfolioTargetDTO(
+            cartridge_name="v6_multi_sleeve", architecture="QuantCore_V6_1_Institutional_58Assets",
+            candle_timestamp="2026-11-21T00:00:00Z", market_breadth=0.5, news_sentiment=0.0,
+            total_gross_leverage=0.8, net_leverage=0.0,
+            targets={
+                "SOLUSDT": CoinTargetDTO(
+                    symbol="SOLUSDT", desired_weight=0.40, raw_model_pos=0.40, phase=2,
+                    alpha_score=1.0, signal_macro=0.0, signal_ml=0.0, ker_purity=0.0,
+                    zscore_96=0.0, rs_vs_btc=0.0, current_price=100.0, atr_14=3.0,
+                    dominant_book="V2_MOMENTUM", sl_atr_mult=8.0, tp_atr_mult=0.0,
+                ),
+                "XRPUSDT": CoinTargetDTO(
+                    symbol="XRPUSDT", desired_weight=-0.40, raw_model_pos=-0.40, phase=-1,
+                    alpha_score=-1.0, signal_macro=0.0, signal_ml=0.0, ker_purity=0.0,
+                    zscore_96=0.0, rs_vs_btc=0.0, current_price=1.0, atr_14=0.03,
+                    dominant_book="V2_MOMENTUM", sl_atr_mult=4.8, tp_atr_mult=0.0,
+                ),
+            },
+            extra_telemetry={"any_rebalanced": True},
+        )
+        cart_m = MagicMock()
+        cart_m.supported_symbols = ("BTCUSDT", "SOLUSDT", "XRPUSDT")
+        cart_m.compute_portfolio_targets = MagicMock(return_value=dto_sp)
+        cart_srv = MagicMock(cartridge=cart_m, active_name="v6_multi_sleeve")
+
+        ex = MagicMock()
+        ex.safe_price = MagicMock(side_effect=lambda s, p: round(p, 4))
+        ex.safe_amount = MagicMock(side_effect=lambda s, q: round(q, 4))
+        ex.fetch_delta_candles = AsyncMock(side_effect=lambda s, limit=None: candles_no_oi[s])
+        ex.fetch_account_snapshot = AsyncMock(return_value=(500.0, 0.0, {}, True))
+        ex.fetch_funding_rates = AsyncMock(return_value={"SOLUSDT": 0.0, "XRPUSDT": 0.0})
+        ex.fetch_market_microstructure = AsyncMock(return_value={
+            "SOLUSDT": {"spread_bps": 4.0},
+            "XRPUSDT": {"spread_bps": 120.0},  # > 55 bps -> відсікається ДО відправки!
+        })
+        ex.execute_smart_rebalance_order = AsyncMock()
+        ex.cleanup_orphan_orders = AsyncMock(return_value=0)
+        db_m = MagicMock()
+        db_m.get_daily_realized_pnl = MagicMock(return_value=0.0)
+        news_m = MagicMock(geo_shock_prob=0.0)
+        orch = MultiAssetExecutionOrchestrator(
+            logger=MagicMock(), state_service=st, db_service=db_m, exchange_service=ex,
+            cartridge_service=cart_srv, online_learner=MagicMock(), news_service=news_m,
+        )
+        with patch.object(StateService, "save_snapshot", return_value=None):
+            asyncio.run(orch.run_step(force_recalc=True))
+        # Оскільки єдиний шорт XRPUSDT відсіяно спредом 120 bps, лонг SOLUSDT теж симетрично стиснуто до 0 -> 0 голих ордерів!
+        ex.execute_smart_rebalance_order.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,10 +9,14 @@ from app.core.config import settings
 from app.core.memory_guard import memory_guard
 from app.core.events import event_bus, EventType
 from app.domain.interfaces import IService, IAlphaCartridge
-try:
-    from app.cartridges.v58_grand_master_cartridge import V58GrandMasterCartridge
-except ImportError:
-    V58GrandMasterCartridge = None
+
+
+def _lazy_v58_cartridge_cls():
+    try:
+        from app.cartridges.v58_grand_master_cartridge import V58GrandMasterCartridge
+        return V58GrandMasterCartridge
+    except ImportError:
+        return None
 
 
 class CartridgeLoaderService(IService):
@@ -42,17 +46,33 @@ class CartridgeLoaderService(IService):
     @property
     def cartridge(self) -> IAlphaCartridge:
         if self._active_cartridge is None:
-            if settings.CARTRIDGE_ENGINE in ("v2", "v3", "v4", "v5"):
+            if settings.CARTRIDGE_ENGINE in ("qv3", "qv3_convex"):
+                self._active_cartridge = self._make_qv3_cartridge()
+                self._active_filename = "qv3_convex"
+            elif settings.CARTRIDGE_ENGINE in ("v2", "v3", "v4", "v5", "v6"):
                 self._active_cartridge = self._make_v2_cartridge(settings.CARTRIDGE_ENGINE)
                 self._active_filename = f"{settings.CARTRIDGE_ENGINE}_multi_sleeve"
             else:
-                if V58GrandMasterCartridge is None:
+                v58_cls = _lazy_v58_cartridge_cls()
+                if v58_cls is None:
                     raise RuntimeError("Proprietary cartridge module not installed locally")
-                self._active_cartridge = V58GrandMasterCartridge(
+                self._active_cartridge = v58_cls(
                     filename="v58_autonomous_sota",
                     bundle={"symbols": list(settings.DEFAULT_SYMBOLS), "assets": {}},
                 )
         return self._active_cartridge
+
+    @staticmethod
+    def _make_qv3_cartridge() -> IAlphaCartridge:
+        from app.cartridges.qv3_convex_cartridge import QV3ConvexCartridge
+        state_path = os.path.join(settings.STORAGE_DIR, "v3_live_state.json")
+        env_syms_raw = os.getenv("ACTIVE_SYMBOLS", "").strip()
+        explicit_syms = (
+            tuple(s.strip().upper() for s in env_syms_raw.split(",") if s.strip())
+            if env_syms_raw
+            else None
+        )
+        return QV3ConvexCartridge(symbols=explicit_syms, state_path=state_path)
 
     @staticmethod
     def _make_v2_cartridge(engine_ver: str = "v2") -> IAlphaCartridge:
@@ -75,7 +95,17 @@ class CartridgeLoaderService(IService):
                 if os.path.isfile(src):
                     shutil.move(src, dst)
 
-        if settings.CARTRIDGE_ENGINE in ("v2", "v3", "v4", "v5"):
+        if settings.CARTRIDGE_ENGINE in ("qv3", "qv3_convex"):
+            self._active_cartridge = self._make_qv3_cartridge()
+            self._active_filename = "qv3_convex"
+            self._logger.info(
+                "✅ Активовано QV3 Convex Growth (%d пар). Валюти: %s",
+                len(self._active_cartridge.supported_symbols),
+                ", ".join(self._active_cartridge.supported_symbols[:16]) + ("..." if len(self._active_cartridge.supported_symbols) > 16 else ""),
+            )
+            return
+
+        if settings.CARTRIDGE_ENGINE in ("v2", "v3", "v4", "v5", "v6"):
             self._active_cartridge = self._make_v2_cartridge(settings.CARTRIDGE_ENGINE)
             self._active_filename = f"{settings.CARTRIDGE_ENGINE}_multi_sleeve"
             if settings.CANDLE_TIMEFRAME != "1h":
@@ -95,8 +125,11 @@ class CartridgeLoaderService(IService):
 
         candidates = self.list_available_cartridges()
         if not candidates:
+            v58_cls = _lazy_v58_cartridge_cls()
+            if v58_cls is None:
+                raise RuntimeError("Proprietary cartridge module not installed locally")
             self._logger.info("ℹ️ Зовнішніх .joblib у storage/cartridges/ поки немає. Активовано автономне SOTA ядро V58.0.")
-            self._active_cartridge = V58GrandMasterCartridge(
+            self._active_cartridge = v58_cls(
                 filename="v58_autonomous_sota",
                 bundle={"symbols": list(settings.DEFAULT_SYMBOLS), "assets": {}},
             )
@@ -135,11 +168,14 @@ class CartridgeLoaderService(IService):
             raise ValueError(f"Файл '{filename}' не є коректним словником картриджа QuantCore.")
 
         eng_tag = str(raw_bundle.get("engine", "")).lower()
-        if eng_tag in ("v2", "v3"):
+        if eng_tag in ("v2", "v3", "v4", "v5", "v6"):
             from app.cartridges.v2_multi_sleeve_cartridge import V2MultiSleeveCartridge
             return V2MultiSleeveCartridge(symbols=raw_bundle.get("symbols"), engine_ver=eng_tag)
 
-        return V58GrandMasterCartridge(filename=filename, bundle=raw_bundle)
+        v58_cls = _lazy_v58_cartridge_cls()
+        if v58_cls is None:
+            raise RuntimeError("Proprietary cartridge module not installed locally")
+        return v58_cls(filename=filename, bundle=raw_bundle)
 
     def load_cartridge_by_name(self, filename: str) -> Dict[str, Any]:
         safe_name = os.path.basename(filename)

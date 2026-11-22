@@ -19,6 +19,7 @@ class MemoryAndDiskGuard:
     PROTECTED_FILENAMES = frozenset({
         "engine_state.json",
         "v2_live_state.json",
+        "v3_live_state.json",
         "shadow_arena_state.json",
         "adaptive_weights.json",
         "online_learning.json",
@@ -26,6 +27,7 @@ class MemoryAndDiskGuard:
         "trading_history.db-wal",
         "trading_history.db-shm",
         "trading_bot.log",
+        "heartbeat.json",
     })
 
     def __init__(self) -> None:
@@ -104,6 +106,8 @@ class MemoryAndDiskGuard:
             extensions=(".db", ".gz", ".zip", ".bak", ".json"),
         )
 
+        removed_bytes += self.prune_market_cache(max_mb=getattr(settings, "MAX_MARKET_CACHE_MB", 200))
+
         all_files: List[Tuple[float, int, str]] = []
         total_bytes = 0
 
@@ -133,6 +137,58 @@ class MemoryAndDiskGuard:
                     pass
 
         return removed_bytes
+
+    @staticmethod
+    def prune_market_cache(max_mb: int = 200, max_age_days: int = 14) -> int:
+        """Обмежує директорію storage/market_cache/ стелею <= max_mb МБ та видаляє застарілі .tmp/кеш-файли."""
+        cache_dir = getattr(settings, "MARKET_CACHE_DIR", "")
+        if not cache_dir or not os.path.exists(cache_dir):
+            return 0
+        max_bytes = max(10, int(max_mb)) * 1024 * 1024
+        now_s = time.time()
+        max_age_sec = max(1, int(max_age_days)) * 86400.0
+        freed = 0
+        entries: List[Tuple[float, int, str, str]] = []
+        total_b = 0
+
+        for root, _, fnames in os.walk(cache_dir):
+            for fn in fnames:
+                fp = os.path.join(root, fn)
+                try:
+                    st = os.stat(fp)
+                except OSError:
+                    continue
+                if fn.endswith(".tmp") and (now_s - st.st_mtime) > 600:
+                    try:
+                        os.remove(fp)
+                        freed += st.st_size
+                    except OSError:
+                        pass
+                    continue
+                if fn != "v3_aux_cache.pkl" and (now_s - st.st_mtime) > max_age_sec:
+                    try:
+                        os.remove(fp)
+                        freed += st.st_size
+                    except OSError:
+                        pass
+                    continue
+                total_b += st.st_size
+                entries.append((st.st_mtime, st.st_size, fn, fp))
+
+        if total_b > max_bytes:
+            # Сортуємо від найстаріших; активний v3_aux_cache.pkl ставимо останнім у чергу видалення
+            entries.sort(key=lambda x: (1 if x[2] == "v3_aux_cache.pkl" else 0, x[0]))
+            target_b = int(max_bytes * 0.85)
+            for _mt, fsz, _fn, fp in entries:
+                try:
+                    os.remove(fp)
+                    total_b -= fsz
+                    freed += fsz
+                    if total_b <= target_b:
+                        break
+                except OSError:
+                    pass
+        return freed
 
     @staticmethod
     def _prune_directory(

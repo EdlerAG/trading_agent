@@ -1,17 +1,20 @@
+import os
+import json
 import time
 import inspect
 import asyncio
 import logging
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
 import pandas as pd
 
 from app.core.config import settings
+from app.core.http_client import http_pool
 from app.core.memory_guard import memory_guard
 from app.domain.interfaces import IService, IExchangeGateway, IOnlineLearner
 from app.services.state_service import StateService
 from app.services.database_service import DatabaseService
-from app.services.news_ai_service import NewsAiService
 from app.cartridges.cartridge_loader import CartridgeLoaderService
 
 
@@ -32,10 +35,12 @@ class MultiAssetExecutionOrchestrator(IService):
         "_news",
         "_market_data",
         "_governor",
+        "_risk_guard",
         "_tg_sender",
         "_ws_sentinel",
         "_shadow_arena",
         "_last_backup_date",
+        "_last_daily_report_date",
         "_last_funding_poll_ts",
         "_demo_wallet_anchor",
     )
@@ -48,7 +53,7 @@ class MultiAssetExecutionOrchestrator(IService):
         exchange_service: IExchangeGateway,
         cartridge_service: CartridgeLoaderService,
         online_learner: IOnlineLearner,
-        news_service: NewsAiService,
+        news_service: Any,
         market_data_service: Optional[Any] = None,
         currency_governor: Optional[Any] = None,
     ) -> None:
@@ -61,12 +66,38 @@ class MultiAssetExecutionOrchestrator(IService):
         self._news = news_service
         self._market_data = market_data_service
         self._governor = currency_governor
+        self._risk_guard: Optional[Any] = None
         self._tg_sender = None
         self._ws_sentinel = None
         self._shadow_arena = None
         self._last_backup_date = datetime.now(timezone.utc).date()
+        self._last_daily_report_date = datetime.now(timezone.utc).date()
         self._last_funding_poll_ts: float = 0.0
         self._demo_wallet_anchor: float = 0.0
+
+    async def _emit_heartbeat(self, status: str, candle_ts: str, equity: float, active_cnt: int) -> None:
+        """Записує локальний heartbeat.json та пінгує зовнішній Dead-Man's Switch (Healthchecks / Uptime Kuma)."""
+        try:
+            hb_path = Path(settings.HEARTBEAT_FILE)
+            hb_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_p = hb_path.with_suffix(".json.tmp")
+            payload = {
+                "ts_unix": round(time.time(), 3),
+                "utc": datetime.now(timezone.utc).isoformat(),
+                "status": status,
+                "candle_ts": candle_ts,
+                "equity": round(float(equity), 2),
+                "active_positions": int(active_cnt),
+            }
+            tmp_p.write_text(json.dumps(payload), encoding="utf-8")
+            os.replace(tmp_p, hb_path)
+        except Exception:
+            pass
+        if settings.EXTERNAL_HEARTBEAT_URL:
+            try:
+                await http_pool.get().get(settings.EXTERNAL_HEARTBEAT_URL, timeout=4.0)
+            except Exception as hb_err:
+                self._logger.debug(f"[Heartbeat] External ping skipped: {hb_err}")
 
     @property
     def name(self) -> str:
@@ -80,6 +111,9 @@ class MultiAssetExecutionOrchestrator(IService):
 
     def bind_shadow_arena(self, arena_service) -> None:
         self._shadow_arena = arena_service
+
+    def bind_risk_guard(self, risk_guard) -> None:
+        self._risk_guard = risk_guard
 
     async def _send_alert(self, msg: str) -> None:
         if self._tg_sender is not None:
@@ -191,14 +225,18 @@ class MultiAssetExecutionOrchestrator(IService):
         self._state.active_cartridge = self._cartridges.active_name
         active_syms = cartridge.supported_symbols
         is_multi_sleeve_family = (
-            settings.CARTRIDGE_ENGINE in ("v2", "v3", "v4", "v5")
+            settings.CARTRIDGE_ENGINE in ("v2", "v3", "v4", "v5", "v6", "qv3", "qv3_convex")
             or "v2" in str(self._cartridges.active_name).lower()
             or "v3" in str(self._cartridges.active_name).lower()
+            or "qv3" in str(self._cartridges.active_name).lower()
             or "v4" in str(self._cartridges.active_name).lower()
             or "v5" in str(self._cartridges.active_name).lower()
+            or "v6" in str(self._cartridges.active_name).lower()
             or "MultiSleeve" in getattr(cartridge, "architecture_name", "")
+            or "ConvexGrowth" in getattr(cartridge, "architecture_name", "")
             or "Apex" in getattr(cartridge, "architecture_name", "")
             or "AllRegime" in getattr(cartridge, "architecture_name", "")
+            or "Institutional" in getattr(cartridge, "architecture_name", "")
         )
 
         # 0. Скасування застарілих stink-bid ордерів ТІЛЬКИ для V58 (у V2/V3 економить 58 приватних REST-запитів щогодини!)
@@ -230,13 +268,20 @@ class MultiAssetExecutionOrchestrator(IService):
         # Data Staleness Guard (тільки при реальному ccxt шлюзі, а не тестових моках з історичними свічками)
         raw_ccxt = getattr(self._exchange, "_exchange", None)
         if raw_ccxt is not None and not hasattr(raw_ccxt, "_mock_name") and not hasattr(self._exchange, "_mock_name") and "open_ms" in btc_df.columns:
-            last_open_ms = int(btc_df["open_ms"].iloc[-1])
-            age_sec = time.time() - (last_open_ms / 1000.0)
-            max_age_sec = float(settings.CANDLE_INTERVAL_MINUTES) * 60.0 * float(settings.MAX_CANDLE_STALENESS_MULT)
-            if age_sec > max_age_sec:
-                self._logger.warning(f"⚠️ Застарілі ринкові дані BTCUSDT (вік свічки {age_sec/60:.1f} хв > ліміту). Пропуск торгів!")
-                await self._send_alert(f"⚠️ <b>[Staleness Guard]</b> Свічка BTCUSDT застаріла ({age_sec/60:.0f} хв). Торговий крок пропущено.")
-                return
+            if self._risk_guard is not None and hasattr(self._risk_guard, "check_stale_market_data"):
+                is_stale, stale_reason = self._risk_guard.check_stale_market_data(candles_map)
+                if is_stale:
+                    self._logger.warning(f"⚠️ [Staleness Guard] {stale_reason}. Пропуск торгів!")
+                    await self._send_alert(f"⚠️ <b>[Staleness Guard]</b> Ринкові дані застаріли (<code>{stale_reason}</code>). Торговий крок пропущено.")
+                    return
+            else:
+                last_open_ms = int(btc_df["open_ms"].iloc[-1])
+                age_sec = time.time() - (last_open_ms / 1000.0)
+                max_age_sec = float(settings.CANDLE_INTERVAL_MINUTES) * 60.0 * float(settings.MAX_CANDLE_STALENESS_MULT)
+                if age_sec > max_age_sec:
+                    self._logger.warning(f"⚠️ Застарілі ринкові дані BTCUSDT (вік свічки {age_sec/60:.1f} хв > ліміту). Пропуск торгів!")
+                    await self._send_alert(f"⚠️ <b>[Staleness Guard]</b> Свічка BTCUSDT застаріла ({age_sec/60:.0f} хв). Торговий крок пропущено.")
+                    return
 
         is_new_candle = (candle_ts != self._state.last_candle_ts)
         if not force_recalc and not is_new_candle:
@@ -274,13 +319,23 @@ class MultiAssetExecutionOrchestrator(IService):
             coin_upnl[sym] = ex_p.unrealized_pnl if ex_p else 0.0
             min_qty, _, _, _, _ = settings.get_symbol_spec(sym)
 
-            # Якщо біржа закрила позицію по Stop-Loss між свічками — фіксуємо PnL у БД та сповіщаємо!
+            # Якщо біржа закрила позицію по Stop-Loss між свічками — фіксуємо PnL, активуємо 48h кулдаун і сповіщаємо!
             if abs(real_qty) < min_qty and abs(c_st.current_pos_qty) >= min_qty:
+                prev_side = 1 if c_st.current_pos_qty > 0 else -1
+                if hasattr(cartridge, "register_exchange_stop_hit"):
+                    try:
+                        cartridge.register_exchange_stop_hit(sym, prev_side)
+                        self._logger.info(
+                            f"🛡️ [StopCooldown] [{sym}] Зовнішнє закриття позиції (side={prev_side:+d}) -> "
+                            f"48h stop_cooldown зафіксовано у LiveState."
+                        )
+                    except Exception as cd_err:
+                        self._logger.warning(f"⚠️ [{sym}] Помилка фіксації stop_cooldown: {cd_err}")
                 if hasattr(self._exchange, "sync_exchange_stop_closure"):
                     sl_info = await self._exchange.sync_exchange_stop_closure(sym)
                     if sl_info:
                         closed_q, avg_p, r_pnl = sl_info
-                        if r_pnl >= 0.0:
+                        if r_pnl >= 0.0 and not is_multi_sleeve_family:
                             await self._send_alert(
                                 f"🎯 <b>[{sym}] Фіксація прибутку (Take-Profit / MFE)!</b>\n"
                                 f"• Закрито: <code>{closed_q:.4f}</code> @ <code>${avg_p:,.4f}</code>\n"
@@ -288,7 +343,7 @@ class MultiAssetExecutionOrchestrator(IService):
                             )
                         else:
                             await self._send_alert(
-                                f"🛡️ <b>[{sym}] Спрацював біржовий Stop-Loss!</b>\n"
+                                f"🛡️ <b>[{sym}] Спрацював біржовий STOP_MARKET (48h Cooldown активовано)!</b>\n"
                                 f"• Закрито: <code>{closed_q:.4f}</code> @ <code>${avg_p:,.4f}</code>\n"
                                 f"• Фіксований PnL: <b>{r_pnl:+.2f} USDT</b>"
                             )
@@ -298,20 +353,45 @@ class MultiAssetExecutionOrchestrator(IService):
                 c_st.is_breakeven = False
                 c_st.bars_held = 0
             elif abs(real_qty) >= min_qty:
+                if abs(c_st.current_pos_qty) >= min_qty and cur_p > 0 and total_equity > 0:
+                    drift_frac = abs(real_qty - c_st.current_pos_qty) * cur_p / total_equity
+                    if drift_frac > float(settings.POSITION_DRIFT_ALERT_PCT):
+                        self._logger.warning(
+                            f"⚠️ [{sym}] Position Drift {drift_frac:.2%} > {settings.POSITION_DRIFT_ALERT_PCT:.0%}: "
+                            f"state={c_st.current_pos_qty:+.4f} vs exchange={real_qty:+.4f}!"
+                        )
+                        await self._send_alert(
+                            f"⚠️ <b>[Position Drift &gt; {settings.POSITION_DRIFT_ALERT_PCT:.0%}] {sym}</b>\n"
+                            f"• Локальний стан: <code>{c_st.current_pos_qty:+.4f}</code> vs Біржа: <code>{real_qty:+.4f}</code> "
+                            f"(<b>{drift_frac:.2%}</b> еквіті)\n"
+                            f"• Виконано автоматичну синхронізацію з біржею."
+                        )
                 c_st.current_pos_qty = real_qty
                 if ex_p and ex_p.entry_price > 0:
                     c_st.entry_price = ex_p.entry_price
                 if is_new_candle:
                     c_st.bars_held += 1
 
-        if await self._check_daily_circuit_breaker(total_equity):
+        if self._risk_guard is not None and hasattr(self._risk_guard, "check_circuit_breaker"):
+            cb_res = await self._risk_guard.check_circuit_breaker(total_equity)
+            tripped, cb_msg = cb_res if isinstance(cb_res, tuple) else (bool(cb_res), "")
+            if tripped:
+                if cb_msg:
+                    await self._send_alert(cb_msg)
+                return
+        elif await self._check_daily_circuit_breaker(total_equity):
             return
 
-        # 3. Оцінка новинного фону Gemini AI (Macro + Per-Asset Bias + Geo-Macro Shock) та фандінгу
-        news_intel = await self._news.fetch_market_intelligence()
-        news_score = float(news_intel.get("macro_sentiment", 0.0))
-        geo_shock_active = bool(news_intel.get("is_geo_shock", False))
-        coin_bias_map = news_intel.get("coin_bias", {})
+        # 3. Сувора ізоляція сигналів для V2..V6 (online_adaptation та news_ai вимкнено -> 100% Zero-Skew паритет!)
+        if is_multi_sleeve_family or not settings.ENABLE_NEWS_SENTIMENT:
+            news_score = 0.0
+            geo_shock_active = False
+            coin_bias_map = {}
+        else:
+            news_intel = await self._news.fetch_market_intelligence()
+            news_score = float(news_intel.get("macro_sentiment", 0.0))
+            geo_shock_active = bool(news_intel.get("is_geo_shock", False))
+            coin_bias_map = news_intel.get("coin_bias", {})
         funding_rates_map = await self._exchange.fetch_funding_rates(active_syms)
 
         if geo_shock_active:
@@ -320,8 +400,13 @@ class MultiAssetExecutionOrchestrator(IService):
                 f"(geo_shock_prob={self._news.geo_shock_prob:.2f})"
             )
 
-        # 4. Запуск ШІ-картриджа для розрахунку цільового портфеля
-        online_states = self._learner.get_all_learning_states()
+        # 4. Запуск картриджа для розрахунку цільового портфеля
+        online_states = {} if (is_multi_sleeve_family or not settings.ENABLE_ONLINE_LEARNING) else self._learner.get_all_learning_states()
+        eff_max_lev = (
+            min(float(self._state.max_portfolio_lev), float(settings.MAX_GROSS_LEVERAGE_CAP))
+            if is_multi_sleeve_family
+            else float(self._state.max_portfolio_lev)
+        )
         _cpt_sig = inspect.signature(cartridge.compute_portfolio_targets).parameters
         _cpt_kwargs = {"account_equity": total_equity} if "account_equity" in _cpt_sig else {}
         portfolio_dto = await asyncio.to_thread(
@@ -329,7 +414,7 @@ class MultiAssetExecutionOrchestrator(IService):
             candles_map,
             self._state.coins,
             online_states,
-            self._state.max_portfolio_lev,
+            eff_max_lev,
             self._state.orchestrator_mode,
             news_score,
             funding_rates_map,
@@ -338,19 +423,60 @@ class MultiAssetExecutionOrchestrator(IService):
             **_cpt_kwargs,
         )
 
-        # Синхронізація лімітів та налаштувань монет через Currency Governor
-        if self._governor is not None:
+        extra_tel_chk = portfolio_dto.extra_telemetry or {}
+        if extra_tel_chk.get("fail_closed"):
+            fc_err = str(extra_tel_chk.get("error") or "v3_data_incomplete")
+            self._logger.error(f"🚨 [FAIL-CLOSED GUARD] Торговий крок скасовано: {fc_err}. Поточні позиції та STOP_MARKET збережено!")
+            await self._send_alert(
+                f"🚨 <b>[FAIL-CLOSED GUARD]</b> Ребаланс заблоковано через неповні V3/ML дані (<code>{fc_err}</code>).\n"
+                f"• Деградація у сліпий V2 <b>ЗАБОРОНЕНА</b>.\n"
+                f"• Поточні позиції та біржові <code>STOP_MARKET</code> збережено без змін."
+            )
+            active_now = sum(1 for c in self._state.coins.values() if abs(c.current_pos_qty) > 0)
+            await self._emit_heartbeat("fail_closed_hold", candle_ts, total_equity, active_now)
+            return
+
+        # Автоматичний захист від делістингу (deliveryDate в межах 72h) та кровотечі фандінгу (>0.30% за виплату проти позиції!)
+        delist_fn = getattr(self._exchange, "get_delisting_symbols", None)
+        delist_raw = delist_fn(active_syms) if callable(delist_fn) else {}
+        delisting_map: Dict[str, int] = delist_raw if isinstance(delist_raw, dict) else {}
+        bleed_lim = float(settings.MAX_ADVERSE_FUNDING_BLEED)
+        auto_exit_notes: List[str] = []
+        for s_chk, t_chk in portfolio_dto.targets.items():
+            if s_chk in delisting_map and abs(t_chk.desired_weight) > 1e-9:
+                t_chk.desired_weight = 0.0
+                t_chk.raw_model_pos = 0.0
+                auto_exit_notes.append(f"• <b>{s_chk}</b>: примусовий вихід (делістинг <code>deliveryDate={delisting_map[s_chk]}</code>)")
+                continue
+            fr_now = float((funding_rates_map or {}).get(s_chk, 0.0) or 0.0)
+            if bleed_lim > 0.0 and abs(t_chk.desired_weight) > 1e-9:
+                if (t_chk.desired_weight > 0 and fr_now > bleed_lim) or (t_chk.desired_weight < 0 and fr_now < -bleed_lim):
+                    t_chk.desired_weight = 0.0
+                    t_chk.raw_model_pos = 0.0
+                    auto_exit_notes.append(f"• <b>{s_chk}</b>: вето кровотечі фандінгу (<code>{fr_now*100:+.3f}%</code>)")
+        if auto_exit_notes:
+            await self._send_alert("🚨 <b>[Auto-Exit Guard: Delisting / Funding Bleed]</b>\n" + "\n".join(auto_exit_notes))
+
+        # Для V58 використовуємо CurrencyGovernor; у V2..V6 режим монет вже враховано у float64 всередині картриджа (без round 1e-4!),
+        # а зверху накладаємо жорсткий серверний ліміт RiskGuard <= 2.25x!
+        if self._governor is not None and not is_multi_sleeve_family:
             portfolio_dto = self._governor.enforce_currency_rules(portfolio_dto)
+        if self._risk_guard is not None and is_multi_sleeve_family and hasattr(self._risk_guard, "enforce_gross_leverage_cap"):
+            portfolio_dto = self._risk_guard.enforce_gross_leverage_cap(portfolio_dto, max_gross=eff_max_lev)
 
         # 5. Двофазна паралельна диспетчеризація ордерів (Фаза А: Звільнення маржі, Фаза Б: Нарощування)
+        cart_nm = str(getattr(portfolio_dto, "cartridge_name", "") or "")
         is_v2_engine = (
-            getattr(portfolio_dto, "cartridge_name", "") in ("v2_multi_sleeve", "v3_multi_sleeve", "v4_multi_sleeve", "v5_multi_sleeve")
-            or settings.CARTRIDGE_ENGINE in ("v2", "v3", "v4", "v5")
+            cart_nm in ("v2_multi_sleeve", "v3_multi_sleeve", "v4_multi_sleeve", "v5_multi_sleeve", "v6_multi_sleeve", "qv3_convex")
+            or settings.CARTRIDGE_ENGINE in ("v2", "v3", "v4", "v5", "v6", "qv3", "qv3_convex")
         )
+        # Legacy v2 використовує пасивний maker_first; V3..V6 та QV3 використовують швидкий Protected Limit IOC без зависань postOnly!
+        use_legacy_v2_maker = (cart_nm == "v2_multi_sleeve" and settings.CARTRIDGE_ENGINE not in ("v3", "v4", "v5", "v6", "qv3", "qv3_convex"))
         extra_tel = portfolio_dto.extra_telemetry or {}
         sleeve_books_map: Dict[str, str] = extra_tel.get("sleeve_books") or {}
         signal_prices_map: Dict[str, float] = extra_tel.get("signal_prices") or extra_tel.get("prices") or {}
-        skipped_exec: Dict[str, str] = {}
+        s_stops_map: Dict[str, float] = extra_tel.get("s_stops") or {}
+        skipped_exec: Dict[str, str] = dict(extra_tel.get("skipped") or {})
 
         executed_orders_summary: List[str] = []
         coin_targets_map: Dict[str, float] = {}
@@ -437,6 +563,9 @@ class MultiAssetExecutionOrchestrator(IService):
                         mk_q = float(ord_dto.executed_qty)
                     else:
                         tk_q = float(ord_dto.executed_qty)
+                diag_ok = self._exchange.get_last_order_diag(sym) if hasattr(self._exchange, "get_last_order_diag") else {}
+                diag_ok = diag_ok if isinstance(diag_ok, dict) else {}
+                sp_val = float(getattr(ord_dto, "spread_bps", 0.0) or diag_ok.get("spread_bps", 0.0) or 0.0)
                 self._db.record_v2_execution(
                     candle_ts=candle_ts,
                     symbol=sym,
@@ -447,17 +576,22 @@ class MultiAssetExecutionOrchestrator(IService):
                     signal_close_px=sig_px,
                     arrival_mid_px=arr_px,
                     fill_avg_px=float(ord_dto.avg_price),
-                    spread_bps=float(getattr(ord_dto, "spread_bps", 0.0) or 0.0),
+                    spread_bps=sp_val,
                     maker_qty=mk_q,
                     taker_qty=tk_q,
                     fee_usdt=float(getattr(ord_dto, "fee_usdt", 0.0) or 0.0),
                     latency_ms=float(getattr(ord_dto, "latency_ms", 0.0) or 0.0),
                     order_status=str(getattr(ord_dto, "order_status", "FILLED") or "FILLED"),
+                    bbo_spread_bps=float(diag_ok.get("bbo_spread_bps", sp_val) or sp_val),
+                    best_bid=float(diag_ok.get("best_bid", 0.0) or 0.0),
+                    best_ask=float(diag_ok.get("best_ask", 0.0) or 0.0),
+                    top5_depth_usd=float(diag_ok.get("top5_depth_usd", 0.0) or 0.0),
                 )
 
             old_qty = c_st.current_pos_qty
             signed_exec = ord_dto.executed_qty if ord_dto.side == "BUY" else -ord_dto.executed_qty
-            new_pos_qty = 0.0 if is_closing_to_cash else (old_qty + signed_exec)
+            rem_qty = old_qty + signed_exec
+            new_pos_qty = 0.0 if abs(rem_qty) < min_qty else rem_qty
 
             if abs(new_pos_qty) >= min_qty:
                 if is_opening_from_cash or is_flip:
@@ -477,10 +611,8 @@ class MultiAssetExecutionOrchestrator(IService):
                 c_st.sl_atr_mult = sl_mult
                 c_st.tp_atr_mult = tp_mult
 
-                # Якщо вже був активований Breakeven — зберігаємо беззбитковий стоп!
-                if dom_b == "V2_MOMENTUM":
-                    # V2-рукав тримає позицію до 14-денного ребалансу і не має
-                    # біржового стопу: інакше 1.35 ATR(1h) вибиває книгу за години.
+                # Legacy V2 (sl_mult <= 0) не ставить стоп; V3..V6 ставлять реальний біржовий STOP_MARKET (4.8 ATR шорти / 12.0 ATR лонги)!
+                if dom_b == "V2_MOMENTUM" and sl_mult <= 0.0:
                     c_st.active_sl_price = 0.0
                     sl_note = "SL: None (Model-Exit)"
                 else:
@@ -496,9 +628,51 @@ class MultiAssetExecutionOrchestrator(IService):
                         raw_sl = (c_st.entry_price - sl_dist) if new_pos_qty > 0 else (c_st.entry_price + sl_dist)
 
                     sl_p = self._exchange.safe_price(sym, raw_sl)
-                    c_st.active_sl_price = sl_p
-                    await self._exchange.place_or_update_stop_loss(sym, new_pos_qty, sl_p)
-                    sl_note = f"SL: <code>${sl_p:,.2f}</code>"
+                    fn_sl_ex = getattr(self._exchange, "place_or_update_stop_loss_ex", None)
+                    if callable(fn_sl_ex) and inspect.iscoroutinefunction(fn_sl_ex):
+                        sl_ok, sl_reason = await fn_sl_ex(sym, new_pos_qty, sl_p)
+                    else:
+                        sl_ok_raw = await self._exchange.place_or_update_stop_loss(sym, new_pos_qty, sl_p)
+                        sl_ok = bool(sl_ok_raw) if isinstance(sl_ok_raw, bool) else True
+                        sl_reason = "OK" if sl_ok else "SL_FAILED"
+
+                    if sl_ok:
+                        c_st.active_sl_price = sl_p
+                        sl_note = f"SL: <code>${sl_p:,.2f}</code>"
+                    else:
+                        # ЗАХИСТ ВІД -2021 ТА ГОЛОЇ ПОЗИЦІЇ (SL: None ЗАБОРОНЕНО!):
+                        # Негайно закриваємо позицію через reduceOnly=True і ставимо 48h stop_cooldown!
+                        c_st.active_sl_price = 0.0
+                        pos_side_dir = 1 if new_pos_qty > 0 else -1
+                        self._logger.error(
+                            f"🚨 [{sym}] Відмова STOP_MARKET @ ${sl_p} ({sl_reason})! "
+                            f"Виконуємо негайне аварійне закриття {new_pos_qty:+.4f} через reduceOnly=True + 48h cooldown!"
+                        )
+                        em_dto = await self._exchange.execute_smart_rebalance_order(
+                            symbol=sym,
+                            delta_qty=-new_pos_qty,
+                            mark_price=cur_p,
+                            realized_pnl_est=0.0,
+                            note=f"EMERGENCY_EXIT_{sl_reason}",
+                            reduce_only=True,
+                        )
+                        c_st.current_pos_qty = 0.0
+                        c_st.entry_price = 0.0
+                        c_st.is_breakeven = False
+                        c_st.bars_held = 0
+                        c_st.dominant_book = ""
+                        c_st.sl_atr_mult = 0.0
+                        c_st.tp_atr_mult = 0.0
+                        if hasattr(cartridge, "register_exchange_stop_hit"):
+                            try:
+                                cartridge.register_exchange_stop_hit(sym, pos_side_dir)
+                            except Exception as cd_e:
+                                self._logger.warning(f"⚠️ [{sym}] Помилка запису stop_cooldown після -2021: {cd_e}")
+                        em_px = em_dto.avg_price if em_dto is not None else cur_p
+                        return (
+                            f"🚨 <b>{sym}</b>: <code>STOP_MARKET</code> відхилено (<code>{sl_reason}</code>) -> "
+                            f"позицію негайно закрито через <code>reduceOnly</code> @ <code>${em_px:,.4f}</code> + 48h Cooldown!"
+                        )
 
                 # Book-Aware Take-Profit: B1/B2/B5/V2 hold-books exit via model/rebalance, NOT tight 1.35 ATR TP
                 is_mean_rev_book = dom_b in ("B1_STATARB", "B2_CARRY_BASIS", "B5_KALMAN_PAIRS", "V2_MOMENTUM")
@@ -563,6 +737,57 @@ class MultiAssetExecutionOrchestrator(IService):
 
             await self._monitor_coin_breakeven(sym, cur_p, cur_atr)
 
+            # Щогодинна ratchet-only підтяжка біржового STOP_MARKET для активних позицій Pod S (100% паритет із backtest.py!)
+            if sym in s_stops_map and abs(c_st.current_pos_qty) > 0:
+                s_sl_cand = self._exchange.safe_price(sym, float(s_stops_map[sym]))
+                if s_sl_cand > 0:
+                    should_ratchet = (
+                        (c_st.current_pos_qty > 0 and (c_st.active_sl_price <= 0 or s_sl_cand > c_st.active_sl_price * 1.0005))
+                        or (c_st.current_pos_qty < 0 and (c_st.active_sl_price <= 0 or s_sl_cand < c_st.active_sl_price * 0.9995))
+                    )
+                    if should_ratchet:
+                        ok_r = await self._exchange.place_or_update_stop_loss(sym, c_st.current_pos_qty, s_sl_cand)
+                        if ok_r:
+                            c_st.active_sl_price = s_sl_cand
+
+            # Страховка для вже відкритих позицій V6.1 (напр. при міграції з V5/V6.0 або в deadzone):
+            # якщо позиція залишається в книзі (не закривається в кеш), але active_sl_price == 0 -> негайно ставимо STOP_MARKET!
+            min_qty_sl, _, _, _, _ = settings.get_symbol_spec(sym)
+            if (
+                abs(c_st.current_pos_qty) >= min_qty_sl
+                and c_st.active_sl_price <= 0.0
+                and c_st.sl_atr_mult > 0.0
+                and cur_atr > 0.0
+                and abs(target_dto.desired_weight) >= settings.CASH_ZONE_THRESHOLD
+                and (c_st.current_pos_qty * target_dto.desired_weight) > 0.0
+            ):
+                ref_ep = c_st.entry_price if c_st.entry_price > 0.0 else cur_p
+                sl_dist_init = c_st.sl_atr_mult * cur_atr
+                raw_sl_init = (ref_ep - sl_dist_init) if c_st.current_pos_qty > 0 else (ref_ep + sl_dist_init)
+                sl_p_init = self._exchange.safe_price(sym, raw_sl_init)
+                fn_sl_ex0 = getattr(self._exchange, "place_or_update_stop_loss_ex", None)
+                if callable(fn_sl_ex0) and inspect.iscoroutinefunction(fn_sl_ex0):
+                    sl_ok0, sl_rsn0 = await fn_sl_ex0(sym, c_st.current_pos_qty, sl_p_init)
+                else:
+                    sl_r0 = await self._exchange.place_or_update_stop_loss(sym, c_st.current_pos_qty, sl_p_init)
+                    sl_ok0 = bool(sl_r0) if isinstance(sl_r0, bool) else True
+                    sl_rsn0 = "OK" if sl_ok0 else "SL_FAILED"
+                if sl_ok0:
+                    c_st.active_sl_price = sl_p_init
+                    self._logger.info(f"🛡️ [{sym}] Довстановлено захисний STOP_MARKET @ ${sl_p_init:,.4f} для утримуваної позиції.")
+                elif sl_rsn0 == "IMMEDIATE_TRIGGER_2021":
+                    pos_sd0 = 1 if c_st.current_pos_qty > 0 else -1
+                    await self._exchange.execute_smart_rebalance_order(
+                        symbol=sym, delta_qty=-c_st.current_pos_qty, mark_price=cur_p,
+                        realized_pnl_est=0.0, note="EMERGENCY_EXIT_2021_HELD", reduce_only=True,
+                    )
+                    c_st.current_pos_qty = 0.0
+                    c_st.entry_price = 0.0
+                    c_st.active_sl_price = 0.0
+                    if hasattr(cartridge, "register_exchange_stop_hit"):
+                        cartridge.register_exchange_stop_hit(sym, pos_sd0)
+                    continue
+
             min_qty, _, min_notional, _, _ = settings.get_symbol_spec(sym)
             cur_weight = (c_st.current_pos_qty * cur_p) / total_equity if total_equity > 0 else 0.0
             if not (c_st.enabled and c_st.mode != 0):
@@ -609,7 +834,7 @@ class MultiAssetExecutionOrchestrator(IService):
                     "sleeve_book": s_book_lbl,
                     "sl_atr_mult": c_st.sl_atr_mult,
                     "tp_atr_mult": c_st.tp_atr_mult,
-                    "maker_first": is_v2_book,
+                    "maker_first": use_legacy_v2_maker,
                     "taker_fallback": True if is_v2_book else None,
                 })
             else:
@@ -624,8 +849,8 @@ class MultiAssetExecutionOrchestrator(IService):
                 delta_qty = target_qty - c_st.current_pos_qty
 
                 if is_v2_book:
-                    v2_min_delta_usd = max(5.0, 0.015 * total_equity)
-                    v2_rel_thresh_usd = 0.18 * abs(c_st.current_pos_qty) * cur_p
+                    v2_min_delta_usd = max(6.0, 0.016 * total_equity)
+                    v2_rel_thresh_usd = 0.24 * abs(c_st.current_pos_qty) * cur_p
                     if abs(delta_qty) * cur_p < max(v2_min_delta_usd, v2_rel_thresh_usd):
                         skipped_exec[sym] = "deadzone"
                         continue
@@ -695,7 +920,7 @@ class MultiAssetExecutionOrchestrator(IService):
                         "sl_atr_mult": c_st.sl_atr_mult,
                         "tp_atr_mult": c_st.tp_atr_mult,
                         "maker_first": (
-                            is_v2_book
+                            use_legacy_v2_maker
                             or (
                                 c_st.dominant_book in ("B1_STATARB", "B2_CARRY_BASIS", "B5_KALMAN_PAIRS")
                                 and not is_flip
@@ -704,6 +929,81 @@ class MultiAssetExecutionOrchestrator(IService):
                         "taker_fallback": True if is_v2_book else None,
                         "urgency": urg_val,
                     })
+
+        # 5a-pre. Pre-Dispatch Spread Filter + Симетричне масштабування нейтральності ДО відправки ордерів!
+        fn_micro_pre = getattr(self._exchange, "fetch_market_microstructure", None)
+        if (
+            is_v2_engine
+            and phase_b_plans
+            and callable(fn_micro_pre)
+            and inspect.iscoroutinefunction(fn_micro_pre)
+        ):
+            try:
+                cand_b_syms = tuple({p["sym"] for p in phase_b_plans})
+                bbo_pre = await fn_micro_pre(cand_b_syms)
+                max_sp_bps = float(settings.MAX_ALLOWED_SPREAD_PCT) * 10_000.0
+                if isinstance(bbo_pre, dict) and bbo_pre:
+                    kept_b: List[Dict[str, Any]] = []
+                    dropped_long_usd = 0.0
+                    dropped_short_usd = 0.0
+                    for pl in phase_b_plans:
+                        sp_b = float((bbo_pre.get(pl["sym"]) or {}).get("spread_bps", 0.0) or 0.0)
+                        if sp_b > max_sp_bps:
+                            not_drop = abs(float(pl["delta_qty"])) * float(pl["cur_p"])
+                            if float(pl["delta_qty"]) > 0:
+                                dropped_long_usd += not_drop
+                            else:
+                                dropped_short_usd += not_drop
+                            skipped_exec[pl["sym"]] = "pre_spread_veto"
+                            self._logger.warning(
+                                f"🛡️ [Pre-Spread Filter] {pl['sym']} спред {sp_b:.1f} bps > {max_sp_bps:.1f} bps -> вхід скасовано до відправки!"
+                            )
+                        else:
+                            kept_b.append(pl)
+                    # Якщо відсіяли ордер на одній стороні — симетрично зменшуємо протилежний бік у phase_b_plans!
+                    # Для малих рахунків (< $1,000) діє dust-tolerance max(15.0, 0.08 * total_equity) проти шуму stepSize.
+                    net_drop_imb = dropped_long_usd - dropped_short_usd
+                    pre_imb_tol_usd = (
+                        max(15.0, 0.08 * total_equity)
+                        if total_equity < 1000.0
+                        else float(settings.NEUTRALITY_IMBALANCE_LIMIT) * total_equity
+                    )
+                    if kept_b and total_equity > 0 and abs(net_drop_imb) > pre_imb_tol_usd:
+                        if net_drop_imb > 0:
+                            # Втратили частину лонгів -> пропорційно стискаємо нові шорти
+                            rem_s_usd = sum(abs(float(p["delta_qty"])) * float(p["cur_p"]) for p in kept_b if float(p["delta_qty"]) < 0)
+                            if rem_s_usd > 1.0:
+                                sc_opp = max(0.0, (rem_s_usd - net_drop_imb)) / rem_s_usd
+                                scaled_b: List[Dict[str, Any]] = []
+                                for p in kept_b:
+                                    if float(p["delta_qty"]) < 0:
+                                        nq = -self._exchange.safe_amount(p["sym"], abs(float(p["delta_qty"])) * sc_opp)
+                                        mq_s, _, mn_s, _, _ = settings.get_symbol_spec(p["sym"])
+                                        if abs(nq) >= mq_s and abs(nq) * float(p["cur_p"]) >= mn_s:
+                                            p["delta_qty"] = nq
+                                            scaled_b.append(p)
+                                    else:
+                                        scaled_b.append(p)
+                                kept_b = scaled_b
+                        else:
+                            # Втратили частину шортів -> пропорційно стискаємо нові лонги
+                            rem_l_usd = sum(abs(float(p["delta_qty"])) * float(p["cur_p"]) for p in kept_b if float(p["delta_qty"]) > 0)
+                            if rem_l_usd > 1.0:
+                                sc_opp = max(0.0, (rem_l_usd - abs(net_drop_imb))) / rem_l_usd
+                                scaled_b = []
+                                for p in kept_b:
+                                    if float(p["delta_qty"]) > 0:
+                                        nq = self._exchange.safe_amount(p["sym"], abs(float(p["delta_qty"])) * sc_opp)
+                                        mq_s, _, mn_s, _, _ = settings.get_symbol_spec(p["sym"])
+                                        if abs(nq) >= mq_s and abs(nq) * float(p["cur_p"]) >= mn_s:
+                                            p["delta_qty"] = nq
+                                            scaled_b.append(p)
+                                    else:
+                                        scaled_b.append(p)
+                                kept_b = scaled_b
+                    phase_b_plans = kept_b
+            except Exception as sp_err:
+                self._logger.debug(f"[Pre-Spread Filter] Skipped: {sp_err}")
 
         # --- ДВОФАЗНА ПАРАЛЕЛЬНА ДИСПЕТЧЕРИЗАЦІЯ ---
         # Фаза А: Паралельне закриття / скорочення позицій (миттєве вивільнення USDT)
@@ -739,7 +1039,13 @@ class MultiAssetExecutionOrchestrator(IService):
             )
             signed_target_net = sum(float(t.desired_weight) for t in portfolio_dto.targets.values())
             imbalance_w = realized_net_w - signed_target_net
-            if abs(imbalance_w) > settings.NEUTRALITY_IMBALANCE_LIMIT:
+            imbalance_usd = abs(imbalance_w) * total_equity
+            post_imb_tol_usd = (
+                max(15.0, 0.08 * total_equity)
+                if total_equity < 1000.0
+                else float(settings.NEUTRALITY_IMBALANCE_LIMIT) * total_equity
+            )
+            if imbalance_usd > post_imb_tol_usd:
                 # Підрізаємо найбільшу позицію на боці надлишкового перекосу (reduce_only=True)
                 excess_side = 1 if imbalance_w > 0 else -1
                 cands_trim = [
@@ -769,6 +1075,18 @@ class MultiAssetExecutionOrchestrator(IService):
                             c_trim.current_pos_qty += d_exec
                             if abs(c_trim.current_pos_qty) < min_q_t:
                                 c_trim.current_pos_qty = 0.0
+
+        # 5b-clean. Очищення осиротілих звичайних та умовних Algo/Trigger SL ордерів на закритих парах
+        fn_orphan = getattr(self._exchange, "cleanup_orphan_orders", None)
+        if (phase_a_plans or phase_b_plans) and callable(fn_orphan) and inspect.iscoroutinefunction(fn_orphan):
+            try:
+                pos_now_clean = {s: float(c.current_pos_qty) for s, c in self._state.coins.items()}
+                touched_syms = tuple({p["sym"] for p in phase_a_plans} | {p["sym"] for p in phase_b_plans})
+                cleaned_n = await fn_orphan(pos_now_clean, candidate_symbols=touched_syms)
+                if cleaned_n > 0:
+                    self._logger.info(f"🧹 [OrphanSLGuard] Скасовано {cleaned_n} залишкових умовних/лімітних ордерів.")
+            except Exception as cl_err:
+                self._logger.debug(f"[OrphanSLGuard] Skipped: {cl_err}")
 
         # 5b-legacy. Pillar 7: Margin-Backed Stink-Bids & VWAP Dip Sniper (ВИКЛЮЧНО для V58; у V2/V3 вимкнено для Zero Skew!)
         rem_lev_budget = max(0.0, self._state.max_portfolio_lev - portfolio_dto.total_gross_leverage)
@@ -856,27 +1174,39 @@ class MultiAssetExecutionOrchestrator(IService):
         calc_ms = round((time.time() - t0) * 1000.0, 1)
         active_coins_cnt = sum(1 for c in self._state.coins.values() if abs(c.current_pos_qty) > 0)
 
+        skipped_counts: Dict[str, int] = {}
+        for r_val in skipped_exec.values():
+            rk = str(r_val or "other")
+            skipped_counts[rk] = skipped_counts.get(rk, 0) + 1
+
         self._state.last_candle_ts = candle_ts
         self._state.latest_telemetry = {
             "timestamp": candle_ts,
             "calc_ms": calc_ms,
-            "engine_mode": settings.CARTRIDGE_ENGINE if settings.CARTRIDGE_ENGINE in ("v2", "v3", "v4", "v5") else ("v2" if is_v2_engine else "v58"),
+            "engine_mode": settings.CARTRIDGE_ENGINE if settings.CARTRIDGE_ENGINE in ("v2", "v3", "v4", "v5", "v6", "qv3", "qv3_convex") else ("v2" if is_v2_engine else "v58"),
             "wallet_balance": round(usdt_balance, 2),
             "unrealized_pnl": round(total_upnl, 2),
             "total_equity": round(total_equity, 2),
+            "peak_equity": round(float(self._state.peak_equity or total_equity), 2),
+            "daily_starting_equity": round(float(self._state.daily_starting_equity or total_equity), 2),
             "gross_leverage": portfolio_dto.total_gross_leverage,
             "net_leverage": portfolio_dto.net_leverage,
             "market_breadth": portfolio_dto.market_breadth,
             "cs_dispersion": float(extra_tel.get("cs_dispersion", 0.0) or 0.0),
             "btc_trend": float(extra_tel.get("btc_trend", 0.0) or 0.0),
             "tier": int(extra_tel.get("tier", 1) or 1),
+            "active_v3_tier": extra_tel.get("active_v3_tier"),
+            "regime_label": extra_tel.get("regime_label"),
+            "committed_beta": extra_tel.get("committed_beta"),
             "a_gross": float(extra_tel.get("a_gross", 0.0) or 0.0),
             "b_gross": float(extra_tel.get("b_gross", 0.0) or 0.0),
             "c_gross": float(extra_tel.get("c_gross", 0.0) or 0.0),
+            "s_gross": float(extra_tel.get("s_gross", extra_tel.get("c_gross", 0.0)) or 0.0),
             "d_gross": float(extra_tel.get("d_gross", 0.0) or 0.0),
             "e_gross": float(extra_tel.get("e_gross", 0.0) or 0.0),
             "virtual_equity_cap": float(settings.VIRTUAL_EQUITY_CAP) if settings.USE_DEMO_TRADING else 0.0,
             "b_rebalanced": bool(extra_tel.get("any_rebalanced", extra_tel.get("b_rebalanced", False))),
+            "s_rebalanced": bool(extra_tel.get("s_rebalanced", False)),
             "news_sentiment": portfolio_dto.news_sentiment,
             "geo_shock_active": geo_shock_active,
             "geo_shock_prob": self._news.geo_shock_prob,
@@ -884,10 +1214,15 @@ class MultiAssetExecutionOrchestrator(IService):
             "top_leader": portfolio_dto.extra_telemetry.get("top_leader", "BTCUSDT"),
             "coin_prices": coin_prices,
             "coin_upnl": coin_upnl,
+            "coin_funding": {str(k): float(v) for k, v in (funding_rates_map or {}).items() if v is not None},
             "coin_targets": coin_targets_map,
             "model_targets": extra_tel.get("weights_net", coin_targets_map) if is_v2_engine else coin_targets_map,
             "coin_books": sleeve_books_map if is_v2_engine else {},
             "coin_factors": extra_tel.get("factor_scores", {}) if is_v2_engine else {},
+            "s_stops": s_stops_map,
+            "stop_cooldowns": extra_tel.get("stop_cooldowns") or {},
+            "skipped_exec": skipped_exec,
+            "skipped_counts": skipped_counts,
             "shadow_arena": arena_board,
         }
         self._state.save_snapshot()
@@ -916,6 +1251,20 @@ class MultiAssetExecutionOrchestrator(IService):
             f"Gross: {portfolio_dto.total_gross_leverage:.2f}x | Лідер: {self._state.latest_telemetry['top_leader']} | "
             f"Breadth: {portfolio_dto.market_breadth:+.2f}"
         )
+
+        await self._emit_heartbeat("ok", candle_ts, total_equity, active_coins_cnt)
+
+        # Щоденний Telegram-звіт (Equity, Peak DD, Active Legs, Gross/Net) на початку нової UTC доби
+        if today > self._last_daily_report_date:
+            self._last_daily_report_date = today
+            peak_e = max(float(self._state.peak_equity or total_equity), total_equity)
+            cur_dd_pct = (peak_e - total_equity) / max(peak_e, 1e-9) * 100.0
+            await self._send_alert(
+                f"📊 <b>[Daily Report {today.strftime('%Y-%m-%d UTC')}] QuantCore</b>\n"
+                f"• Equity: <b>${total_equity:,.2f} USDT</b> (DD від піку: <code>-{cur_dd_pct:.2f}%</code>)\n"
+                f"• Активні позиції: <code>{active_coins_cnt}</code> | Gross: <code>{portfolio_dto.total_gross_leverage:.2f}x</code> "
+                f"| Net: <code>{portfolio_dto.net_leverage:+.2f}x</code>"
+            )
 
         if executed_orders_summary:
             eng_title = "QuantCore V2 Multi-Sleeve (1h)" if is_v2_engine else "QuantCore V58.0 Pure SOTA"

@@ -23,13 +23,17 @@ QuantCore-GrandMaster-Server/.env
 data_1h/
 Prepearing/
 quant_v2/
-tests/test_quant_v2_suite.py
+quant_v3/
+tests/
 QuantCore-GrandMaster-Server/app/cartridges/v2_multi_sleeve_cartridge.py
 QuantCore-GrandMaster-Server/app/cartridges/v58_grand_master_cartridge.py
+QuantCore-GrandMaster-Server/app/cartridges/qv3_convex_cartridge.py
 QuantCore-GrandMaster-Server/app/cartridges/feature_pipe_v58.py
+QuantCore-GrandMaster-Server/scripts/
 QuantCore-GrandMaster-Server/tests/test_v2_cartridge.py
 QuantCore-GrandMaster-Server/tests/test_v58_pipeline.py
 QuantCore-GrandMaster-Server/tests/test_step4_data_channels.py
+QuantCore-GrandMaster-Server/tests/test_portal_and_qv3.py
 QuantCore-GrandMaster-Server/storage/*.db*
 QuantCore-GrandMaster-Server/storage/*.json
 QuantCore-GrandMaster-Server/storage/*.log
@@ -37,5 +41,6 @@ QuantCore-GrandMaster-Server/storage/backups/*
 QuantCore-GrandMaster-Server/storage/v2_telemetry/*
 QuantCore-GrandMaster-Server/storage/cartridges/*.joblib
 .agents/
+.opencode/
 .idea/
 .vscode/

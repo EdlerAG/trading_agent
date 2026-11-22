@@ -297,10 +297,13 @@ class ShadowArenaService(IService):
                             _step_live_c_stops_and_mfe(st, panel, feat, t, syms_l, use_cfg) if has_v3_u else ({}, False)
                         )
 
+                        cont_1h_u = bool(has_v3_u and getattr(use_cfg.sleeve_b, "continuous_1h_ewma", False))
+                        n_tr_u = 1 if cont_1h_u else (max(1, int(getattr(use_cfg.sleeve_b, "n_tranches", 1))) if has_v3_u else 1)
+                        stride_b_u = 1 if cont_1h_u else max(1, int(use_cfg.sleeve_b.rebalance_every_h) // n_tr_u)
                         bar_h = cur_bar_ms // 3_600_000
-                        b_bkt = bar_h // use_cfg.sleeve_b.rebalance_every_h
-                        c_bkt = bar_h // max(1, use_cfg.sleeve_c.rebalance_every_h)
-                        d_bkt = bar_h // max(1, use_cfg.sleeve_d.rebalance_every_h)
+                        b_bkt = bar_h // stride_b_u
+                        c_bkt = bar_h if cont_1h_u else (bar_h // max(1, use_cfg.sleeve_c.rebalance_every_h))
+                        d_bkt = bar_h if cont_1h_u else (bar_h // max(1, use_cfg.sleeve_d.rebalance_every_h))
                         b_due = b_bkt != st.last_b_bucket
                         c_due = bool(has_v3_u and use_cfg.sleeve_c.enabled and st.tier2_active and c_bkt != st.last_c_bucket)
                         d_due = bool(has_v3_u and use_cfg.sleeve_d.enabled and st.tier3_active and d_bkt != st.last_d_bucket)
@@ -311,29 +314,33 @@ class ShadowArenaService(IService):
                                     np.asarray(st.recent_eq_history, dtype=np.float64),
                                     use_downside=bool(getattr(use_cfg.risk, "use_downside_vol", False)),
                                 )
-                                if (has_v3_u and len(st.recent_eq_history) >= 96)
+                                if (has_v3_u and len(st.recent_eq_history) >= 96 and not getattr(use_cfg.risk, "use_ex_ante_lw_vol", False))
                                 else None
                             )
-                            net_w, a_w, b_w, c_w, d_w, _e_w, _rm = compute_live_weights(
+                            init_tr_u = st.b_tranches if st.b_tranches else [dict(st.last_b_weights) for _ in range(n_tr_u)]
+                            net_w, a_w, b_w, c_w, d_w, _rm, new_tr_u = compute_live_weights(
                                 feat, panel, t, eq_now, {}, st.last_a_weights, st.last_b_weights, st.peak_equity,
                                 use_cfg.sleeve_a, use_cfg.sleeve_b, use_cfg.risk, use_cfg.allocator,
                                 funding_filter=True, tier2_active=st.tier2_active, force_b_rebalance=b_due,
                                 initial_equity=st.initial_equity, ml_scores_t=ml_168, ml_fast_scores_t=ml_24,
-                                cfg_c=use_cfg.sleeve_c, cfg_d=use_cfg.sleeve_d, cfg_e=use_cfg.sleeve_e,
-                                last_c_weights=st.last_c_weights, last_d_weights=st.last_d_weights, last_e_weights={},
-                                tier3_active=st.tier3_active, force_c_rebalance=c_due, force_e_rebalance=False,
+                                cfg_c=use_cfg.sleeve_c, cfg_d=use_cfg.sleeve_d,
+                                last_c_weights=st.last_c_weights, last_d_weights=st.last_d_weights,
+                                tier3_active=st.tier3_active, force_c_rebalance=c_due,
                                 coin_news_bias=coin_news_bias, port_rvol_ann=p_rv,
-                                active_c_positions=active_c_pos, return_all_sleeves=True,
+                                active_c_positions=active_c_pos, b_tranches=init_tr_u,
+                                return_all_sleeves=True, return_tranches=True,
                             )
                             if b_due:
                                 st.last_b_weights, st.last_a_weights = dict(b_w), dict(a_w)
+                                st.b_tranches = [dict(x) for x in new_tr_u] if n_tr_u > 1 else []
                                 st.last_b_bucket = b_bkt
                             if d_due or b_due:
                                 st.last_d_weights = dict(d_w)
                                 st.last_d_bucket = d_bkt
                             if c_due or b_due:
                                 st.last_c_weights = dict(c_w)
-                                st.last_c_bucket = c_bkt
+                                if c_due:
+                                    st.last_c_bucket = c_bkt
                                 if has_v3_u:
                                     _sync_c_meta_after_rebalance(st, st.last_c_weights, panel, feat, t, syms_l, use_cfg)
                             bot["live_state"] = st.to_dict()

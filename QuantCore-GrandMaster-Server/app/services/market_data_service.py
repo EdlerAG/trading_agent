@@ -1,6 +1,10 @@
 import asyncio
 import inspect
 import logging
+import os
+import pickle
+import random
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
@@ -18,13 +22,40 @@ class MarketDataService(IService):
       із локальним кільцевим кешем у пам'яті (< 4 MB RAM на всі 58 монет).
     """
 
-    __slots__ = ("_logger", "_exchange", "_last_synced_ts", "_v3_aux_cache")
+    __slots__ = ("_logger", "_exchange", "_last_synced_ts", "_v3_aux_cache", "_aux_cache_path", "_aux_dirty")
 
     def __init__(self, logger: logging.Logger, exchange_service: IExchangeGateway) -> None:
         self._logger = logger
         self._exchange = exchange_service
         self._last_synced_ts: str = ""
         self._v3_aux_cache: Dict[str, Tuple[float, Dict[int, Tuple[float, float, float, float, float, float]]]] = {}
+        self._aux_cache_path = Path(settings.MARKET_CACHE_DIR) / "v3_aux_cache.pkl"
+        self._aux_dirty: bool = False
+
+    def _load_disk_aux_cache_sync(self) -> None:
+        if not self._aux_cache_path.exists():
+            return
+        try:
+            with open(self._aux_cache_path, "rb") as f:
+                data = pickle.load(f)
+            if isinstance(data, dict):
+                self._v3_aux_cache.update(data)
+                self._logger.info(f"💾 [MarketData] Завантажено дисковий кеш V3-каналів для {len(data)} монет.")
+        except Exception as e:
+            self._logger.debug(f"[MarketData] Пропуск пошкодженого кешу V3: {e}")
+
+    def _save_disk_aux_cache_sync(self) -> None:
+        if not self._aux_dirty or not self._v3_aux_cache:
+            return
+        try:
+            self._aux_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_p = self._aux_cache_path.with_suffix(".pkl.tmp")
+            with open(tmp_p, "wb") as f:
+                pickle.dump(self._v3_aux_cache, f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp_p, self._aux_cache_path)
+            self._aux_dirty = False
+        except Exception as e:
+            self._logger.debug(f"[MarketData] Не вдалося зберегти кеш V3: {e}")
 
     @property
     def name(self) -> str:
@@ -35,10 +66,12 @@ class MarketDataService(IService):
         return self._last_synced_ts
 
     async def init(self) -> None:
-        pass
+        from app.core.memory_guard import memory_guard
+        await asyncio.to_thread(memory_guard.prune_market_cache, getattr(settings, "MAX_MARKET_CACHE_MB", 200))
+        await asyncio.to_thread(self._load_disk_aux_cache_sync)
 
     async def shutdown(self) -> None:
-        pass
+        await asyncio.to_thread(self._save_disk_aux_cache_sync)
 
     @staticmethod
     def _bar_ts_ms(df: pd.DataFrame) -> np.ndarray:
@@ -116,13 +149,24 @@ class MarketDataService(IService):
         now_ms = int(now_s * 1000)
 
         async def _safe_json(url: str, params: Dict[str, object]) -> list:
-            try:
-                r = await client.get(url, params=params, timeout=7.5)
-                if r.status_code == 200:
-                    d = r.json()
-                    return d if isinstance(d, list) else []
-            except Exception:
-                pass
+            for attempt in range(3):
+                try:
+                    r = await client.get(url, params=params, timeout=7.5)
+                    if r.status_code == 200:
+                        d = r.json()
+                        return d if isinstance(d, list) else []
+                    if r.status_code in (429, 418, 500, 502, 503, 504):
+                        retry_after = float(r.headers.get("Retry-After") or 0.0)
+                        backoff = max(retry_after, (0.65 * (2.2 ** attempt)) + random.uniform(0.05, 0.25))
+                        self._logger.warning(
+                            f"⚠️ [MarketData HTTP {r.status_code}] {sym_u} backoff {backoff:.2f}s (attempt {attempt + 1}/3)"
+                        )
+                        await asyncio.sleep(min(backoff, 8.0))
+                        continue
+                    break
+                except Exception:
+                    if attempt < 2:
+                        await asyncio.sleep(0.5 * (attempt + 1))
             return []
 
         prem_r, spot_r, oi_r, tls_r, gls_r = await asyncio.gather(
@@ -168,7 +212,9 @@ class MarketDataService(IService):
         # Обмежуємо кільцевий буфер до останніх 540 годин (~25 КБ на монету!)
         sorted_keys = sorted(merged)[-540:]
         compact = {k: (merged[k][0], merged[k][1], merged[k][2], merged[k][3], merged[k][4], merged[k][5]) for k in sorted_keys}
-        self._v3_aux_cache[sym_u] = (now_s, compact)
+        if compact:
+            self._v3_aux_cache[sym_u] = (now_s, compact)
+            self._aux_dirty = True
         return compact
 
     @classmethod
@@ -276,8 +322,10 @@ class MarketDataService(IService):
         # Підвантаження V3 допоміжних каналів тільки коли активне ядро V3 та реальний біржовий шлюз
         v3_aux_by_sym: Dict[str, Dict[int, Tuple[float, float, float, float, float, float]]] = {}
         is_real_gateway = getattr(self._exchange, "_exchange", None) is not None
-        if settings.CARTRIDGE_ENGINE in ("v3", "v4", "v5") and settings.ENABLE_V3_AUX_CHANNELS and is_real_gateway:
-            aux_sem = asyncio.Semaphore(8)
+        if settings.CARTRIDGE_ENGINE in ("v3", "v4", "v5", "v6") and settings.ENABLE_V3_AUX_CHANNELS and is_real_gateway:
+            if not self._v3_aux_cache and self._aux_cache_path.exists():
+                await asyncio.to_thread(self._load_disk_aux_cache_sync)
+            aux_sem = asyncio.Semaphore(6)
 
             async def _pull_aux(s: str):
                 async with aux_sem:
@@ -285,6 +333,8 @@ class MarketDataService(IService):
 
             for s_k, aux_d in await asyncio.gather(*[_pull_aux(sym) for sym in symbols]):
                 v3_aux_by_sym[s_k] = aux_d
+            if self._aux_dirty:
+                await asyncio.to_thread(self._save_disk_aux_cache_sync)
 
         for sym_u, df in candles_results:
             if df is not None and len(df) >= min_bars:

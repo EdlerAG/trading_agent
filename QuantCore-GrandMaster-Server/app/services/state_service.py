@@ -25,24 +25,30 @@ class StateService(IService):
         "active_cartridge",
         "force_step",
         "daily_starting_equity",
+        "peak_equity",
         "last_reset_date",
         "coins",
         "latest_telemetry",
         "last_candle_ts",
         "updated_at",
+        "_started_at_unix",
     )
 
     def __init__(self) -> None:
+        self._started_at_unix: float = time.time()
         self.is_paused: bool = False
         self.pause_until: Optional[datetime] = None
         self.risk_profile: str = settings.DEFAULT_RISK_PROFILE
         if self.risk_profile not in RISK_PROFILES_MAP:
             self.risk_profile = "OPTIMAL"
         self.max_portfolio_lev: float = RISK_PROFILES_MAP[self.risk_profile][1]
+        if settings.CARTRIDGE_ENGINE in ("v3", "v4", "v5", "v6", "qv3", "qv3_convex"):
+            self.max_portfolio_lev = min(self.max_portfolio_lev, settings.MAX_GROSS_LEVERAGE_CAP)
         self.orchestrator_mode: str = settings.DEFAULT_ORCHESTRATOR_MODE
         self.active_cartridge: str = "auto"
         self.force_step: bool = False
         self.daily_starting_equity: float = 0.0
+        self.peak_equity: float = 0.0
         self.last_reset_date: Optional[str] = None
         self.coins: Dict[str, CoinStateDTO] = {}
         self.latest_telemetry: Dict[str, Any] = {}
@@ -97,19 +103,24 @@ class StateService(IService):
             if prof in RISK_PROFILES_MAP:
                 self.risk_profile = prof
                 self.max_portfolio_lev = float(data.get("max_portfolio_lev") or RISK_PROFILES_MAP[prof][1])
-            if settings.CARTRIDGE_ENGINE in ("v4", "v5"):
-                self.max_portfolio_lev = max(self.max_portfolio_lev, 3.50)
+            if settings.CARTRIDGE_ENGINE in ("v3", "v4", "v5", "v6", "qv3", "qv3_convex"):
+                self.max_portfolio_lev = min(self.max_portfolio_lev, settings.MAX_GROSS_LEVERAGE_CAP)
 
             self.orchestrator_mode = str(data.get("orchestrator_mode", self.orchestrator_mode)).upper()
             self.active_cartridge = str(data.get("active_cartridge", "auto"))
             self.force_step = bool(data.get("force_step", False))
             self.daily_starting_equity = float(data.get("daily_starting_equity", 0.0))
+            self.peak_equity = float(data.get("peak_equity", 0.0))
             self.last_reset_date = data.get("last_reset_date")
             self.last_candle_ts = str(data.get("last_candle_ts", ""))
             saved_tel = data.get("latest_telemetry")
+            alt_tel = data.get("telemetry")
             if isinstance(saved_tel, dict) and saved_tel:
                 self.latest_telemetry = saved_tel
-            self.latest_telemetry = data.get("telemetry", {})
+            elif isinstance(alt_tel, dict) and alt_tel:
+                self.latest_telemetry = alt_tel
+            else:
+                self.latest_telemetry = {}
 
             coins_raw = data.get("coins", {})
             for sym, c_dict in coins_raw.items():
@@ -169,6 +180,7 @@ class StateService(IService):
             "active_cartridge": self.active_cartridge,
             "force_step": self.force_step,
             "daily_starting_equity": round(self.daily_starting_equity, 2),
+            "peak_equity": round(self.peak_equity, 2),
             "last_reset_date": self.last_reset_date,
             "last_candle_ts": self.last_candle_ts,
             "latest_telemetry": self.latest_telemetry,
@@ -292,6 +304,9 @@ class StateService(IService):
         model_targets = self.latest_telemetry.get("model_targets", {})
         coin_books = self.latest_telemetry.get("coin_books", {})
         coin_factors = self.latest_telemetry.get("coin_factors", {})
+        coin_funding = self.latest_telemetry.get("coin_funding", {}) or {}
+        s_stops = self.latest_telemetry.get("s_stops", {}) or {}
+        raw_cds = self.latest_telemetry.get("stop_cooldowns", {}) or {}
         tot_eq = float(self.latest_telemetry.get("total_equity", 0.0) or 0.0)
 
         out = []
@@ -303,6 +318,8 @@ class StateService(IService):
             raw_tw = float(coin_targets.get(sym, 0.0) or 0.0)
             mod_tw = float(model_targets.get(sym, 0.0) or 0.0)
             eff_tw = mod_tw if abs(mod_tw) > 1e-6 else (raw_tw if abs(raw_tw) > 1e-6 else realized_w)
+            cd_l = int(raw_cds.get(f"{sym}:1", 0) or 0)
+            cd_s = int(raw_cds.get(f"{sym}:-1", 0) or 0)
             d["price"] = price
             d["notional_usdt"] = round(abs(notional_signed), 2)
             d["realized_weight"] = round(realized_w, 4)
@@ -310,6 +327,9 @@ class StateService(IService):
             d["target_weight"] = round(eff_tw, 4)
             d["sleeve_book"] = str(coin_books.get(sym) or c.dominant_book or "")
             d["factors"] = coin_factors.get(sym) or {}
+            d["funding_rate"] = float(coin_funding.get(sym)) if sym in coin_funding and coin_funding.get(sym) is not None else None
+            d["s_stop_px"] = float(s_stops.get(sym, 0.0) or 0.0)
+            d["cooldown_until_ms"] = max(cd_l, cd_s)
             out.append(d)
         return out
 
@@ -321,6 +341,8 @@ class StateService(IService):
             "max_portfolio_lev": self.max_portfolio_lev,
             "orchestrator_mode": self.orchestrator_mode,
             "daily_starting_equity": round(self.daily_starting_equity, 2),
+            "peak_equity": round(self.peak_equity, 2),
+            "uptime_sec": round(max(0.0, time.time() - self._started_at_unix), 1),
             "last_candle_ts": self.last_candle_ts,
             "updated_at": self.updated_at,
             "telemetry": self.latest_telemetry,

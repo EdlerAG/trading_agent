@@ -29,9 +29,13 @@ class OnlineAdaptationService(IOnlineLearner):
         return "OnlineAdaptationService"
 
     async def init(self) -> None:
+        if not settings.ENABLE_ONLINE_LEARNING:
+            return
         self.load_state()
 
     async def shutdown(self) -> None:
+        if not settings.ENABLE_ONLINE_LEARNING:
+            return
         self.save_state()
 
     def _ensure_asset(self, symbol: str) -> Dict[str, Any]:
@@ -115,6 +119,8 @@ class OnlineAdaptationService(IOnlineLearner):
         return self._ensure_asset(symbol)
 
     def get_all_learning_states(self) -> Dict[str, Dict[str, Any]]:
+        if not settings.ENABLE_ONLINE_LEARNING:
+            return {}
         return self._assets
 
     def record_step_and_adapt(

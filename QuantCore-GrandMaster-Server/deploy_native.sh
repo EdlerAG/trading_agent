@@ -47,19 +47,36 @@ fi
 mkdir -p "$SCRIPT_DIR/storage/cartridges"
 mkdir -p "$SCRIPT_DIR/storage/backups"
 mkdir -p "$SCRIPT_DIR/storage/v2_telemetry"
+mkdir -p "$SCRIPT_DIR/storage/market_cache"
 chmod -R 750 "$SCRIPT_DIR/storage"
+if [ -f "$SCRIPT_DIR/deploy/notify_systemd_failure.sh" ]; then
+    chmod +x "$SCRIPT_DIR/deploy/notify_systemd_failure.sh"
+fi
 
 # 4. Генерація systemd unit-файлу (попередня компіляція кешу Numba для швидкого старту)
-echo "⚡ Попередня компіляція 49-фічевого Numba-ядра..."
+echo "⚡ Попередня компіляція 50-фічевого Numba-ядра..."
 PYTHONPATH="$SCRIPT_DIR:$PARENT_DIR" NUMBA_NUM_THREADS=2 "$VENV_DIR/bin/python" -c "import numpy as np, quant_v2.features as qf; p={'ts':np.arange(16,dtype=np.int64)*3600000,'symbols':np.array(['BTCUSDT','ETHUSDT','SOLUSDT']),'open':np.ones((16,3)),'high':np.ones((16,3))*1.01,'low':np.ones((16,3))*0.99,'close':np.ones((16,3)),'quote_volume':np.ones((16,3))*1e6,'taker_quote':np.ones((16,3))*5e5,'num_trades':np.ones((16,3))*100,'funding_last':np.zeros((16,3)),'valid':np.ones((16,3),bool)}; qf.compute_features(p); print('Numba cache ready!')"
+
+ALERT_SERVICE_FILE="/etc/systemd/system/trading_bot_failure_alert.service"
+sudo bash -c "cat > $ALERT_SERVICE_FILE" <<EOF
+[Unit]
+Description=QuantCore Dead-Man Switch Telegram Alert on Failure
+
+[Service]
+Type=oneshot
+User=$CURRENT_USER
+ExecStart=/bin/bash $SCRIPT_DIR/deploy/notify_systemd_failure.sh
+EOF
+
 SERVICE_FILE="/etc/systemd/system/$SERVICE_NAME"
 echo "🔧 Генерація $SERVICE_FILE..."
 
 sudo bash -c "cat > $SERVICE_FILE" <<EOF
 [Unit]
-Description=QuantCore V5.0 All-Regime Sovereign Server
+Description=QuantCore V6.1 Institutional Production Core Server
 After=network.target network-online.target
 Wants=network-online.target
+OnFailure=trading_bot_failure_alert.service
 
 [Service]
 Type=simple

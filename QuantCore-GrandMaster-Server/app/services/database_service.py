@@ -708,6 +708,10 @@ class DatabaseService(IService):
         fee_usdt: float,
         latency_ms: float,
         order_status: str = "FILLED",
+        bbo_spread_bps: Optional[float] = None,
+        best_bid: float = 0.0,
+        best_ask: float = 0.0,
+        top5_depth_usd: float = 0.0,
     ) -> None:
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         sgn = 1.0 if side.upper() == "BUY" else -1.0
@@ -715,6 +719,7 @@ class DatabaseService(IService):
         slip_sig = ((fill_avg_px - signal_close_px) / max(signal_close_px, 1e-8) * sgn * 10_000.0) if (fill_avg_px > 0 and signal_close_px > 0) else 0.0
         is_maker = 1 if (maker_qty > 0 and taker_qty <= 1e-12) else 0
         fb_used = 1 if taker_qty > 1e-12 else 0
+        eff_bbo_sp = float(bbo_spread_bps if bbo_spread_bps is not None else spread_bps)
         try:
             with self._connect() as conn:
                 conn.execute(
@@ -730,7 +735,7 @@ class DatabaseService(IService):
                         now_str, str(candle_ts), symbol.upper(), str(sleeve_book), side.upper(),
                         float(target_qty), float(executed_qty), float(signal_close_px),
                         float(arrival_mid_px), float(fill_avg_px), round(float(slip_arr), 3),
-                        round(float(slip_arr), 3), round(float(slip_sig), 3), round(float(spread_bps), 3),
+                        round(float(slip_arr), 3), round(float(slip_sig), 3), round(eff_bbo_sp, 3),
                         is_maker, fb_used, float(maker_qty), float(taker_qty),
                         float(fee_usdt), float(latency_ms), str(order_status),
                     ),
@@ -752,7 +757,11 @@ class DatabaseService(IService):
             "slippage_bps": round(float(slip_arr), 3),
             "slip_arr_bps": round(float(slip_arr), 3),
             "slip_sig_bps": round(float(slip_sig), 3),
-            "spread_bps": round(float(spread_bps), 3),
+            "spread_bps": round(eff_bbo_sp, 3),
+            "bbo_spread_bps": round(eff_bbo_sp, 3),
+            "best_bid": float(best_bid),
+            "best_ask": float(best_ask),
+            "top5_depth_usd": round(float(top5_depth_usd), 2),
             "is_maker": bool(is_maker),
             "maker_fallback_used": bool(fb_used),
             "maker_qty": round(float(maker_qty), 6),
@@ -915,6 +924,10 @@ class DatabaseService(IService):
                 "avg_slippage_arrival_bps": round(float(ex["avg_slip_arr"] or 0.0), 2) if ex else 0.0,
                 "avg_slippage_signal_bps": round(float(ex["avg_slip_sig"] or 0.0), 2) if ex else 0.0,
                 "avg_spread_bps": round(float(ex["avg_spread"] or 0.0), 2) if ex else 0.0,
+                "avg_bbo_spread_bps": round(float(ex["avg_spread"] or 0.0), 2) if ex else 0.0,
+                "est_maker_savings_usd": round(
+                    t_usd * ((0.00030 + 0.5 * float(ex["avg_spread"] or 0.0) / 10_000.0) if ex else 0.00030), 3
+                ),
                 "avg_latency_ms": round(float(ex["avg_lat"] or 0.0), 1) if ex else 0.0,
                 "v2_fees_usdt": round(float(ex["fees"] or 0.0), 3) if ex else 0.0,
                 "funding_events": int(fn["cnt"] or 0) if fn else 0,

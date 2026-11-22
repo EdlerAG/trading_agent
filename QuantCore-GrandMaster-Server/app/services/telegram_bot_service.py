@@ -15,7 +15,6 @@ from app.core.events import event_bus, EventType
 from app.domain.interfaces import IService
 from app.services.state_service import StateService
 from app.services.database_service import DatabaseService
-from app.services.news_ai_service import NewsAiService
 from app.cartridges.cartridge_loader import CartridgeLoaderService
 
 
@@ -82,7 +81,7 @@ class TelegramBotService(IService):
         state_service: StateService,
         db_service: DatabaseService,
         cartridge_service: CartridgeLoaderService,
-        news_service: NewsAiService,
+        news_service: Any,
         orchestrator,
     ) -> None:
         self._logger = logger
@@ -112,9 +111,11 @@ class TelegramBotService(IService):
 
     def _is_v2(self) -> bool:
         return (
-            settings.CARTRIDGE_ENGINE in ("v2", "v3", "v4", "v5")
+            settings.CARTRIDGE_ENGINE in ("v2", "v3", "v4", "v5", "v6")
             or "v2" in str(self._cartridges.active_name).lower()
             or "v3" in str(self._cartridges.active_name).lower()
+            or "v5" in str(self._cartridges.active_name).lower()
+            or "v6" in str(self._cartridges.active_name).lower()
         )
 
     def _env_badge(self) -> str:
@@ -887,11 +888,11 @@ class TelegramBotService(IService):
         while True:
             try:
                 offset = -1 if not self._synced else (self._last_update_id + 1)
-                timeout_val = 0 if not self._synced else 35
+                timeout_val = 0 if not self._synced else 50
                 data = await self._api(
                     "getUpdates",
                     {"offset": offset, "limit": 10, "timeout": timeout_val},
-                    timeout=42.0,
+                    timeout=58.0,
                 )
 
                 if data and data.get("ok"):
