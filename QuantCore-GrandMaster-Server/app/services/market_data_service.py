@@ -2,11 +2,11 @@ import asyncio
 import inspect
 import logging
 import os
-import pickle
 import random
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import numpy as np
+import orjson
 import pandas as pd
 
 from app.core.config import settings
@@ -29,7 +29,7 @@ class MarketDataService(IService):
         self._exchange = exchange_service
         self._last_synced_ts: str = ""
         self._v3_aux_cache: Dict[str, Tuple[float, Dict[int, Tuple[float, float, float, float, float, float]]]] = {}
-        self._aux_cache_path = Path(settings.MARKET_CACHE_DIR) / "v3_aux_cache.pkl"
+        self._aux_cache_path = Path(settings.MARKET_CACHE_DIR) / "v3_aux_cache.json"
         self._aux_dirty: bool = False
 
     def _load_disk_aux_cache_sync(self) -> None:
@@ -37,10 +37,18 @@ class MarketDataService(IService):
             return
         try:
             with open(self._aux_cache_path, "rb") as f:
-                data = pickle.load(f)
+                data = orjson.loads(f.read())
             if isinstance(data, dict):
-                self._v3_aux_cache.update(data)
-                self._logger.info(f"💾 [MarketData] Завантажено дисковий кеш V3-каналів для {len(data)} монет.")
+                parsed = {
+                    str(sym): (
+                        float(entry[0]),
+                        {int(k): tuple(float(x) for x in v) for k, v in entry[1].items()},
+                    )
+                    for sym, entry in data.items()
+                    if isinstance(entry, (list, tuple)) and len(entry) == 2 and isinstance(entry[1], dict)
+                }
+                self._v3_aux_cache.update(parsed)
+                self._logger.info(f"💾 [MarketData] Завантажено дисковий кеш V3-каналів для {len(parsed)} монет.")
         except Exception as e:
             self._logger.debug(f"[MarketData] Пропуск пошкодженого кешу V3: {e}")
 
@@ -49,9 +57,13 @@ class MarketDataService(IService):
             return
         try:
             self._aux_cache_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_p = self._aux_cache_path.with_suffix(".pkl.tmp")
+            tmp_p = self._aux_cache_path.with_suffix(".json.tmp")
+            payload = {
+                sym: [float(entry[0]), {str(k): list(v) for k, v in entry[1].items()}]
+                for sym, entry in self._v3_aux_cache.items()
+            }
             with open(tmp_p, "wb") as f:
-                pickle.dump(self._v3_aux_cache, f, protocol=pickle.HIGHEST_PROTOCOL)
+                f.write(orjson.dumps(payload))
             os.replace(tmp_p, self._aux_cache_path)
             self._aux_dirty = False
         except Exception as e:

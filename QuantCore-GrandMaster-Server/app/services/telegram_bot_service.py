@@ -536,11 +536,16 @@ class TelegramBotService(IService):
                 ]
             }
 
+            base_real = os.path.realpath(settings.BASE_DIR)
             if fname.endswith(".py"):
-                sub_dir = self.PY_FILE_ROUTES.get(fname, caption.strip() if caption else "")
-                target_dir = os.path.join(settings.BASE_DIR, sub_dir) if sub_dir else settings.BASE_DIR
+                safe_fname = os.path.basename(fname.replace("\\", "/"))
+                sub_dir = self.PY_FILE_ROUTES.get(safe_fname, caption.strip() if caption else "")
+                target_dir = os.path.realpath(os.path.join(base_real, sub_dir) if sub_dir else base_real)
+                target_path = os.path.realpath(os.path.join(target_dir, safe_fname))
+                if os.path.commonpath([base_real, target_path]) != base_real:
+                    await self.send_alert("❌ Відхилено: неприпустимий шлях файлу.")
+                    return
                 os.makedirs(target_dir, exist_ok=True)
-                target_path = os.path.join(target_dir, fname)
                 tmp_path = target_path + ".tmp"
                 with open(tmp_path, "wb") as f:
                     f.write(raw_bytes)
@@ -555,9 +560,11 @@ class TelegramBotService(IService):
                     with zipfile.ZipFile(io.BytesIO(raw_bytes)) as zf:
                         extracted = []
                         for member in zf.namelist():
-                            if ".." in member or member.startswith("/") or ".env" in member:
+                            norm_m = member.replace("\\", "/")
+                            dest_real = os.path.realpath(os.path.join(base_real, norm_m))
+                            if os.path.commonpath([base_real, dest_real]) != base_real or ".env" in norm_m.lower():
                                 continue
-                            zf.extract(member, settings.BASE_DIR)
+                            zf.extract(member, base_real)
                             extracted.append(member)
                     await self.send_alert(
                         f"📦 <b>ZIP-патч розпаковано ({len(extracted)} файлів)!</b>",

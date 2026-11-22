@@ -133,8 +133,11 @@ class NewsAiService(IService):
     @classmethod
     def _extract_feed_titles(cls, xml_bytes: bytes, now_ts: float, max_items: int = 8) -> List[str]:
         out: List[str] = []
+        raw_slice = xml_bytes[: cls.MAX_FEED_BYTES]
+        if b"<!DOCTYPE" in raw_slice.upper() or b"<!ENTITY" in raw_slice.upper():
+            return out
         try:
-            root = ET.fromstring(xml_bytes[: cls.MAX_FEED_BYTES])
+            root = ET.fromstring(raw_slice)
         except Exception:
             return out
 
@@ -367,9 +370,14 @@ class NewsAiService(IService):
         for model_name in model_candidates:
             if not model_name:
                 continue
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={settings.GEMINI_API_KEY}"
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
             try:
-                resp = await client.post(url, json=payload, timeout=8.5)
+                resp = await client.post(
+                    url,
+                    json=payload,
+                    headers={"x-goog-api-key": settings.GEMINI_API_KEY},
+                    timeout=8.5,
+                )
                 if resp.status_code != 200:
                     continue
                 data = resp.json()

@@ -232,10 +232,14 @@ class CartridgeLoaderService(IService):
         }
 
     async def hot_swap_from_bytes(self, filename: str, content: bytes) -> Dict[str, Any]:
-        safe_name = os.path.basename(filename)
+        raw_base = os.path.basename(filename.replace("\\", "/"))
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw_base).strip("._") or "quant_core_uploaded.joblib"
         if not safe_name.endswith(".joblib"):
             safe_name += ".joblib"
-        target_path = os.path.join(settings.CARTRIDGES_DIR, safe_name)
+        base_real = os.path.realpath(settings.CARTRIDGES_DIR)
+        target_path = os.path.realpath(os.path.join(base_real, safe_name))
+        if os.path.commonpath([base_real, target_path]) != base_real:
+            raise ValueError("Неприпустиме ім'я файлу картриджа")
         with open(target_path, "wb") as f:
             f.write(content)
         info = self.load_cartridge_by_name(safe_name)
