@@ -1,6 +1,7 @@
 import re
 from typing import Tuple
 from fastapi import APIRouter, Depends, Request, HTTPException
+from app.core.config import settings
 from app.core.security import verify_api_access
 from app.domain.schemas import CartridgeSelectRequest
 
@@ -59,6 +60,9 @@ async def upload_and_hotswap_cartridge(
     і виконує гарячу заміну (Hot-Swap) на льоту без перезапуску сервера.
     Працює навіть без встановленого python-multipart!
     """
+    if not settings.ALLOW_CARTRIDGE_UPLOAD:
+        raise HTTPException(status_code=403, detail="Завантаження картриджів вимкнено конфігурацією безпеки")
+
     container = getattr(request.app.state, "container", None)
     if container is None:
         raise HTTPException(status_code=503, detail="Сервіси ще ініціалізуються")

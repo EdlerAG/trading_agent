@@ -196,6 +196,10 @@ class Settings:
     DASHBOARD_PASSWORD: str = os.getenv("DASHBOARD_PASSWORD") or secrets.token_hex(24)
     SERVER_HOST: str = os.getenv("SERVER_HOST", "0.0.0.0")
     SERVER_PORT: int = int(os.getenv("SERVER_PORT", "8501"))
+    COOKIE_SECURE: bool = os.getenv("COOKIE_SECURE", "false").lower() in ("1", "true", "yes")
+    ENABLE_API_DOCS: bool = os.getenv("ENABLE_API_DOCS", "false").lower() in ("1", "true", "yes")
+    ALLOW_CARTRIDGE_UPLOAD: bool = os.getenv("ALLOW_CARTRIDGE_UPLOAD", "true").lower() in ("1", "true", "yes")
+    ALLOW_QUERY_KEY_AUTH: bool = os.getenv("ALLOW_QUERY_KEY_AUTH", "false").lower() in ("1", "true", "yes")
 
     DEFAULT_RISK_PROFILE: str = os.getenv("RISK_PROFILE", "OPTIMAL").upper()
     DEFAULT_ORCHESTRATOR_MODE: str = os.getenv("ORCHESTRATOR_MODE", "PORTFOLIO_SYNERGY").upper()

@@ -1,8 +1,39 @@
 import hashlib
 import secrets
-from typing import Optional
+import time
+from collections import deque
+from typing import Dict, Optional
 from fastapi import Header, Cookie, Query, HTTPException, status
 from app.core.config import settings
+
+_LOGIN_FAILURES: Dict[str, deque] = {}
+_LOGIN_WINDOW_SEC = 60.0
+_LOGIN_MAX_ATTEMPTS = 5
+
+
+def check_login_rate_limit(client_ip: str) -> None:
+    """Блокує IP при перевищенні ліміту невдалих спроб входу (5 спроб / 60с)."""
+    now = time.monotonic()
+    q = _LOGIN_FAILURES.get(client_ip)
+    if not q:
+        return
+    while q and now - q[0] > _LOGIN_WINDOW_SEC:
+        q.popleft()
+    if len(q) >= _LOGIN_MAX_ATTEMPTS:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Забагато невдалих спроб входу. Зачекайте 60 секунд.",
+        )
+
+
+def record_login_failure(client_ip: str) -> None:
+    now = time.monotonic()
+    q = _LOGIN_FAILURES.setdefault(client_ip, deque())
+    q.append(now)
+
+
+def reset_login_failures(client_ip: str) -> None:
+    _LOGIN_FAILURES.pop(client_ip, None)
 
 
 def compute_session_token(password: str) -> str:
@@ -33,7 +64,9 @@ async def verify_api_access(
     - Через Cookie 'qc_session' у веб-терміналі
     - Через query-параметр ?key=...
     """
-    candidates = [x_api_key, qc_session, key]
+    candidates = [x_api_key, qc_session]
+    if settings.ALLOW_QUERY_KEY_AUTH and key:
+        candidates.append(key)
     if authorization and authorization.lower().startswith("bearer "):
         candidates.append(authorization[7:].strip())
 

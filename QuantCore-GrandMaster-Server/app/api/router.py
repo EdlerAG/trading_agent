@@ -1,6 +1,13 @@
 from fastapi import APIRouter, Request, Response, HTTPException
 from fastapi.responses import HTMLResponse
-from app.core.security import verify_password_raw, EXPECTED_SESSION_TOKEN
+from app.core.config import settings
+from app.core.security import (
+    verify_password_raw,
+    EXPECTED_SESSION_TOKEN,
+    check_login_rate_limit,
+    record_login_failure,
+    reset_login_failures,
+)
 from app.domain.schemas import AuthLoginRequest
 from app.api.endpoints_telemetry import router as telemetry_router
 from app.api.endpoints_control import router as control_router
@@ -26,16 +33,21 @@ async def serve_web_terminal():
 
 
 @api_router.post("/api/v1/auth/login", tags=["Auth"])
-async def login_terminal(payload: AuthLoginRequest, response: Response):
+async def login_terminal(payload: AuthLoginRequest, request: Request, response: Response):
     """Авторизація у веб-терміналі зі встановленням захищеного HttpOnly сесійного кукі."""
+    client_ip = request.client.host if request.client else "unknown"
+    check_login_rate_limit(client_ip)
     if not verify_password_raw(payload.password):
+        record_login_failure(client_ip)
         raise HTTPException(status_code=401, detail="Невірний пароль доступу")
 
+    reset_login_failures(client_ip)
     response.set_cookie(
         key="qc_session",
         value=EXPECTED_SESSION_TOKEN,
         max_age=30 * 24 * 3600,
         httponly=True,
         samesite="lax",
+        secure=settings.COOKIE_SECURE,
     )
-    return {"ok": True, "token": EXPECTED_SESSION_TOKEN}
+    return {"ok": True}

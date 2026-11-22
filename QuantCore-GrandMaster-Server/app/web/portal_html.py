@@ -953,8 +953,7 @@ function showToast(msg, isErr=false){
 }
 
 function getHeaders(){
-  const tok = localStorage.getItem('qc_token') || '';
-  return {'Content-Type':'application/json', 'X-Api-Key': tok};
+  return {'Content-Type':'application/json'};
 }
 
 async function apiFetch(url, opts={}){
@@ -982,10 +981,13 @@ async function doLogin(){
       body: JSON.stringify({password: pwd})
     });
     if(r.ok){
-      const d = await r.json();
-      localStorage.setItem('qc_token', d.token);
+      await r.json();
+      localStorage.removeItem('qc_token');
       document.getElementById('loginModal').classList.remove('open');
       refreshAll();
+    } else if(r.status === 429){
+      errEl.textContent = 'Забагато спроб входу. Зачекайте 60 секунд.';
+      errEl.style.display = 'block';
     } else {
       errEl.textContent = 'Невірний пароль доступу. Перевірте ключ та спробуйте ще раз.';
       errEl.style.display = 'block';
@@ -1630,10 +1632,9 @@ function renderArena(rows){
 }
 
 async function downloadV2Zip(){
-  const tok = localStorage.getItem('qc_token') || '';
   showToast('Формування ZIP-архіву телеметрії...');
   try{
-    const resp = await fetch('/api/v1/v2/export', {headers:{'X-Api-Key': tok}});
+    const resp = await fetch('/api/v1/v2/export', {credentials:'same-origin'});
     if(!resp.ok){ showToast('Не вдалося сформувати ZIP-архів.', true); return; }
     const blob = await resp.blob();
     const url = URL.createObjectURL(blob);
@@ -1701,9 +1702,8 @@ async function uploadCartridge(){
   fd.append('file', fInput.files[0]);
   showToast('Виконується гаряча заміна моделі...');
   try{
-    const tok = localStorage.getItem('qc_token') || '';
     const resp = await fetch('/api/v1/cartridge/upload', {
-      method:'POST', headers:{'X-Api-Key': tok}, body: fd
+      method:'POST', credentials:'same-origin', body: fd
     });
     const d = await resp.json();
     if(resp.ok && d.ok){

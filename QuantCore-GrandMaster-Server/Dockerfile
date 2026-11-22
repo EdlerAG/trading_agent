@@ -20,8 +20,11 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --compile -r requirements.txt
 
 COPY . .
-RUN mkdir -p storage/cartridges storage/backups storage/v2_telemetry
+RUN useradd -r -u 10001 -m quantcore && \
+    mkdir -p storage/cartridges storage/backups storage/v2_telemetry && \
+    chown -R quantcore:quantcore /srv/quantcore
 
+USER quantcore
 EXPOSE 8501
 
 CMD ["python", "main.py"]
