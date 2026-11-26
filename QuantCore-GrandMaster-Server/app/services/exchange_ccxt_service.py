@@ -150,6 +150,8 @@ class ExchangeCcxtService(IExchangeGateway):
             "options": {
                 "defaultType": "future",
                 "adjustForTimeDifference": True,
+                "warnOnFetchOpenOrdersWithoutSymbol": False,
+                "fetchOpenOrders": {"warnWithoutSymbol": False},
             },
         })
         if settings.USE_DEMO_TRADING:
@@ -1583,6 +1585,31 @@ class ExchangeCcxtService(IExchangeGateway):
             }
             return None
 
+    @staticmethod
+    def _extract_order_type(o: Any) -> str:
+        """Надійно визначає реальний тип ордера (включно з Binance Algo/Trigger CONDITIONAL, де o['type']=='market', а info['orderType']=='STOP_MARKET'!)."""
+        if not isinstance(o, dict):
+            return ""
+        inf = o.get("info") if isinstance(o.get("info"), dict) else {}
+        raw_t = str(
+            inf.get("orderType")
+            or inf.get("origType")
+            or inf.get("type")
+            or o.get("type")
+            or ""
+        ).strip().lower()
+        if raw_t == "market":
+            has_trig = bool(
+                str(inf.get("algoType") or "").upper() == "CONDITIONAL"
+                or o.get("stopPrice")
+                or o.get("triggerPrice")
+                or inf.get("stopPrice")
+                or inf.get("triggerPrice")
+            )
+            if has_trig:
+                return "stop_market"
+        return raw_t
+
     def _cancel_conditional_orders_sync(
         self, ccxt_sym: str, types_filter: Optional[Tuple[str, ...]] = None
     ) -> int:
@@ -1607,7 +1634,7 @@ class ExchangeCcxtService(IExchangeGateway):
             for o in (ords or []):
                 if not isinstance(o, dict) or "id" not in o:
                     continue
-                o_type = str(o.get("type") or (o.get("info") or {}).get("origType") or (o.get("info") or {}).get("orderType") or "").lower()
+                o_type = self._extract_order_type(o)
                 if types_filter is not None and o_type and o_type not in types_filter:
                     continue
                 try:
@@ -1643,7 +1670,9 @@ class ExchangeCcxtService(IExchangeGateway):
             return False, "INVALID_QTY_OR_PRICE"
 
         close_side = "sell" if position_qty > 0 else "buy"
-        sl_cid = self.build_client_order_id(clean_sym, close_side, qty, True, bucket_tag=f"sl_{sl_p}")
+        nonce_ms = int(time.time() * 1000) % 10_000_000
+        sl_cid = self.build_client_order_id(clean_sym, close_side, qty, True, bucket_tag=f"sl_{sl_p}_{nonce_ms}")
+        sl_cid_fb = self.build_client_order_id(clean_sym, close_side, qty, True, bucket_tag=f"slf_{sl_p}_{nonce_ms}")
         try:
             self._cancel_conditional_orders_sync(ccxt_sym, types_filter=("stop_market", "stop"))
 
@@ -1682,7 +1711,7 @@ class ExchangeCcxtService(IExchangeGateway):
                         "stopPrice": sl_p,
                         "reduceOnly": True,
                         "workingType": "MARK_PRICE",
-                        "newClientOrderId": sl_cid,
+                        "newClientOrderId": sl_cid_fb,
                     },
                 )
                 return True, "OK_FALLBACK"
@@ -1817,10 +1846,11 @@ class ExchangeCcxtService(IExchangeGateway):
             for o in ords:
                 if not isinstance(o, dict):
                     continue
-                o_type = str(o.get("type") or (o.get("info") or {}).get("origType") or (o.get("info") or {}).get("orderType") or "").lower()
+                o_type = self._extract_order_type(o)
                 if o_type in ("stop_market", "stop") and captured_sl_px <= 0.0:
                     sp = float(
                         o.get("stopPrice")
+                        or o.get("triggerPrice")
                         or (o.get("info") or {}).get("stopPrice")
                         or (o.get("info") or {}).get("triggerPrice")
                         or 0.0

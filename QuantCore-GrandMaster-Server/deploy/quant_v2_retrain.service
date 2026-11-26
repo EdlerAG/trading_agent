@@ -1,0 +1,21 @@
+# QuantCore V6.2-A Monthly 30-Day Expanding Retrain Service (ONLY for nodes with >= 4 GB RAM!)
+# WARNING: Measured CPU-only Peak RSS is ~2.16 GiB (2156 MiB). Do NOT enable on < 4 GB RAM VPS;
+# run `retrain_v2_monthly.py --deploy-vps my-bot-server` from workstation instead.
+[Unit]
+Description=QuantCore V2 Monthly 30-Day Causal ML Retrain
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/trading_agent
+Nice=19
+IOSchedulingClass=idle
+MemoryMax=3G
+CPUQuota=60%
+Environment=OMP_NUM_THREADS=2
+Environment=OPENBLAS_NUM_THREADS=2
+Environment=MKL_NUM_THREADS=2
+Environment=NUMBA_NUM_THREADS=2
+ExecStart=/home/ubuntu/trading_agent/venv/bin/python /home/ubuntu/trading_agent/scripts/retrain_v2_monthly.py --cpu-only

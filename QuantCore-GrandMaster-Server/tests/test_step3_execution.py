@@ -696,6 +696,36 @@ class TestStep3Execution(unittest.TestCase):
         )
         orch._tg_sender = tg
 
+        # 1-й здоровий цикл: чистить ордер-сироту по BTCUSDT, ставить Naked SL по SOLUSDT, а по ETHUSDT (Zombie 1/2) ЛИШЕ попереджає!
+        asyncio.run(orch._run_post_rebalance_watchdog(
+            active_syms=("BTCUSDT", "ETHUSDT", "SOLUSDT"),
+            coin_targets_map={"BTCUSDT": 0.0, "ETHUSDT": 0.0, "SOLUSDT": 0.25},
+            coin_prices={"BTCUSDT": 90000.0, "ETHUSDT": 3000.0, "SOLUSDT": 100.0},
+            phase_a_plans=[],
+            phase_b_plans=[],
+            executed_orders_summary=[],
+        ))
+
+        cancel_syms_1 = [c.args[0] for c in ex.cancel_symbol_orders.call_args_list]
+        self.assertIn("BTCUSDT", cancel_syms_1)
+        self.assertNotIn("ETHUSDT", cancel_syms_1)
+        ex.execute_smart_rebalance_order.assert_not_awaited()
+        ex.place_or_update_stop_loss_ex.assert_awaited_once_with("SOLUSDT", 5.0, 90.0)
+        tg.send_alert.assert_awaited_once()
+
+        # 2-й здоровий цикл: SOLUSDT вже має Binance CONDITIONAL STOP_MARKET (type='market', info.orderType='STOP_MARKET'),
+        # а ETHUSDT (Zombie 2/2) тепер примусово закривається MARKET reduceOnly!
+        ex.fetch_all_open_orders_by_symbol = AsyncMock(return_value={
+            "BTCUSDT": [],
+            "ETHUSDT": [],
+            "SOLUSDT": [{
+                "id": "algo_sl_1",
+                "type": "market",
+                "info": {"algoType": "CONDITIONAL", "orderType": "STOP_MARKET", "triggerPrice": "90.0"},
+            }],
+        })
+        ex.place_or_update_stop_loss_ex.reset_mock()
+
         asyncio.run(orch._run_post_rebalance_watchdog(
             active_syms=("BTCUSDT", "ETHUSDT", "SOLUSDT"),
             coin_targets_map={"BTCUSDT": 0.0, "ETHUSDT": 0.0, "SOLUSDT": 0.25},
@@ -706,15 +736,78 @@ class TestStep3Execution(unittest.TestCase):
         ))
 
         cancel_syms = [c.args[0] for c in ex.cancel_symbol_orders.call_args_list]
-        self.assertIn("BTCUSDT", cancel_syms)
         self.assertIn("ETHUSDT", cancel_syms)
         ex.execute_smart_rebalance_order.assert_awaited_once()
         _, z_kw = ex.execute_smart_rebalance_order.call_args
         self.assertEqual(z_kw["symbol"], "ETHUSDT")
         self.assertAlmostEqual(z_kw["delta_qty"], -2.0)
         self.assertTrue(z_kw["reduce_only"])
-        ex.place_or_update_stop_loss_ex.assert_awaited_once_with("SOLUSDT", 5.0, 90.0)
-        tg.send_alert.assert_awaited_once()
+        # SOLUSDT вже мав CONDITIONAL STOP_MARKET -> повторне перевиставлення НЕ викликалось!
+        ex.place_or_update_stop_loss_ex.assert_not_awaited()
+
+    def test_watchdog_never_closes_positions_on_fail_closed_or_empty_targets(self):
+        """Safe Zombie Guard: НІКОЛИ не закриває відкриті позиції при fail_closed=True або порожній книзі таргетів."""
+        from app.domain.schemas import CoinStateDTO, ExchangePositionDTO
+        from app.services.state_service import StateService
+        from app.services.execution_service import MultiAssetExecutionOrchestrator
+
+        st = StateService()
+        st.coins["ETHUSDT"] = CoinStateDTO(symbol="ETHUSDT", enabled=True, current_pos_qty=2.0, active_sl_price=2800.0)
+
+        ex = MagicMock()
+        ex.fetch_account_snapshot = AsyncMock(return_value=(
+            500.0, 0.0,
+            {"ETHUSDT": ExchangePositionDTO(symbol="ETHUSDT", contracts_qty=2.0, mark_price=3000.0)},
+            True,
+        ))
+        ex.fetch_all_open_orders_by_symbol = AsyncMock(return_value={
+            "ETHUSDT": [{"id": "sl_eth", "type": "market", "info": {"algoType": "CONDITIONAL", "orderType": "STOP_MARKET"}}],
+        })
+        ex.execute_smart_rebalance_order = AsyncMock()
+
+        orch = MultiAssetExecutionOrchestrator(
+            logger=MagicMock(), state_service=st, db_service=MagicMock(),
+            exchange_service=ex, cartridge_service=MagicMock(),
+            online_learner=MagicMock(), news_service=MagicMock(),
+        )
+        # Навіть 3 виклики поспіль при fail_closed=True або порожніх таргетах НЕ чіпають позицію!
+        for _ in range(3):
+            asyncio.run(orch._run_post_rebalance_watchdog(
+                active_syms=("ETHUSDT",),
+                coin_targets_map={"ETHUSDT": 0.0},
+                coin_prices={"ETHUSDT": 3000.0},
+                phase_a_plans=[],
+                phase_b_plans=[],
+                executed_orders_summary=[],
+                fail_closed=True,
+            ))
+            asyncio.run(orch._run_post_rebalance_watchdog(
+                active_syms=("ETHUSDT",),
+                coin_targets_map={},
+                coin_prices={"ETHUSDT": 3000.0},
+                phase_a_plans=[],
+                phase_b_plans=[],
+                executed_orders_summary=[],
+                is_healthy_rebalance=True,
+            ))
+        ex.execute_smart_rebalance_order.assert_not_awaited()
+
+    def test_conditional_algo_stop_market_detection_and_cancellation(self):
+        """Binance USD-M CONDITIONAL STOP_MARKET (o['type']=='market', info['orderType']=='STOP_MARKET') коректно скасовується."""
+        self.mock_ccxt.fetch_open_orders = MagicMock(side_effect=lambda sym, params=None: (
+            [{
+                "id": "1000000304073863",
+                "type": "market",
+                "info": {"algoType": "CONDITIONAL", "orderType": "STOP_MARKET", "triggerPrice": "0.9623"},
+            }] if (params and params.get("trigger")) else []
+        ))
+        self.mock_ccxt.cancel_order = MagicMock()
+        self.mock_ccxt.create_order = MagicMock(return_value={"id": "new_sl_1"})
+
+        ok1, st1 = self.exchange_service._place_stop_loss_ex_sync("XRPUSDT", -29.3, 0.9623)
+        self.assertTrue(ok1)
+        self.assertEqual(st1, "OK")
+        self.mock_ccxt.cancel_order.assert_called_once_with("1000000304073863", "XRP/USDT:USDT", params={"trigger": True})
 
 
 if __name__ == "__main__":

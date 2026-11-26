@@ -48,6 +48,7 @@ class MultiAssetExecutionOrchestrator(IService):
         "_last_ntp_alert_ts",
         "_last_ntp_skew_ms",
         "_demo_wallet_anchor",
+        "_zombie_streaks",
     )
 
     def __init__(
@@ -82,6 +83,7 @@ class MultiAssetExecutionOrchestrator(IService):
         self._last_ntp_alert_ts: float = 0.0
         self._last_ntp_skew_ms: Optional[int] = None
         self._demo_wallet_anchor: float = 0.0
+        self._zombie_streaks: Dict[str, int] = {}
 
     async def _emit_heartbeat(self, status: str, candle_ts: str, equity: float, active_cnt: int) -> None:
         """Записує локальний heartbeat.json та пінгує зовнішній Dead-Man's Switch (Healthchecks / Uptime Kuma)."""
@@ -1242,7 +1244,16 @@ class MultiAssetExecutionOrchestrator(IService):
                             if abs(c_trim.current_pos_qty) < min_q_t:
                                 c_trim.current_pos_qty = 0.0
 
-        # 5b-clean. Post-Rebalance Reconciliation Watchdog (Orphan Sweeper + Naked SL Check + Zombie Position Check)
+        # 5b-clean. Post-Rebalance Reconciliation Watchdog (Orphan Sweeper + Naked SL Check + 2-Cycle Safe Zombie Check)
+        has_valid_targets = bool(coin_targets_map) and any(
+            abs(float(w)) >= settings.CASH_ZONE_THRESHOLD for w in coin_targets_map.values()
+        )
+        healthy_rebal_cycle = (
+            not bool(extra_tel_chk.get("fail_closed"))
+            and not bool(extra_tel_chk.get("error"))
+            and not bool(geo_shock_active)
+            and (has_valid_targets or bool(extra_tel.get("intentional_cash_all", False)))
+        )
         await self._run_post_rebalance_watchdog(
             active_syms=active_syms,
             coin_targets_map=coin_targets_map,
@@ -1250,6 +1261,7 @@ class MultiAssetExecutionOrchestrator(IService):
             phase_a_plans=phase_a_plans,
             phase_b_plans=phase_b_plans,
             executed_orders_summary=executed_orders_summary,
+            is_healthy_rebalance=healthy_rebal_cycle,
         )
 
         # 5b-legacy. Pillar 7: Margin-Backed Stink-Bids & VWAP Dip Sniper (ВИКЛЮЧНО для V58; у V2/V3 вимкнено для Zero Skew!)
@@ -1536,12 +1548,19 @@ class MultiAssetExecutionOrchestrator(IService):
         phase_a_plans: List[Dict[str, Any]],
         phase_b_plans: List[Dict[str, Any]],
         executed_orders_summary: List[str],
+        is_healthy_rebalance: bool = True,
+        fail_closed: bool = False,
     ) -> None:
-        """Post-Rebalance Reconciliation Watchdog:
-        1) Orphan Sweeper: чистить відкриті ордери при нульовій позиції на біржі.
-        2) Zombie Position Check: при target_weight==0 і відкритій позиції — 1 спроба MARKET reduceOnly + CRITICAL алерт.
-        3) Naked Position Check: перевіряє наявність активного STOP_MARKET для відкритих позицій і перевиставляє за active_sl_price.
+        """Post-Rebalance Reconciliation Watchdog (V6.2-A):
+        1) Orphan Sweeper: чистить відкриті ордери при нульовій позиції на біржі (виключаючи активні входи).
+        2) Safe Zombie Position Check (2 здорових цикли поспіль, ніколи при fail_closed/порожньому портфелі!):
+           - 1-й цикл -> WARNING + Telegram алерт;
+           - 2-й цикл поспіль -> скасування SL + 1 контрольована спроба MARKET reduceOnly + CRITICAL алерт.
+        3) Naked & Duplicate SL Check: розпізнає Binance CONDITIONAL Algo STOP_MARKET (info.orderType),
+           дедуплікує накопичені дублікати SL і перевиставляє відсутній STOP_MARKET за active_sl_price.
         """
+        from app.services.exchange_ccxt_service import ExchangeCcxtService
+
         fn_orphan = getattr(self._exchange, "cleanup_orphan_orders", None)
         if (phase_a_plans or phase_b_plans) and callable(fn_orphan) and inspect.iscoroutinefunction(fn_orphan):
             try:
@@ -1572,6 +1591,16 @@ class MultiAssetExecutionOrchestrator(IService):
             self._logger.debug(f"[Watchdog] Пропуск звірки через помилку REST: {wd_err}")
             return
 
+        has_non_empty_book = bool(coin_targets_map) and any(
+            abs(float(w)) >= settings.CASH_ZONE_THRESHOLD for w in coin_targets_map.values()
+        )
+        can_check_zombies = bool(is_healthy_rebalance and (not fail_closed) and has_non_empty_book)
+        active_entry_syms = {
+            str(p.get("sym", "")).upper()
+            for p in (phase_b_plans or [])
+            if isinstance(p, dict) and not bool(p.get("reduce_only", False))
+        }
+
         alerts: List[str] = []
         for sym in syms_tuple:
             p_dto = live_pos_map.get(sym)
@@ -1580,8 +1609,17 @@ class MultiAssetExecutionOrchestrator(IService):
             c_st = self._state.coins.get(sym)
             sym_orders = open_orders_map.get(sym) or []
 
-            # 1. Orphan Sweeper
+            # 1. Orphan Sweeper (пропускає символи з активними ордерами на вхід)
             if abs(live_qty) < min_q:
+                self._zombie_streaks.pop(sym, None)
+                if sym in active_entry_syms:
+                    has_non_sl_entry = any(
+                        ExchangeCcxtService._extract_order_type(o) not in ("stop_market", "stop", "take_profit_market", "take_profit")
+                        for o in sym_orders
+                        if isinstance(o, dict)
+                    )
+                    if has_non_sl_entry:
+                        continue
                 if sym_orders and hasattr(self._exchange, "cancel_symbol_orders"):
                     await self._exchange.cancel_symbol_orders(sym)
                     self._logger.info(
@@ -1592,53 +1630,67 @@ class MultiAssetExecutionOrchestrator(IService):
             if c_st is not None:
                 c_st.current_pos_qty = live_qty
 
-            # 2. Zombie Position Check (target_weight == 0, але позиція досі на біржі)
+            # 2. Safe Zombie Position Check (СТРОГО лише на здоровому циклі: 1-й цикл WARNING, 2-й цикл MARKET reduceOnly!)
             tgt_w = coin_targets_map.get(sym)
-            if tgt_w is not None and abs(float(tgt_w)) < settings.CASH_ZONE_THRESHOLD:
-                cur_px = float(coin_prices.get(sym, 0.0) or (getattr(p_dto, "mark_price", 0.0) if p_dto else 0.0) or 0.0)
-                self._logger.critical(
-                    f"🚨 [ZombiePositionCheck] {sym}: target_weight=0, але на біржі лишилася позиція {live_qty:+.4f}! "
-                    f"Запускаємо 1 примусове закриття MARKET reduceOnly."
-                )
-                if hasattr(self._exchange, "cancel_symbol_orders"):
-                    await self._exchange.cancel_symbol_orders(sym)
-                z_dto = await self._exchange.execute_smart_rebalance_order(
-                    symbol=sym,
-                    delta_qty=-live_qty,
-                    mark_price=cur_px,
-                    realized_pnl_est=0.0,
-                    note="ZOMBIE_WATCHDOG_FORCE_CLOSE",
-                    reduce_only=True,
-                    maker_first=False,
-                    taker_fallback=True,
-                )
-                if z_dto is not None and z_dto.executed_qty >= (abs(live_qty) - min_q * 0.5):
-                    live_qty = 0.0
-                    if c_st is not None:
-                        c_st.current_pos_qty = 0.0
-                        c_st.entry_price = 0.0
-                        c_st.active_sl_price = 0.0
-                    executed_orders_summary.append(
-                        f"🧹 <b>{sym}</b>: Watchdog примусово закрив завислу позицію @ <code>${z_dto.avg_price:,.4f}</code>"
+            if can_check_zombies and tgt_w is not None and abs(float(tgt_w)) < settings.CASH_ZONE_THRESHOLD:
+                streak = int(self._zombie_streaks.get(sym, 0)) + 1
+                self._zombie_streaks[sym] = streak
+                if streak < 2:
+                    self._logger.warning(
+                        f"⚠️ [ZombiePositionCheck 1/2] {sym}: target_weight=0, на біржі {live_qty:+.4f}. "
+                        f"Очікуємо підтвердження на 2-му здоровому циклі перед примусовим закриттям."
                     )
-                    alerts.append(f"• <b>{sym}</b> (Zombie): примусово закрито <code>{z_dto.executed_qty}</code> @ <code>${z_dto.avg_price:,.4f}</code>")
-                    continue
-                if z_dto is not None:
-                    signed_z = z_dto.executed_qty if z_dto.side == "BUY" else -z_dto.executed_qty
-                    live_qty += signed_z
-                    if c_st is not None:
-                        c_st.current_pos_qty = live_qty
-                alerts.append(f"• <b>{sym}</b> (Zombie CRITICAL): НЕ вдалося закрити <code>{live_qty:+.4f}</code>!")
+                    alerts.append(
+                        f"• ⚠️ <b>{sym}</b> (Zombie 1/2): відкрита <code>{live_qty:+.4f}</code> при <code>target=0</code> (спостереження)"
+                    )
+                else:
+                    cur_px = float(coin_prices.get(sym, 0.0) or (getattr(p_dto, "mark_price", 0.0) if p_dto else 0.0) or 0.0)
+                    self._logger.critical(
+                        f"🚨 [ZombiePositionCheck {streak}/2] {sym}: 2-й здоровий цикл поспіль із target_weight=0 ({live_qty:+.4f})! "
+                        f"Виконуємо 1 контрольоване закриття MARKET reduceOnly."
+                    )
+                    if hasattr(self._exchange, "cancel_symbol_orders"):
+                        await self._exchange.cancel_symbol_orders(sym)
+                    z_dto = await self._exchange.execute_smart_rebalance_order(
+                        symbol=sym,
+                        delta_qty=-live_qty,
+                        mark_price=cur_px,
+                        realized_pnl_est=0.0,
+                        note="ZOMBIE_WATCHDOG_FORCE_CLOSE",
+                        reduce_only=True,
+                        maker_first=False,
+                        taker_fallback=True,
+                    )
+                    if z_dto is not None and z_dto.executed_qty >= (abs(live_qty) - min_q * 0.5):
+                        live_qty = 0.0
+                        self._zombie_streaks.pop(sym, None)
+                        if c_st is not None:
+                            c_st.current_pos_qty = 0.0
+                            c_st.entry_price = 0.0
+                            c_st.active_sl_price = 0.0
+                        executed_orders_summary.append(
+                            f"🧹 <b>{sym}</b>: Watchdog закрив zombie (2/2) @ <code>${z_dto.avg_price:,.4f}</code>"
+                        )
+                        alerts.append(f"• 🚨 <b>{sym}</b> (Zombie 2/2 CRITICAL): закрито <code>{z_dto.executed_qty}</code> @ <code>${z_dto.avg_price:,.4f}</code>")
+                        continue
+                    if z_dto is not None:
+                        signed_z = z_dto.executed_qty if z_dto.side == "BUY" else -z_dto.executed_qty
+                        live_qty += signed_z
+                        if c_st is not None:
+                            c_st.current_pos_qty = live_qty
+                    alerts.append(f"• 🚨 <b>{sym}</b> (Zombie CRITICAL): НЕ вдалося закрити <code>{live_qty:+.4f}</code>!")
+            elif can_check_zombies and tgt_w is not None and abs(float(tgt_w)) >= settings.CASH_ZONE_THRESHOLD:
+                self._zombie_streaks.pop(sym, None)
 
-            # 3. Naked Position Check (позиція відкрита, перевіряємо активний STOP_MARKET)
+            # 3. Naked & Duplicate SL Position Check (позиція відкрита -> рівно 1 активний STOP_MARKET)
             if abs(live_qty) >= min_q and c_st is not None:
-                has_stop = any(
-                    str(o.get("type") or (o.get("info") or {}).get("origType") or (o.get("info") or {}).get("orderType") or "").lower()
-                    in ("stop_market", "stop")
-                    for o in sym_orders
-                    if isinstance(o, dict)
-                )
-                if not has_stop:
+                stop_ords = [
+                    o for o in sym_orders
+                    if isinstance(o, dict) and ExchangeCcxtService._extract_order_type(o) in ("stop_market", "stop")
+                ]
+                has_stop = len(stop_ords) >= 1
+                has_dup_stops = len(stop_ords) > 1
+                if not has_stop or has_dup_stops:
                     sl_px = float(getattr(c_st, "active_sl_price", 0.0) or 0.0)
                     if sl_px > 0.0:
                         fn_sl_ex = getattr(self._exchange, "place_or_update_stop_loss_ex", None)
@@ -1649,15 +1701,20 @@ class MultiAssetExecutionOrchestrator(IService):
                             r_sl = await self._exchange.place_or_update_stop_loss(sym, live_qty, sl_px)
                             sl_ok = bool(r_sl) if isinstance(r_sl, bool) else True
                         if sl_ok:
-                            self._logger.warning(
-                                f"🛡️ [NakedPositionCheck] {sym}: перевиставлено відсутній STOP_MARKET @ ${sl_px:,.4f} ({live_qty:+.4f})."
-                            )
-                            alerts.append(f"• <b>{sym}</b> (Naked SL): перевиставлено <code>STOP_MARKET @ ${sl_px:,.4f}</code>")
-                        else:
+                            if not has_stop:
+                                self._logger.warning(
+                                    f"🛡️ [NakedPositionCheck] {sym}: перевиставлено відсутній STOP_MARKET @ ${sl_px:,.4f} ({live_qty:+.4f})."
+                                )
+                                alerts.append(f"• <b>{sym}</b> (Naked SL): перевиставлено <code>STOP_MARKET @ ${sl_px:,.4f}</code>")
+                            else:
+                                self._logger.info(
+                                    f"🧹 [DuplicateSLDedupe] {sym}: очищено {len(stop_ords)} дублікатів SL -> залишено 1 чистий STOP_MARKET @ ${sl_px:,.4f}."
+                                )
+                        elif not has_stop:
                             self._logger.critical(
                                 f"🚨 [NakedPositionCheck] {sym}: позиція {live_qty:+.4f} БЕЗ STOP_MARKET, перевиставлення @ ${sl_px:,.4f} не вдалося!"
                             )
-                            alerts.append(f"• <b>{sym}</b> (Naked CRITICAL): <code>{live_qty:+.4f}</code> без SL!")
+                            alerts.append(f"• 🚨 <b>{sym}</b> (Naked SL CRITICAL): позиція <code>{live_qty:+.4f}</code> БЕЗ стопа!")
 
         if alerts:
             await self._send_alert("🛡️ <b>[Reconciliation Watchdog]</b>\n" + "\n".join(alerts))

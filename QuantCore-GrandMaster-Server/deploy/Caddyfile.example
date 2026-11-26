@@ -2,5 +2,17 @@
 # Скопіюйте у /etc/caddy/Caddyfile та замініть <DOMAIN_OR_SSLIP_HOST> на свій домен або <IP-WITH-DASHES>.sslip.io
 
 <DOMAIN_OR_SSLIP_HOST> {
+    @blocked_probes {
+        path /.* */.* *.env* *.git* *.sql* *.bak* *.db *.sqlite* *.log *.yml *.yaml *.py *.joblib *.npz *.key *.toml *.ini /config.json /package.json /composer.json /storage/* /data/* /graphql*
+    }
+    respond @blocked_probes 403
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        -Server
+    }
+
     reverse_proxy 127.0.0.1:8501
 }

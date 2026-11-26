@@ -1,0 +1,11 @@
+# QuantCore V6.2-A Monthly 30-Day Expanding Retrain Timer (ONLY for nodes with >= 4 GB RAM!)
+[Unit]
+Description=Run QuantCore V2 Monthly ML Retrain every 30 days
+
+[Timer]
+OnCalendar=*-*-01 03:20:00 UTC
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
