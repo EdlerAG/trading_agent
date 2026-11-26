@@ -108,6 +108,7 @@ async def reset_and_clean_history(request: Request, _: str = Depends(verify_admi
     btc_px = float((tel.get("coin_prices") or {}).get("BTCUSDT") or 90000.0)
     res = container.db_service.reset_and_optimize_history(seed_equity=seed_eq, btc_price=btc_px)
     container.state_service.daily_starting_equity = 0.0
+    container.state_service.demo_wallet_anchor = 0.0
     container.state_service.last_candle_ts = ""
     container.state_service.save_snapshot()
     if getattr(container, "shadow_arena", None) is not None:

@@ -19,6 +19,8 @@ class TestStep3Execution(unittest.TestCase):
         self.db_service = MagicMock()
         self.exchange_service = ExchangeCcxtService(logger=self.logger, db_service=self.db_service)
         self.mock_ccxt = MagicMock()
+        self.mock_ccxt.amount_to_precision = MagicMock(side_effect=lambda _s, q: str(round(float(q), 6)))
+        self.mock_ccxt.price_to_precision = MagicMock(side_effect=lambda _s, p: str(round(float(p), 6)))
         self.exchange_service._exchange = self.mock_ccxt
 
     def test_sync_stop_closure_take_profit_note(self):
@@ -536,6 +538,183 @@ class TestStep3Execution(unittest.TestCase):
             object.__setattr__(settings, "DASHBOARD_ADMIN_KEY_FILE", orig_key_file)
             if "key_path" in locals() and os.path.exists(key_path):
                 os.remove(key_path)
+
+    def test_stop_market_uses_close_position_without_qty_or_reduce_only(self):
+        """100% позиційний STOP_MARKET використовує closePosition=True без amount/quantity і без reduceOnly (-1106)."""
+        self.mock_ccxt.fetch_open_orders = MagicMock(return_value=[])
+        self.mock_ccxt.create_order = MagicMock(return_value={"id": "sl_cp_1"})
+        ok, reason = self.exchange_service._place_stop_loss_ex_sync("SOLUSDT", 5.0, 92.5)
+        self.assertTrue(ok)
+        self.assertEqual(reason, "OK")
+        _, kwargs = self.mock_ccxt.create_order.call_args
+        self.assertIsNone(kwargs.get("amount"))
+        self.assertEqual(kwargs["type"], "STOP_MARKET")
+        self.assertTrue(kwargs["params"].get("closePosition"))
+        self.assertNotIn("reduceOnly", kwargs["params"])
+
+    def test_2022_case1_position_already_closed_cleans_orders(self):
+        """Кейс 1 (-2022): REST підтверджує live_qty == 0 -> чистий вихід + очищення ордерів."""
+        self.mock_ccxt.fetch_order_book = MagicMock(return_value={
+            "bids": [[100.0, 50.0]], "asks": [[100.05, 50.0]],
+        })
+        self.mock_ccxt.create_market_order = MagicMock(
+            side_effect=Exception("binance {'code': -2022, 'msg': 'ReduceOnly Order is rejected.'}")
+        )
+        self.mock_ccxt.fetch_positions = MagicMock(return_value=[])
+        self.mock_ccxt.fetch_open_orders = MagicMock(side_effect=lambda sym, params=None: (
+            [{"id": "orphan_sl", "type": "stop_market", "stopPrice": 90.0}] if (params and params.get("trigger")) else []
+        ))
+        self.mock_ccxt.cancel_all_orders = MagicMock()
+        self.mock_ccxt.cancel_order = MagicMock()
+
+        res = self.exchange_service._execute_smart_order_sync(
+            symbol="SOLUSDT", delta_qty=-2.0, mark_price=100.0,
+            realized_pnl_est=0.0, note="Close case 1",
+            reduce_only=True, maker_first=False, taker_fallback=True,
+        )
+        self.assertIsNone(res)
+        self.assertEqual(self.exchange_service.get_last_order_diag("SOLUSDT").get("order_status"), "ALREADY_CLOSED_2022")
+        self.assertEqual(self.mock_ccxt.create_market_order.call_count, 1)
+        self.mock_ccxt.cancel_all_orders.assert_called_once()
+        self.mock_ccxt.cancel_order.assert_called_once_with("orphan_sl", "SOL/USDT:USDT", params={"trigger": True})
+
+    def test_2022_case2_blocked_by_stop_market_full_close_retries(self):
+        """Кейс 2 (-2022): позиція відкрита (2.0), блокує STOP_MARKET -> cancel orders -> повне закриття reduceOnly."""
+        self.mock_ccxt.fetch_order_book = MagicMock(return_value={
+            "bids": [[100.0, 50.0]], "asks": [[100.05, 50.0]],
+        })
+        # postOnly maker падає з -2022 (квоту блокує старий STOP_MARKET), повторний postOnly теж відхиляється -> MARKET fallback успішний
+        self.mock_ccxt.create_order = MagicMock(side_effect=[
+            Exception("binance {'code': -2022, 'msg': 'ReduceOnly Order is rejected.'}"),
+            Exception("PostOnly would immediately match"),
+        ])
+        self.mock_ccxt.fetch_positions = MagicMock(return_value=[
+            {"symbol": "SOL/USDT:USDT", "contracts": 2.0, "side": "long"}
+        ])
+        self.mock_ccxt.fetch_open_orders = MagicMock(side_effect=lambda sym, params=None: (
+            [{"id": "blk_sl_1", "type": "stop_market", "stopPrice": 91.0}] if (params and params.get("trigger")) else []
+        ))
+        self.mock_ccxt.cancel_all_orders = MagicMock()
+        self.mock_ccxt.cancel_order = MagicMock()
+        self.mock_ccxt.create_market_order = MagicMock(return_value={
+            "id": "mkt_close_2", "filled": 2.0, "average": 100.0, "fee": {"cost": 0.1},
+        })
+
+        res = self.exchange_service._execute_smart_order_sync(
+            symbol="SOLUSDT", delta_qty=-2.0, mark_price=100.0,
+            realized_pnl_est=5.0, note="Full close case 2",
+            reduce_only=True, maker_first=True, taker_fallback=False,
+        )
+        self.assertIsNotNone(res)
+        self.assertAlmostEqual(res.executed_qty, 2.0)
+        self.mock_ccxt.cancel_order.assert_called_once_with("blk_sl_1", "SOL/USDT:USDT", params={"trigger": True})
+        _, m_kwargs = self.mock_ccxt.create_market_order.call_args
+        self.assertTrue(m_kwargs["params"].get("reduceOnly"))
+        self.assertEqual(self.exchange_service.get_last_order_diag("SOLUSDT").get("order_status"), "FILLED_2022_RETRY")
+
+    def test_2022_case3_partial_trim_cancels_sl_and_rearms_on_remainder(self):
+        """Кейс 3 (-2022): частковий trim (4 з 10), блокує STOP_MARKET -> cancel -> trim -> перевиставлення SL на 6."""
+        self.mock_ccxt.fetch_order_book = MagicMock(return_value={
+            "bids": [[100.0, 200.0]], "asks": [[100.05, 200.0]],
+        })
+        self.mock_ccxt.fetch_positions = MagicMock(return_value=[
+            {"symbol": "SOL/USDT:USDT", "contracts": 10.0, "side": "long"}
+        ])
+        open_calls = {"n": 0}
+        def _open_orders_case3(sym, params=None):
+            open_calls["n"] += 1
+            if params and params.get("trigger") and open_calls["n"] <= 4:
+                return [{"id": "blk_sl_3", "type": "stop_market", "stopPrice": 88.0}]
+            return []
+        self.mock_ccxt.fetch_open_orders = MagicMock(side_effect=_open_orders_case3)
+        self.mock_ccxt.cancel_all_orders = MagicMock()
+        self.mock_ccxt.cancel_order = MagicMock()
+        self.mock_ccxt.create_market_order = MagicMock(side_effect=[
+            Exception("binance {'code': -2022, 'msg': 'ReduceOnly Order is rejected.'}"),
+            {"id": "mkt_trim_3", "filled": 4.0, "average": 100.0, "fee": {"cost": 0.2}},
+        ])
+        self.mock_ccxt.create_order = MagicMock(return_value={"id": "sl_rearmed_6"})
+
+        res = self.exchange_service._execute_smart_order_sync(
+            symbol="SOLUSDT", delta_qty=-4.0, mark_price=100.0,
+            realized_pnl_est=2.0, note="Partial trim case 3",
+            reduce_only=True, maker_first=False, taker_fallback=True,
+            active_sl_price=88.0,
+        )
+        self.assertIsNotNone(res)
+        self.assertAlmostEqual(res.executed_qty, 4.0)
+        self.assertEqual(self.mock_ccxt.create_market_order.call_count, 2)
+        self.mock_ccxt.cancel_order.assert_called_once_with("blk_sl_3", "SOL/USDT:USDT", params={"trigger": True})
+        # Перевірка перевиставлення STOP_MARKET у finally на залишок (6.0 != 0) за 88.0 із closePosition=True
+        self.mock_ccxt.create_order.assert_called_once()
+        _, sl_kw = self.mock_ccxt.create_order.call_args
+        self.assertEqual(sl_kw["type"], "STOP_MARKET")
+        self.assertEqual(sl_kw["side"], "sell")
+        self.assertIsNone(sl_kw["amount"])
+        self.assertAlmostEqual(float(sl_kw["params"]["stopPrice"]), 88.0)
+        self.assertTrue(sl_kw["params"].get("closePosition"))
+        self.assertTrue(self.exchange_service.get_last_order_diag("SOLUSDT").get("sl_rearmed_after_2022"))
+
+    def test_watchdog_orphan_zombie_and_naked_sl_remediation(self):
+        """Post-Rebalance Watchdog: чистить ордери-сироти, закриває zombie (target=0), ставить відсутній STOP_MARKET."""
+        from app.domain.schemas import CoinStateDTO, ExchangePositionDTO, OrderExecutionDTO
+        from app.services.state_service import StateService
+        from app.services.execution_service import MultiAssetExecutionOrchestrator
+
+        st = StateService()
+        st.coins["BTCUSDT"] = CoinStateDTO(symbol="BTCUSDT", enabled=True, current_pos_qty=0.0)
+        st.coins["ETHUSDT"] = CoinStateDTO(symbol="ETHUSDT", enabled=True, current_pos_qty=0.0)
+        st.coins["SOLUSDT"] = CoinStateDTO(symbol="SOLUSDT", enabled=True, current_pos_qty=5.0, active_sl_price=90.0)
+
+        ex = MagicMock()
+        ex.fetch_account_snapshot = AsyncMock(return_value=(
+            500.0, 0.0,
+            {
+                "BTCUSDT": ExchangePositionDTO(symbol="BTCUSDT", contracts_qty=0.0),
+                "ETHUSDT": ExchangePositionDTO(symbol="ETHUSDT", contracts_qty=2.0, mark_price=3000.0),
+                "SOLUSDT": ExchangePositionDTO(symbol="SOLUSDT", contracts_qty=5.0, mark_price=100.0),
+            },
+            True,
+        ))
+        ex.fetch_all_open_orders_by_symbol = AsyncMock(return_value={
+            "BTCUSDT": [{"id": "orphan_1", "type": "limit"}],
+            "ETHUSDT": [],
+            "SOLUSDT": [],  # Немає STOP_MARKET -> Naked Position!
+        })
+        ex.cancel_symbol_orders = AsyncMock(return_value=True)
+        ex.execute_smart_rebalance_order = AsyncMock(return_value=OrderExecutionDTO(
+            symbol="ETHUSDT", side="SELL", executed_qty=2.0, avg_price=3000.0, fee_usdt=3.0,
+        ))
+        ex.place_or_update_stop_loss_ex = AsyncMock(return_value=(True, "OK"))
+
+        tg = MagicMock()
+        tg.send_alert = AsyncMock()
+        orch = MultiAssetExecutionOrchestrator(
+            logger=MagicMock(), state_service=st, db_service=MagicMock(),
+            exchange_service=ex, cartridge_service=MagicMock(),
+            online_learner=MagicMock(), news_service=MagicMock(),
+        )
+        orch._tg_sender = tg
+
+        asyncio.run(orch._run_post_rebalance_watchdog(
+            active_syms=("BTCUSDT", "ETHUSDT", "SOLUSDT"),
+            coin_targets_map={"BTCUSDT": 0.0, "ETHUSDT": 0.0, "SOLUSDT": 0.25},
+            coin_prices={"BTCUSDT": 90000.0, "ETHUSDT": 3000.0, "SOLUSDT": 100.0},
+            phase_a_plans=[],
+            phase_b_plans=[],
+            executed_orders_summary=[],
+        ))
+
+        cancel_syms = [c.args[0] for c in ex.cancel_symbol_orders.call_args_list]
+        self.assertIn("BTCUSDT", cancel_syms)
+        self.assertIn("ETHUSDT", cancel_syms)
+        ex.execute_smart_rebalance_order.assert_awaited_once()
+        _, z_kw = ex.execute_smart_rebalance_order.call_args
+        self.assertEqual(z_kw["symbol"], "ETHUSDT")
+        self.assertAlmostEqual(z_kw["delta_qty"], -2.0)
+        self.assertTrue(z_kw["reduce_only"])
+        ex.place_or_update_stop_loss_ex.assert_awaited_once_with("SOLUSDT", 5.0, 90.0)
+        tg.send_alert.assert_awaited_once()
 
 
 if __name__ == "__main__":

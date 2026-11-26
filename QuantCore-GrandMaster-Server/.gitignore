@@ -7,6 +7,7 @@
 .admin_key
 *.key
 storage/
+data/
 *.joblib
 *.db
 *.sqlite

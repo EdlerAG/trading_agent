@@ -17,6 +17,7 @@ except ImportError:
 from app.core.config import settings
 from app.core.events import AsyncEventBus, event_bus
 from app.domain.interfaces import IService
+from app.services.research_lake_service import research_lake
 from app.services.state_service import StateService
 from app.services.exchange_ccxt_service import ExchangeCcxtService
 
@@ -140,12 +141,21 @@ class WebSocketSentinelService(IService):
                     close_timeout=5,
                     max_size=2 * 1024 * 1024,
                 ) as ws:
-                    self._logger.info("⚡ [WSSentinel] Активно! Реальний потік Mark Price 1s підключено.")
+                    self._logger.info(
+                        f"⚡ [WSSentinel] Активно! Потік Mark Price підключено (observe_only={settings.WS_SENTINEL_OBSERVE_ONLY})."
+                    )
                     retry_delay = 1.0
+                    last_sample_ts = 0.0
+                    sample_sec = max(1.0, float(getattr(settings, "WS_SENTINEL_SAMPLE_SEC", 5.0)))
 
                     async for message in ws:
                         if not self._running:
                             break
+                        if settings.WS_SENTINEL_OBSERVE_ONLY:
+                            t_now_msg = time.time()
+                            if (t_now_msg - last_sample_ts) < sample_sec:
+                                continue
+                            last_sample_ts = t_now_msg
                         try:
                             payload = _loads(message)
                             if isinstance(payload, list):
@@ -160,7 +170,7 @@ class WebSocketSentinelService(IService):
                     if use_demo_ws:
                         use_demo_ws = False  # Автоматичний фолбек на стабільний основний WS при недоступності Demo WS
                     self._logger.warning(
-                        f"⚠️ [WSSentinel] Розрив зв'язку: {e}. Перепідключення через {retry_delay:.0f}с..."
+                        f"⚠️ [WSSentinel] Розрив зв'язку: {type(e).__name__}: {e!r}. Перепідключення через {retry_delay:.0f}с..."
                     )
                     await asyncio.sleep(retry_delay)
                     retry_delay = min(15.0, retry_delay * 1.5)
@@ -198,6 +208,12 @@ class WebSocketSentinelService(IService):
                 for s in self._state.coins:
                     if s in self._mark_prices:
                         cp[s] = self._mark_prices[s]
+
+        if settings.WS_SENTINEL_OBSERVE_ONLY:
+            # У режимі OBSERVE_ONLY виконуємо ВИКЛЮЧНО пасивне логування аномальних рухів у V3 Research Lake
+            # (нуль втручання у біржові стопи та нуль позапланових пробуджень ядра V6.1!)
+            await self._check_flash_crash_cascade(now)
+            return
 
         # 2. Перевірка 1: Суб-секундний Breakeven & Chandelier Ratchet
         await self._check_breakeven_and_ratchet()
@@ -342,6 +358,19 @@ class WebSocketSentinelService(IService):
                 if (now - last_wake) >= 90.0:
                     self._last_flash_wakeup[sym] = now
                     delta_pct = (delta_price / open_p) * 100.0 if open_p > 0 else 0.0
+                    dir_code = "DOWN" if mark_p < open_p else "UP"
+                    research_lake.record_sentinel_event(
+                        symbol=sym,
+                        atr_move=delta_price / max(atr, 1e-9),
+                        direction=dir_code,
+                        price_at_trigger=mark_p,
+                        open_price=open_p,
+                    )
+                    if settings.WS_SENTINEL_OBSERVE_ONLY:
+                        self._logger.info(
+                            f"📡 [WSSentinel Observe] {sym} {dir_code}: Δ={delta_pct:+.2f}% ({delta_price / max(atr, 1e-9):.2f} ATR) -> записано у V3 Data Lake."
+                        )
+                        continue
                     direction = "📉 ПРОЛИВ" if mark_p < open_p else "📈 ПАМП/СПЛЕСК"
 
                     self._logger.warning(

@@ -1,4 +1,5 @@
 import os
+import sys as _sys
 
 # Жорстке обмеження багатопотоковості C-бібліотек та Numba для мінімального споживання RAM на 1GB VPS
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -6,7 +7,8 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
-os.environ.setdefault("NUMBA_NUM_THREADS", os.getenv("SERVER_NUMBA_THREADS", "2"))
+if "numba" not in _sys.modules:
+    os.environ.setdefault("NUMBA_NUM_THREADS", os.getenv("SERVER_NUMBA_THREADS", "2"))
 os.environ.setdefault("MALLOC_TRIM_THRESHOLD_", "65536")
 os.environ.setdefault("MALLOC_ARENA_MAX", "2")
 
@@ -168,7 +170,10 @@ async def lifespan(app: FastAPI):
     for t in tasks:
         t.cancel()
     if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=3.0)
+        except Exception:
+            pass
 
     if getattr(app.state, "container", None) is not None:
         try:
@@ -256,5 +261,6 @@ if __name__ == "__main__":
         http="auto",
         access_log=False,
         limit_concurrency=32,
-        timeout_keep_alive=15,
+        timeout_keep_alive=5,
+        timeout_graceful_shutdown=5,
     )

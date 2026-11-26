@@ -104,7 +104,8 @@ Environment=MALLOC_ARENA_MAX=2
 Restart=always
 RestartSec=3
 KillSignal=SIGTERM
-TimeoutStopSec=15
+KillMode=mixed
+TimeoutStopSec=45
 StandardOutput=journal
 StandardError=journal
 

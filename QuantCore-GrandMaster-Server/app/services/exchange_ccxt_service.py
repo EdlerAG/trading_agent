@@ -1,8 +1,10 @@
 import os
+import json
 import time
 import hashlib
 import asyncio
 import logging
+import urllib.request
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Optional, Tuple, Any, List
@@ -124,6 +126,12 @@ class ExchangeCcxtService(IExchangeGateway):
             return True  # для unit-тестових MagicMock без завантаженого словника markets
         return ccxt_sym in markets
 
+    def is_symbol_listed(self, symbol: str) -> bool:
+        """Публічна перевірка лістингу пари на поточному стенді біржі (True для офлайн/тестових шлюзів)."""
+        if self._exchange is None or hasattr(self._exchange, "_mock_name"):
+            return True
+        return self._is_listed_market(symbol_to_ccxt(ccxt_to_symbol(symbol)))
+
     @property
     def name(self) -> str:
         return "ExchangeCcxtService"
@@ -152,11 +160,19 @@ class ExchangeCcxtService(IExchangeGateway):
 
         if settings.BINANCE_API_KEY:
             try:
-                ex.set_position_mode(hedged=False)
+                already_one_way = False
+                if hasattr(ex, "fapiPrivateGetPositionSideDual") and not hasattr(ex, "_mock_name"):
+                    dual_res = ex.fapiPrivateGetPositionSideDual() or {}
+                    dual_val = dual_res.get("dualSidePosition")
+                    if dual_val is False or str(dual_val).lower() == "false":
+                        already_one_way = True
+                if not already_one_way:
+                    ex.set_position_mode(hedged=False)
             except Exception as e_pm:
-                # Binance кидає -4059 "No need to change position side" якщо One-Way вже увімкнено
-                if "-4059" not in str(e_pm) and "No need to change" not in str(e_pm):
-                    self._logger.warning(f"⚠️ Перевірка set_position_mode(One-Way): {e_pm}")
+                # Binance кидає -4059 / -4067 якщо One-Way вже активний або є захисні STOP_MARKET ордери
+                err_s = str(e_pm)
+                if "-4059" not in err_s and "-4067" not in err_s and "No need to change" not in err_s:
+                    self._logger.warning(f"⚠️ Перевірка set_position_mode(One-Way): {type(e_pm).__name__}: {e_pm!r}")
 
             def _setup_margin_and_lev(sym_s: str) -> None:
                 c_sym = symbol_to_ccxt(sym_s)
@@ -342,14 +358,25 @@ class ExchangeCcxtService(IExchangeGateway):
             pass
         return round(p, 4 if p < 10.0 else 2)
 
-    async def sync_exchange_stop_closure(self, symbol: str) -> Optional[Tuple[float, float, float]]:
+    async def sync_exchange_stop_closure(
+        self,
+        symbol: str,
+        prev_pos_qty: float = 0.0,
+        since_ms: int = 0,
+    ) -> Optional[Tuple[float, float, float]]:
         """
-        Викликається, коли відкрита позиція зникла на біржі (спрацював STOP_MARKET).
-        Скасовує залишкові ордери, записує фактичний PnL у БД і повертає (qty, avg_price, realized_pnl).
+        Викликається, коли відкрита позиція зникла на біржі (спрацював STOP_MARKET / TP).
+        Скасовує залишкові ордери, зчитує фактичні закриваючі трейди та fapiPrivateGetIncome(REALIZED_PNL, COMMISSION),
+        коректно фіксує CLOSE_SHORT (BUY) / CLOSE_LONG (SELL) і повертає (qty, avg_price, realized_pnl).
         """
-        return await asyncio.to_thread(self._sync_exchange_stop_closure_sync, symbol)
+        return await asyncio.to_thread(self._sync_exchange_stop_closure_sync, symbol, prev_pos_qty, since_ms)
 
-    def _sync_exchange_stop_closure_sync(self, symbol: str) -> Optional[Tuple[float, float, float]]:
+    def _sync_exchange_stop_closure_sync(
+        self,
+        symbol: str,
+        prev_pos_qty: float = 0.0,
+        since_ms: int = 0,
+    ) -> Optional[Tuple[float, float, float]]:
         if self._exchange is None:
             return None
         clean_sym = ccxt_to_symbol(symbol)
@@ -362,31 +389,173 @@ class ExchangeCcxtService(IExchangeGateway):
             self._cancel_conditional_orders_sync(ccxt_sym)
         except Exception:
             pass
-        try:
-            trades = self._exchange.fetch_my_trades(ccxt_sym, limit=6)
-            if not trades:
-                return None
-            last_order_id = trades[-1].get("order")
-            related = [t for t in trades if t.get("order") == last_order_id] or [trades[-1]]
-            tot_qty = sum(float(t.get("amount") or 0.0) for t in related if isinstance(t, dict))
-            tot_fee = sum(float((t.get("fee") or {}).get("cost") or 0.0) for t in related if isinstance(t, dict))
-            tot_pnl = sum(float((t.get("info") or {}).get("realizedPnl") or 0.0) for t in related if isinstance(t, dict))
-            last_side = str(related[-1].get("side") or "SELL").upper()
-            avg_price = float(related[-1].get("price") or 0.0)
 
-            self._db.record_trade(
-                symbol=clean_sym,
-                side=last_side,
-                amount=tot_qty,
-                price=avg_price,
-                order_id=str(last_order_id or ""),
-                pnl=tot_pnl,
-                fee=tot_fee,
-                note="MFE_HARVESTER_TP" if tot_pnl >= 0.0 else "STOP_LOSS_EXCHANGE",
-            )
+        expected_side = "BUY" if float(prev_pos_qty) < -1e-12 else ("SELL" if float(prev_pos_qty) > 1e-12 else "")
+        action_str = "CLOSE_SHORT" if expected_side == "BUY" else ("CLOSE_LONG" if expected_side == "SELL" else "")
+        eff_since = int(since_ms) if int(since_ms) > 0 else (int((time.time() - 7200.0) * 1000) if expected_side else 0)
+
+        try:
+            if eff_since > 0:
+                try:
+                    trades = self._exchange.fetch_my_trades(ccxt_sym, since=eff_since, limit=40)
+                except TypeError:
+                    trades = self._exchange.fetch_my_trades(ccxt_sym, limit=20)
+            else:
+                trades = self._exchange.fetch_my_trades(ccxt_sym, limit=6)
+
+            valid_trades = [t for t in (trades or []) if isinstance(t, dict)]
+            if expected_side:
+                # Відсікаємо ордери ВХОДУ: закриття шорта ОБОВ'ЯЗКОВО має side=='BUY' та ненульовий realizedPnl (або свіжий час)
+                side_matched = [
+                    t for t in valid_trades
+                    if str(t.get("side") or "").upper() == expected_side
+                ]
+                pnl_matched = [
+                    t for t in side_matched
+                    if abs(float((t.get("info") or {}).get("realizedPnl") or 0.0)) > 1e-12
+                ]
+                cand_trades = pnl_matched or side_matched
+            else:
+                cand_trades = valid_trades
+
+            tot_qty = 0.0
+            tot_fee = 0.0
+            tot_pnl = 0.0
+            avg_price = 0.0
+            order_id_str = ""
+
+            if cand_trades:
+                if expected_side and len(cand_trades) > 1:
+                    # Агрегуємо всі часткові філи останнього закриття (напр. 2 частинами по ROSEUSDT)
+                    last_ts = int(cand_trades[-1].get("timestamp") or 0)
+                    cluster = [
+                        t for t in cand_trades
+                        if last_ts <= 0 or abs(int(t.get("timestamp") or 0) - last_ts) <= 180_000
+                    ] or [cand_trades[-1]]
+                else:
+                    last_oid = cand_trades[-1].get("order")
+                    cluster = [t for t in cand_trades if t.get("order") == last_oid] or [cand_trades[-1]]
+
+                tot_qty = sum(float(t.get("amount") or 0.0) for t in cluster)
+                tot_cost = sum(float(t.get("amount") or 0.0) * float(t.get("price") or 0.0) for t in cluster)
+                tot_fee = sum(abs(float((t.get("fee") or {}).get("cost") or 0.0)) for t in cluster)
+                tot_pnl = sum(float((t.get("info") or {}).get("realizedPnl") or 0.0) for t in cluster)
+                avg_price = (tot_cost / tot_qty) if tot_qty > 0 else float(cluster[-1].get("price") or 0.0)
+                order_id_str = str(cluster[-1].get("order") or "")
+                rec_side = expected_side or str(cluster[-1].get("side") or "SELL").upper()
+            else:
+                rec_side = expected_side or "SELL"
+
+            # Резервна звірка з канонічним реєстром Binance fapiPrivateGetIncome(REALIZED_PNL, COMMISSION),
+            # якщо userTrades ще не встиг віддати realizedPnl або повернув порожній список!
+            if expected_side and abs(tot_pnl) <= 1e-12 and hasattr(self._exchange, "fapiPrivateGetIncome") and not hasattr(self._exchange.fapiPrivateGetIncome, "_mock_name"):
+                try:
+                    inc_st = eff_since if eff_since > 0 else int((time.time() - 7200.0) * 1000)
+                    rp_rows = self._exchange.fapiPrivateGetIncome({
+                        "symbol": clean_sym, "incomeType": "REALIZED_PNL", "startTime": inc_st, "limit": 50
+                    }) or []
+                    cm_rows = self._exchange.fapiPrivateGetIncome({
+                        "symbol": clean_sym, "incomeType": "COMMISSION", "startTime": inc_st, "limit": 50
+                    }) or []
+                    if rp_rows:
+                        tot_pnl = sum(float(r.get("income") or 0.0) for r in rp_rows if isinstance(r, dict))
+                        if not order_id_str:
+                            order_id_str = f"inc_{rp_rows[-1].get('tranId', '')}"
+                    if cm_rows and tot_fee <= 1e-12:
+                        tot_fee = sum(abs(float(r.get("income") or 0.0)) for r in cm_rows if isinstance(r, dict))
+                    if tot_qty <= 0.0:
+                        tot_qty = abs(float(prev_pos_qty))
+                except Exception:
+                    pass
+
+            if tot_qty <= 0.0 and abs(tot_pnl) <= 1e-12:
+                return None
+
+            note_lbl = "MFE_HARVESTER_TP" if tot_pnl > 0.0 else "STOP_LOSS_EXCHANGE"
+            rec_kwargs: Dict[str, Any] = {
+                "symbol": clean_sym,
+                "side": rec_side,
+                "amount": tot_qty,
+                "price": avg_price,
+                "order_id": order_id_str,
+                "pnl": tot_pnl,
+                "fee": tot_fee,
+                "note": note_lbl,
+            }
+            if action_str:
+                rec_kwargs["action"] = action_str
+            try:
+                self._db.record_trade(**rec_kwargs)
+            except TypeError:
+                rec_kwargs.pop("action", None)
+                self._db.record_trade(**rec_kwargs)
             return tot_qty, avg_price, tot_pnl
         except Exception as e:
             self._logger.warning(f"⚠️ [{clean_sym}] Не вдалося зчитати деталі закритого стопа: {e}")
+            return None
+
+    async def fetch_account_income_ledger(self, since_ms: int) -> List[Dict[str, Any]]:
+        """Зчитує канонічні записи REALIZED_PNL, COMMISSION та FUNDING_FEE з Binance USD-M за унікальним tranId."""
+        return await asyncio.to_thread(self._fetch_account_income_ledger_sync, since_ms)
+
+    def _fetch_account_income_ledger_sync(self, since_ms: int) -> List[Dict[str, Any]]:
+        if self._exchange is None or not hasattr(self._exchange, "fapiPrivateGetIncome") or hasattr(self._exchange, "_mock_name"):
+            return []
+        out: List[Dict[str, Any]] = []
+        for itype in ("REALIZED_PNL", "COMMISSION", "FUNDING_FEE"):
+            cur_since = int(since_ms) if since_ms > 0 else 0
+            for _page in range(5):
+                try:
+                    params: Dict[str, Any] = {"incomeType": itype, "limit": 1000}
+                    if cur_since > 0:
+                        params["startTime"] = cur_since
+                    rows = self._exchange.fapiPrivateGetIncome(params) or []
+                    if not rows:
+                        break
+                    max_t = cur_since
+                    for r in rows:
+                        if not isinstance(r, dict):
+                            continue
+                        tid = str(r.get("tranId") or "").strip()
+                        tms = int(r.get("time") or 0)
+                        if not tid or tms <= 0:
+                            continue
+                        if tms > max_t:
+                            max_t = tms
+                        out.append({
+                            "tran_id": f"{itype}_{tid}",
+                            "ts_ms": tms,
+                            "income_type": itype,
+                            "symbol": str(r.get("symbol") or "").upper(),
+                            "income_usdt": float(r.get("income") or 0.0),
+                            "info": str(r.get("info") or ""),
+                        })
+                    if len(rows) < 1000 or max_t <= cur_since:
+                        break
+                    cur_since = max_t + 1
+                except Exception:
+                    break
+        return out
+
+    async def measure_ntp_skew_ms(self) -> Optional[int]:
+        return await asyncio.to_thread(self._measure_ntp_skew_sync)
+
+    def _measure_ntp_skew_sync(self) -> Optional[int]:
+        if self._exchange is None or hasattr(self._exchange, "_mock_name"):
+            return None
+        try:
+            t_loc_before = time.time() * 1000.0
+            if hasattr(self._exchange, "fapiPublicGetTime"):
+                srv_res = self._exchange.fapiPublicGetTime() or {}
+                srv_ms = float(srv_res.get("serverTime") or 0.0)
+            else:
+                srv_ms = float(self._exchange.fetch_time() or 0.0)
+            t_loc_after = time.time() * 1000.0
+            if srv_ms <= 0:
+                return None
+            loc_mid = 0.5 * (t_loc_before + t_loc_after)
+            return int(round(loc_mid - srv_ms))
+        except Exception:
             return None
 
     async def fetch_account_snapshot(
@@ -401,11 +570,21 @@ class ExchangeCcxtService(IExchangeGateway):
             return 0.0, 0.0, {}, False
         try:
             bal = self._exchange.fetch_balance()
-            usdt_wallet = float(
-                (bal.get("total") or {}).get("USDT")
-                or (bal.get("free") or {}).get("USDT")
-                or 0.0
-            )
+            info_bal = (bal.get("info") or {}) if isinstance(bal, dict) else {}
+            raw_wb = info_bal.get("totalWalletBalance")
+            if raw_wb is None and isinstance(info_bal.get("assets"), list):
+                for a_item in info_bal["assets"]:
+                    if isinstance(a_item, dict) and str(a_item.get("asset") or "").upper() == "USDT":
+                        raw_wb = a_item.get("walletBalance")
+                        break
+            if raw_wb is not None:
+                usdt_wallet = float(raw_wb)
+            else:
+                usdt_wallet = float(
+                    (bal.get("total") or {}).get("USDT")
+                    or (bal.get("free") or {}).get("USDT")
+                    or 0.0
+                )
             ccxt_syms = [symbol_to_ccxt(s) for s in symbols if self._is_listed_market(symbol_to_ccxt(s))]
             raw_positions = self._exchange.fetch_positions(ccxt_syms) if ccxt_syms else []
 
@@ -502,7 +681,22 @@ class ExchangeCcxtService(IExchangeGateway):
         now_s = time.time()
         ttl_sec = 7200.0  # 2h TTL: 8h фандінг змінюється раз на 4-8 годин -> нуль зайвих REST-запитів!
         since = int(now_s * 1000) - int(hours) * 3_600_000
+        is_mock_ex = hasattr(self._exchange, "_mock_name")
+        disk_f_path = Path(settings.MARKET_CACHE_DIR) / "funding_hist_cache.json"
+
+        if not self._funding_hist_cache and not is_mock_ex and disk_f_path.exists():
+            try:
+                raw_disk = json.loads(disk_f_path.read_text(encoding="utf-8"))
+                if isinstance(raw_disk, dict):
+                    for s_k, entry in raw_disk.items():
+                        if isinstance(entry, list) and len(entry) == 2 and isinstance(entry[1], list) and entry[1]:
+                            df_cached = pd.DataFrame(entry[1], columns=["timestamp", "funding_rate"])
+                            self._funding_hist_cache[str(s_k).upper()] = (float(entry[0]), df_cached)
+            except Exception:
+                pass
+
         out: Dict[str, pd.DataFrame] = {}
+        to_fetch: List[str] = []
         for sym in symbols:
             sym_u = sym.upper()
             cached = self._funding_hist_cache.get(sym_u)
@@ -512,8 +706,12 @@ class ExchangeCcxtService(IExchangeGateway):
             ccxt_sym = symbol_to_ccxt(sym)
             if not self._is_listed_market(ccxt_sym):
                 continue
+            to_fetch.append(sym_u)
+
+        def _pull_one(sym_u: str) -> Tuple[str, Optional[pd.DataFrame]]:
+            ccxt_sym = symbol_to_ccxt(sym_u)
             try:
-                raw = self._exchange.fetch_funding_rate_history(
+                raw = self._exchange.fetch_funding_rate_history(  # type: ignore[union-attr]
                     ccxt_sym, since=since, limit=1000
                 )
                 rows = [
@@ -531,12 +729,41 @@ class ExchangeCcxtService(IExchangeGateway):
                         .sort_values("timestamp")
                         .reset_index(drop=True)
                     )
-                    self._funding_hist_cache[sym_u] = (now_s, df_h)
-                    out[sym_u] = df_h
+                    return sym_u, df_h
             except Exception as e:
                 self._logger.warning(
-                    f"⚠️ Не вдалося завантажити funding history для {sym}: {e}"
+                    f"⚠️ Не вдалося завантажити funding history для {sym_u}: {type(e).__name__}: {e!r}"
                 )
+            return sym_u, None
+
+        dirty_disk = False
+        if to_fetch:
+            n_workers = 1 if is_mock_ex else min(6, max(1, len(to_fetch)))
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                for sym_u, df_h in pool.map(_pull_one, to_fetch):
+                    if df_h is not None:
+                        self._funding_hist_cache[sym_u] = (now_s, df_h)
+                        out[sym_u] = df_h
+                        dirty_disk = True
+                    elif sym_u in self._funding_hist_cache:
+                        out[sym_u] = self._funding_hist_cache[sym_u][1]
+
+        if dirty_disk and not is_mock_ex and self._funding_hist_cache:
+            try:
+                disk_f_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp_f = disk_f_path.with_suffix(".json.tmp")
+                serial_obj = {
+                    s_k: [
+                        round(float(ts_f), 3),
+                        [[int(r["timestamp"]), float(r["funding_rate"])] for _, r in df_v.tail(260).iterrows()],
+                    ]
+                    for s_k, (ts_f, df_v) in self._funding_hist_cache.items()
+                    if df_v is not None and not df_v.empty
+                }
+                tmp_f.write_text(json.dumps(serial_obj, separators=(",", ":")), encoding="utf-8")
+                os.replace(tmp_f, disk_f_path)
+            except Exception as disk_e:
+                self._logger.debug(f"[FundingCache] Save skipped: {type(disk_e).__name__}: {disk_e!r}")
         return out
 
     async def fetch_funding_income(self, since_ms: int = 0) -> List[Dict[str, Any]]:
@@ -603,11 +830,21 @@ class ExchangeCcxtService(IExchangeGateway):
             if cached_oi is not None and (now_s - cached_oi[0]) < oi_ttl:
                 return sym_name, cached_oi[1]
             try:
-                if hasattr(self._exchange, "fapiPublicGetOpenInterest"):
+                val = 0.0
+                if settings.USE_DEMO_TRADING and not hasattr(self._exchange, "_mock_name"):
+                    # На Binance Demo публічний fapiPublicGetOpenInterest повертає штучні сотні мільйонів паперових контрактів ($30T BTC).
+                    # Читаємо реальний Open Interest із публічного Mainnet ендпоінта для чистоти v2_market_micro / V3 Data Lake!
+                    req = urllib.request.Request(f"https://fapi.binance.com/fapi/v1/openInterest?symbol={sym_name}")
+                    with urllib.request.urlopen(req, timeout=4.0) as resp:
+                        oi_raw = json.loads(resp.read().decode("utf-8")) or {}
+                    val = float(oi_raw.get("openInterest") or 0.0) * mp
+                elif hasattr(self._exchange, "fapiPublicGetOpenInterest"):
                     oi_raw = self._exchange.fapiPublicGetOpenInterest({"symbol": sym_name}) or {}
                     val = float(oi_raw.get("openInterest") or 0.0) * mp
-                    self._oi_cache[sym_name] = (now_s, val)
-                    return sym_name, val
+                if not (0.0 <= val <= 200_000_000_000.0):
+                    val = 0.0
+                self._oi_cache[sym_name] = (now_s, val)
+                return sym_name, val
             except Exception:
                 pass
             return sym_name, 0.0
@@ -750,11 +987,212 @@ class ExchangeCcxtService(IExchangeGateway):
         maker_first: bool = False,
         taker_fallback: Optional[bool] = None,
         urgency: str = "normal",
+        active_sl_price: float = 0.0,
     ) -> Optional[OrderExecutionDTO]:
         return await asyncio.to_thread(
             self._execute_smart_order_sync,
-            symbol, delta_qty, mark_price, realized_pnl_est, note, reduce_only, maker_first, taker_fallback, urgency,
+            symbol,
+            delta_qty,
+            mark_price,
+            realized_pnl_est,
+            note,
+            reduce_only,
+            maker_first,
+            taker_fallback,
+            urgency,
+            active_sl_price,
         )
+
+    @staticmethod
+    def _is_reduce_only_2022(err: Any) -> bool:
+        s = str(err)
+        return ("-2022" in s) or ("ReduceOnly" in s)
+
+    def _fetch_live_symbol_position_sync(self, ccxt_sym: str, clean_sym: str) -> Optional[float]:
+        """Свіжий REST-запит поточної позиції на біржі для одного символа."""
+        if self._exchange is None:
+            return None
+        try:
+            raw_pos = self._exchange.fetch_positions([ccxt_sym])
+        except Exception as e:
+            self._logger.warning(f"⚠️ [{clean_sym}] Не вдалося отримати живу позицію через REST: {e}")
+            return None
+        if not isinstance(raw_pos, (list, tuple)):
+            return 0.0
+        for p in raw_pos:
+            if not isinstance(p, dict):
+                continue
+            p_sym = ccxt_to_symbol(str(p.get("symbol") or ""))
+            if p_sym and p_sym != clean_sym:
+                continue
+            contracts = float(p.get("contracts") or 0.0)
+            side_p = str(p.get("side") or "").lower()
+            if contracts <= 0.0:
+                continue
+            if side_p == "short":
+                return -contracts
+            if side_p == "long":
+                return contracts
+            signed = float((p.get("info") or {}).get("positionAmt") or 0.0)
+            if signed != 0.0:
+                return signed
+        return 0.0
+
+    def _extract_order_exec_fields(
+        self, ord_dict: Dict[str, Any], ccxt_sym: str, fallback_qty: float, fallback_price: float, fee_rate: float
+    ) -> Tuple[float, float, float, str]:
+        raw_filled = ord_dict.get("filled")
+        if raw_filled is None:
+            f_qty = fallback_qty if str(ord_dict.get("type") or "").lower() != "limit" else 0.0
+        else:
+            f_qty = float(raw_filled)
+        if f_qty <= 0.0:
+            return 0.0, 0.0, 0.0, str(ord_dict.get("id") or "")
+        avg_exec = float(ord_dict.get("average") or ord_dict.get("price") or (ord_dict.get("info") or {}).get("avgPrice") or 0.0)
+        if avg_exec <= 0.0 and ord_dict.get("id"):
+            try:
+                chk = self._exchange.fetch_order(ord_dict["id"], ccxt_sym)
+                if isinstance(chk, dict):
+                    avg_exec = float(chk.get("average") or chk.get("price") or (chk.get("info") or {}).get("avgPrice") or 0.0)
+            except Exception:
+                pass
+        f_price = avg_exec if avg_exec > 0.0 else float(fallback_price)
+        f_fee = float((ord_dict.get("fee") or {}).get("cost") or (f_qty * f_price * fee_rate))
+        return f_qty, f_price, f_fee, str(ord_dict.get("id") or "")
+
+    def _recover_2022_reduce_only_sync(
+        self,
+        clean_sym: str,
+        ccxt_sym: str,
+        side: str,
+        requested_qty: float,
+        min_qty: float,
+        est_price: float,
+        maker_mode: bool,
+        allow_market_fallback: bool,
+        limit_price: float,
+        active_sl_price: float,
+    ) -> Tuple[Optional[Dict[str, Any]], str, bool]:
+        """Відновлення після Binance -2022 (ReduceOnly Order is rejected).
+
+        Повертає (executed_order_dict_or_None, status_str, sl_rearmed_flag).
+        """
+        live_qty = self._fetch_live_symbol_position_sync(ccxt_sym, clean_sym)
+        if live_qty is None:
+            self._logger.error(f"🚨 [{clean_sym}] -2022 recovery: REST-запит позиції недоступний.")
+            return None, "FAILED_2022_RETRY", False
+
+        if abs(live_qty) < min_qty:
+            self._logger.info(
+                f"ℹ️ [{clean_sym}] -2022 підтверджено через REST (live_qty={live_qty:.6f} <= {min_qty}): "
+                f"позиція вже закрита, чистимо залишкові ордери."
+            )
+            self._cancel_symbol_orders_with_sl_capture_sync(ccxt_sym, clean_sym)
+            return None, "ALREADY_CLOSED_2022", False
+
+        expected_close_side = "sell" if live_qty > 0 else "buy"
+        if side != expected_close_side:
+            self._logger.critical(
+                f"🚨 [{clean_sym}] -2022 SIDE MISMATCH: side={side}, live_qty={live_qty:+.4f}. Скасовано без ретраю!"
+            )
+            return None, "FAILED_2022_SIDE_MISMATCH", False
+
+        retry_qty = self.safe_amount(clean_sym, min(requested_qty, abs(live_qty)))
+        if retry_qty < min_qty:
+            return None, "ALREADY_CLOSED_2022", False
+
+        is_full_exit = retry_qty >= (abs(live_qty) - min_qty * 0.5)
+        self._logger.warning(
+            f"🔄 [{clean_sym}] -2022 але live_qty={live_qty:+.4f}: скасовуємо блокуючі ордери та повторюємо "
+            f"{'CLOSE' if is_full_exit else 'TRIM'} qty={retry_qty}."
+        )
+
+        captured_sl_px = 0.0
+        retry_filled = 0.0
+        retry_ord: Optional[Dict[str, Any]] = None
+        sl_rearmed = False
+        try:
+            _, captured_sl_px = self._cancel_symbol_orders_with_sl_capture_sync(ccxt_sym, clean_sym)
+
+            if maker_mode and limit_price > 0.0:
+                mk_cid = self.build_client_order_id(
+                    clean_sym, side, retry_qty, True, bucket_tag=f"r22mk_{int(time.time() // 60)}"
+                )
+                try:
+                    mk_ord = self._exchange.create_order(
+                        symbol=ccxt_sym,
+                        type="limit",
+                        side=side,
+                        amount=retry_qty,
+                        price=limit_price,
+                        params={"postOnly": True, "reduceOnly": True, "newClientOrderId": mk_cid},
+                    )
+                    if isinstance(mk_ord, dict) and mk_ord.get("id"):
+                        if str(mk_ord.get("status") or "").lower() == "closed" or float(mk_ord.get("filled") or 0.0) > 0.0:
+                            retry_ord = mk_ord
+                        else:
+                            try:
+                                self._exchange.cancel_order(mk_ord["id"], ccxt_sym)
+                            except Exception:
+                                pass
+                            try:
+                                chk = self._exchange.fetch_order(mk_ord["id"], ccxt_sym)
+                                if isinstance(chk, dict) and float(chk.get("filled") or 0.0) > 0.0:
+                                    retry_ord = chk
+                            except Exception:
+                                pass
+                except Exception as mk_e:
+                    self._logger.warning(f"⚠️ [{clean_sym}] Повторний postOnly після -2022 не вдався: {mk_e}")
+
+            rem_retry = retry_qty
+            if retry_ord is not None:
+                f_q = float(retry_ord.get("filled") or 0.0)
+                retry_filled += f_q
+                rem_retry = self.safe_amount(clean_sym, max(0.0, retry_qty - f_q))
+
+            if rem_retry >= min_qty and (is_full_exit or allow_market_fallback or not maker_mode):
+                tk_cid = self.build_client_order_id(
+                    clean_sym, side, rem_retry, True, bucket_tag=f"r22tk_{int(time.time() // 60)}"
+                )
+                try:
+                    m_ord = self._exchange.create_market_order(
+                        ccxt_sym,
+                        side,
+                        rem_retry,
+                        params={"reduceOnly": True, "newClientOrderId": tk_cid, "newOrderRespType": "RESULT"},
+                    )
+                    if isinstance(m_ord, dict):
+                        f_m = m_ord.get("filled")
+                        f_mq = rem_retry if f_m is None else float(f_m)
+                        if f_mq > 0.0:
+                            retry_filled += f_mq
+                            retry_ord = m_ord
+                except Exception as m_e:
+                    self._logger.error(f"🚨 [{clean_sym}] Повторний MARKET reduceOnly після -2022 не вдався: {m_e}")
+
+            if retry_filled > 0.0 and retry_ord is not None:
+                res_ord, res_status = retry_ord, "FILLED_2022_RETRY"
+            else:
+                res_ord, res_status = None, "FAILED_2022_RETRY"
+        finally:
+            eff_sl = float(active_sl_price or 0.0) if float(active_sl_price or 0.0) > 0.0 else captured_sl_px
+            if eff_sl > 0.0:
+                signed_delta_done = retry_filled if side == "buy" else -retry_filled
+                rem_est = live_qty + signed_delta_done
+                live_after = self._fetch_live_symbol_position_sync(ccxt_sym, clean_sym)
+                if live_after is not None and (retry_filled <= 0.0 or abs(live_after - live_qty) > 1e-12):
+                    rem_signed = live_after
+                else:
+                    rem_signed = rem_est
+                if abs(rem_signed) >= min_qty:
+                    ok_rearm, _ = self._place_stop_loss_ex_sync(clean_sym, rem_signed, eff_sl)
+                    if ok_rearm:
+                        sl_rearmed = True
+                        self._logger.info(
+                            f"🛡️ [{clean_sym}] Перевиставлено STOP_MARKET @ ${eff_sl:,.4f} на залишок {rem_signed:+.4f} після -2022."
+                        )
+                        self._last_order_diag.setdefault(clean_sym, {})["sl_rearmed_after_2022"] = True
+        return res_ord, res_status, sl_rearmed
 
     def _execute_smart_order_sync(
         self,
@@ -767,6 +1205,7 @@ class ExchangeCcxtService(IExchangeGateway):
         maker_first: bool = False,
         taker_fallback: Optional[bool] = None,
         urgency: str = "normal",
+        active_sl_price: float = 0.0,
     ) -> Optional[OrderExecutionDTO]:
         if self._exchange is None:
             return None
@@ -851,15 +1290,22 @@ class ExchangeCcxtService(IExchangeGateway):
             total_cost = 0.0
             total_fee = 0.0
             last_order_id = ""
-            aborted_2022 = False
+            status_2022_override: Optional[str] = None
+            sl_rearmed_2022 = False
+            allow_fb = bool(taker_fallback) if taker_fallback is not None else not (maker_first and not reduce_only)
 
             for t_idx, tranche_qty in enumerate(tranches):
                 if t_idx > 0:
                     time.sleep(2.0)  # TWAP-lite інтервал 2 с між траншами
 
                 t_rem = tranche_qty
-                # 3. Адаптивний 2-ітераційний BBO Chaser виконується ТІЛЬКИ якщо явно запитано maker_first=True
-                chaser_iters = (1, 2) if maker_first else ()
+                # 3. Адаптивний BBO Chaser виконується якщо maker_first=True АБО увімкнено ENABLE_SMART_MAKER_CHASE (до 3 спроб по 2.5с)
+                smart_chase_on = bool(getattr(settings, "ENABLE_SMART_MAKER_CHASE", False)) and not reduce_only
+                eff_maker_mode = bool(maker_first or smart_chase_on)
+                n_max_chase = int(getattr(settings, "SMART_MAKER_MAX_RETRIES", 3)) if smart_chase_on else (2 if maker_first else 0)
+                chaser_iters = tuple(range(1, n_max_chase + 1))
+                requotes_done = 0
+                last_limit_placed = 0.0
                 for iteration in chaser_iters:
                     if t_rem < min_qty:
                         break
@@ -883,6 +1329,9 @@ class ExchangeCcxtService(IExchangeGateway):
                         if (not favorable_flow) and sp_abs >= (min_sp_mult * tk_sz):
                             raw_lim = (cur_bid + tk_sz) if side == "buy" else (cur_ask - tk_sz)
                     limit_price = self.safe_price(clean_sym, raw_lim)
+                    last_limit_placed = limit_price
+                    if iteration > 1:
+                        requotes_done += 1
 
                     mk_cid = self.build_client_order_id(
                         clean_sym, side, t_rem, reduce_only, bucket_tag=f"mk{t_idx}_{iteration}_{int(time.time()//60)}"
@@ -902,12 +1351,32 @@ class ExchangeCcxtService(IExchangeGateway):
                             params=params,
                         )
                     except Exception as e:
-                        err_mk = str(e)
-                        if reduce_only and ("-2022" in err_mk or "ReduceOnly" in err_mk):
-                            self._logger.info(
-                                f"ℹ️ [{clean_sym}] ReduceOnly postOnly відхилено (-2022): позиція вже закрита — скасовано без ретраю!"
+                        if reduce_only and self._is_reduce_only_2022(e):
+                            rec_ord, status_2022_override, sl_rearmed_2022 = self._recover_2022_reduce_only_sync(
+                                clean_sym=clean_sym,
+                                ccxt_sym=ccxt_sym,
+                                side=side,
+                                requested_qty=t_rem,
+                                min_qty=min_qty,
+                                est_price=est_price,
+                                maker_mode=True,
+                                allow_market_fallback=allow_fb,
+                                limit_price=limit_price,
+                                active_sl_price=active_sl_price,
                             )
-                            aborted_2022 = True
+                            if rec_ord is not None:
+                                r_qty, r_px, r_fee, r_id = self._extract_order_exec_fields(
+                                    rec_ord, ccxt_sym, t_rem, est_price, 0.0005
+                                )
+                                if r_qty > 0.0:
+                                    if str(rec_ord.get("type") or "").lower() == "limit":
+                                        total_maker_filled += r_qty
+                                    else:
+                                        total_market_filled += r_qty
+                                    total_cost += r_qty * r_px
+                                    total_fee += r_fee
+                                    last_order_id = r_id or last_order_id
+                                    t_rem = max(0.0, t_rem - r_qty)
                             break
                         self._logger.debug(f"Maker order attempt {iteration} for {clean_sym} skipped: {e}")
                         maker_order = None
@@ -918,11 +1387,14 @@ class ExchangeCcxtService(IExchangeGateway):
                         t0 = time.time()
                         iter_filled = False
 
-                        if maker_first and taker_fallback is True:
+                        if smart_chase_on:
+                            wait_lim = float(getattr(settings, "SMART_MAKER_REQUOTE_SEC", 2.5))
+                            poll_sec = 0.45
+                        elif eff_maker_mode and taker_fallback is True:
                             wait_lim = float(settings.V3_URGENT_MAKER_WAIT_SEC if urgency == "high" else settings.V2_MAKER_WAIT_SEC)
                             poll_sec = 0.45
                         else:
-                            wait_lim = 5.5 if maker_first else 4.5
+                            wait_lim = 5.5 if eff_maker_mode else 4.5
                             poll_sec = 1.0
                         while (time.time() - t0) < wait_lim:
                             time.sleep(poll_sec)
@@ -957,11 +1429,10 @@ class ExchangeCcxtService(IExchangeGateway):
                             except Exception:
                                 pass
 
-                if aborted_2022:
+                if status_2022_override is not None:
                     break
 
                 # 4. Захищене виконання залишку: Protected Limit IOC (BBO ± max_slip) на вхід або ReduceOnly на вихід!
-                allow_fb = bool(taker_fallback) if taker_fallback is not None else not (maker_first and not reduce_only)
                 if t_rem >= min_qty and allow_fb:
                     m_qty = self.safe_amount(clean_sym, t_rem)
                     tk_cid = self.build_client_order_id(
@@ -998,47 +1469,42 @@ class ExchangeCcxtService(IExchangeGateway):
                                     m_params["reduceOnly"] = True
                                 m_ord = self._exchange.create_market_order(ccxt_sym, side, m_qty, params=m_params)
                         except Exception as e:
-                            err_s = str(e)
                             # КРИТИЧНЕ ВИПРАВЛЕННЯ БЕЗПЕКИ (-2022):
-                            # НІКОЛИ не повторюємо ордер без `reduceOnly=True`! Якщо SL вже закрив позицію на біржі,
-                            # повтор без `reduceOnly` відкривав би голу зустрічну позицію в протилежний бік!
-                            if "-2022" in err_s or "ReduceOnly" in err_s:
-                                self._logger.info(
-                                    f"ℹ️ [{clean_sym}] ReduceOnly ордер відхилено біржею (-2022: позиція вже 0) — "
-                                    f"безпечне скасування БЕЗ відкриття зустрічної позиції!"
+                            # НІКОЛИ не повторюємо ордер без `reduceOnly=True`!
+                            if reduce_only and self._is_reduce_only_2022(e):
+                                m_ord, status_2022_override, sl_rearmed_2022 = self._recover_2022_reduce_only_sync(
+                                    clean_sym=clean_sym,
+                                    ccxt_sym=ccxt_sym,
+                                    side=side,
+                                    requested_qty=m_qty,
+                                    min_qty=min_qty,
+                                    est_price=est_price,
+                                    maker_mode=False,
+                                    allow_market_fallback=True,
+                                    limit_price=0.0,
+                                    active_sl_price=active_sl_price,
                                 )
-                                aborted_2022 = True
+                                if m_ord is None:
+                                    break
+                            elif self._is_reduce_only_2022(e):
+                                status_2022_override = "ALREADY_CLOSED_2022"
                                 break
-                            # Ідемпотентна перевірка після мережевого таймауту перед відмовою
-                            rec_ord = self._find_existing_order_by_client_id(ccxt_sym, tk_cid)
-                            if rec_ord is not None:
-                                m_ord = rec_ord
                             else:
-                                self._logger.warning(f"⚠️ [{clean_sym}] Помилка виконання IOC/Taker ордера: {e}")
+                                rec_ord = self._find_existing_order_by_client_id(ccxt_sym, tk_cid)
+                                if rec_ord is not None:
+                                    m_ord = rec_ord
+                                else:
+                                    self._logger.warning(f"⚠️ [{clean_sym}] Помилка виконання IOC/Taker ордера: {e}")
 
                     if m_ord and isinstance(m_ord, dict):
-                        raw_filled = m_ord.get("filled")
-                        # Для IOC лімітника filled може бути 0.0 (якщо ціна втекла за межі BBO ± max_slip)!
-                        if raw_filled is None:
-                            f_qty = m_qty if str(m_ord.get("type") or "").lower() != "limit" else 0.0
-                        else:
-                            f_qty = float(raw_filled)
+                        f_qty, f_price, f_fee, f_id = self._extract_order_exec_fields(
+                            m_ord, ccxt_sym, m_qty, est_price, 0.0005
+                        )
                         if f_qty > 0.0:
-                            avg_exec = float(m_ord.get("average") or (m_ord.get("info") or {}).get("avgPrice") or 0.0)
-                            if avg_exec <= 0.0 and m_ord.get("id"):
-                                try:
-                                    chk_ioc = self._exchange.fetch_order(m_ord["id"], ccxt_sym)
-                                    if isinstance(chk_ioc, dict):
-                                        avg_exec = float(chk_ioc.get("average") or (chk_ioc.get("info") or {}).get("avgPrice") or 0.0)
-                                except Exception:
-                                    pass
-                            # Ніколи не беремо захисну стелю ліміту ioc_px як середню ціну виконання!
-                            f_price = avg_exec if avg_exec > 0.0 else float(est_price)
-                            f_fee = float((m_ord.get("fee") or {}).get("cost") or (f_qty * f_price * 0.0005))
                             total_market_filled += f_qty
                             total_cost += (f_qty * f_price)
                             total_fee += f_fee
-                            last_order_id = str(m_ord.get("id") or last_order_id)
+                            last_order_id = f_id or last_order_id
 
             tot_qty = total_maker_filled + total_market_filled
             lat_ms = round((time.perf_counter() - t_start_ord) * 1000.0, 1)
@@ -1047,9 +1513,10 @@ class ExchangeCcxtService(IExchangeGateway):
                     "arrival_mid_px": float(arrival_mid),
                     "spread_bps": spread_bps_val,
                     "latency_ms": lat_ms,
+                    "sl_rearmed_after_2022": sl_rearmed_2022,
                     "order_status": (
-                        "ALREADY_CLOSED_2022"
-                        if aborted_2022
+                        status_2022_override
+                        if status_2022_override is not None
                         else ("UNFILLED" if (maker_first and not allow_fb) else "REJECTED")
                     ),
                 }
@@ -1069,8 +1536,12 @@ class ExchangeCcxtService(IExchangeGateway):
                 "best_bid": float(best_bid),
                 "best_ask": float(best_ask),
                 "top5_depth_usd": round(float(top5_usd), 2),
+                "limit_placed_price": float(last_limit_placed),
+                "requotes_count": int(requotes_done),
+                "sl_rearmed_after_2022": sl_rearmed_2022,
+                "fallback_reason": "maker_unfilled_ioc_fallback" if (eff_maker_mode and fb_used_flag) else ("direct_ioc" if fb_used_flag else "maker_filled"),
                 "latency_ms": lat_ms,
-                "order_status": status_str,
+                "order_status": status_2022_override or status_str,
             }
             self._db.record_trade(
                 symbol=clean_sym,
@@ -1177,15 +1648,16 @@ class ExchangeCcxtService(IExchangeGateway):
             self._cancel_conditional_orders_sync(ccxt_sym, types_filter=("stop_market", "stop"))
 
             try:
+                # 100% позиційний STOP_MARKET з closePosition=True (без amount/quantity та reduceOnly, щоб уникнути -1106 і не займати квоту reduceOnly)
                 self._exchange.create_order(
                     symbol=ccxt_sym,
                     type="STOP_MARKET",
                     side=close_side,
-                    amount=qty,
+                    amount=None,
                     price=None,
                     params={
                         "stopPrice": sl_p,
-                        "reduceOnly": True,
+                        "closePosition": True,
                         "workingType": "MARK_PRICE",
                         "newClientOrderId": sl_cid,
                     },
@@ -1208,8 +1680,9 @@ class ExchangeCcxtService(IExchangeGateway):
                     price=None,
                     params={
                         "stopPrice": sl_p,
-                        "closePosition": True,
+                        "reduceOnly": True,
                         "workingType": "MARK_PRICE",
+                        "newClientOrderId": sl_cid,
                     },
                 )
                 return True, "OK_FALLBACK"
@@ -1321,27 +1794,124 @@ class ExchangeCcxtService(IExchangeGateway):
                 pass
         return canceled_cnt
 
-    async def cancel_symbol_orders(self, symbol: str) -> bool:
-        return await asyncio.to_thread(self._cancel_symbol_orders_sync, symbol)
-
-    def _cancel_symbol_orders_sync(self, symbol: str) -> bool:
+    def _cancel_symbol_orders_with_sl_capture_sync(self, ccxt_sym: str, clean_sym: str) -> Tuple[bool, float]:
+        """Скасовує всі відкриті та умовні ордери по символу і повертає (ok, stop_price_якщо_був_SL)."""
         if self._exchange is None:
-            return False
-        clean = ccxt_to_symbol(symbol)
-        ccxt_sym = symbol_to_ccxt(clean)
+            return False, 0.0
+        captured_sl_px = 0.0
+        for is_trig in (False, True):
+            try:
+                ords = (
+                    self._exchange.fetch_open_orders(ccxt_sym, params={"trigger": True})
+                    if is_trig
+                    else self._exchange.fetch_open_orders(ccxt_sym)
+                )
+            except TypeError:
+                if is_trig:
+                    continue
+                ords = self._exchange.fetch_open_orders(ccxt_sym)
+            except Exception:
+                continue
+            if not isinstance(ords, (list, tuple)):
+                continue
+            for o in ords:
+                if not isinstance(o, dict):
+                    continue
+                o_type = str(o.get("type") or (o.get("info") or {}).get("origType") or (o.get("info") or {}).get("orderType") or "").lower()
+                if o_type in ("stop_market", "stop") and captured_sl_px <= 0.0:
+                    sp = float(
+                        o.get("stopPrice")
+                        or (o.get("info") or {}).get("stopPrice")
+                        or (o.get("info") or {}).get("triggerPrice")
+                        or 0.0
+                    )
+                    if sp > 0.0:
+                        captured_sl_px = sp
+
         ok = False
         try:
             self._exchange.cancel_all_orders(ccxt_sym)
             ok = True
         except Exception as e:
-            self._logger.warning(f"⚠️ [{clean}] Помилка cancel_all_orders: {e}")
-        # Додатково скасовуємо умовні Algo/Trigger SL/TP ордери, які cancel_all_orders на Binance може пропускати!
+            self._logger.warning(f"⚠️ [{clean_sym}] Помилка cancel_all_orders: {e}")
         try:
             if self._cancel_conditional_orders_sync(ccxt_sym) > 0:
                 ok = True
         except Exception:
             pass
+        return ok, captured_sl_px
+
+    async def cancel_symbol_orders(self, symbol: str) -> bool:
+        return await asyncio.to_thread(self._cancel_symbol_orders_sync, symbol)
+
+    def _cancel_symbol_orders_sync(self, symbol: str) -> bool:
+        clean = ccxt_to_symbol(symbol)
+        ccxt_sym = symbol_to_ccxt(clean)
+        ok, _ = self._cancel_symbol_orders_with_sl_capture_sync(ccxt_sym, clean)
         return ok
+
+    async def fetch_all_open_orders_by_symbol(self, symbols: Tuple[str, ...]) -> Dict[str, List[Dict[str, Any]]]:
+        """Повертає карту відкритих звичайних + Algo/Trigger ордерів по символах."""
+        return await asyncio.to_thread(self._fetch_all_open_orders_by_symbol_sync, symbols)
+
+    def _fetch_all_open_orders_by_symbol_sync(self, symbols: Tuple[str, ...]) -> Dict[str, List[Dict[str, Any]]]:
+        if self._exchange is None:
+            return {}
+        out: Dict[str, List[Dict[str, Any]]] = {s.upper(): [] for s in symbols}
+        bulk_ok = True
+        for is_trig in (False, True):
+            try:
+                raw_ords = (
+                    self._exchange.fetch_open_orders(None, params={"trigger": True})
+                    if is_trig
+                    else self._exchange.fetch_open_orders(None)
+                )
+            except TypeError:
+                if is_trig:
+                    continue
+                try:
+                    raw_ords = self._exchange.fetch_open_orders(None)
+                except Exception:
+                    bulk_ok = False
+                    break
+            except Exception:
+                bulk_ok = False
+                break
+            if not isinstance(raw_ords, (list, tuple)):
+                bulk_ok = False
+                break
+            for o in raw_ords:
+                if not isinstance(o, dict):
+                    continue
+                c_sym = ccxt_to_symbol(str(o.get("symbol") or ""))
+                if c_sym in out:
+                    out[c_sym].append(o)
+
+        if bulk_ok:
+            return out
+
+        out = {s.upper(): [] for s in symbols}
+        for s in symbols:
+            clean = ccxt_to_symbol(s)
+            ccxt_sym = symbol_to_ccxt(clean)
+            if not self._is_listed_market(ccxt_sym):
+                continue
+            for is_trig in (False, True):
+                try:
+                    ords = (
+                        self._exchange.fetch_open_orders(ccxt_sym, params={"trigger": True})
+                        if is_trig
+                        else self._exchange.fetch_open_orders(ccxt_sym)
+                    )
+                except TypeError:
+                    if is_trig:
+                        continue
+                    ords = self._exchange.fetch_open_orders(ccxt_sym)
+                except Exception:
+                    continue
+                if isinstance(ords, (list, tuple)):
+                    out[clean].extend(o for o in ords if isinstance(o, dict))
+        return out
 
     async def cleanup_orphan_orders(
         self, active_positions: Dict[str, float], candidate_symbols: Optional[Tuple[str, ...]] = None

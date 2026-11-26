@@ -9,8 +9,12 @@ catboost_info/
 
 # Secrets & Environment
 .env
+**/.env
+**/.env.*
+!**/.env.example
 QuantCore-GrandMaster-Server/.env
 .admin_key
+**/.admin_key*
 QuantCore-GrandMaster-Server/.admin_key
 *.key
 
@@ -47,3 +51,5 @@ QuantCore-GrandMaster-Server/storage/cartridges/*.joblib
 .opencode/
 .idea/
 .vscode/
+server_analytics/
+QuantCore-GrandMaster-Server/data/

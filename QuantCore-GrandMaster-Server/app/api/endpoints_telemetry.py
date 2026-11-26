@@ -39,8 +39,20 @@ async def get_terminal_state(request: Request, auth_role: str = Depends(verify_a
     cart_meta = container.cartridge_service.get_metadata()
     online_meta = container.online_learner.get_summary_dict()
     res_meta = memory_guard.get_resource_telemetry(cart_meta["active_cartridge"])
-    news_meta = container.news_service.get_cached_info() if getattr(container, "news_service", None) else {}
-    arena_meta = container.shadow_arena.get_leaderboard() if getattr(container, "shadow_arena", None) else []
+    news_meta = (
+        container.news_service.get_cached_info()
+        if getattr(container, "news_service", None) is not None
+        else {"status": "DISABLED_BY_CONFIG", "enabled": False, "headlines": []}
+    )
+    arena_obj = getattr(container, "shadow_arena", None)
+    arena_meta = arena_obj.get_leaderboard() if arena_obj is not None else []
+    arena_status = "ACTIVE" if arena_obj is not None else "DISABLED_BY_CONFIG"
+    ws_obj = getattr(container, "ws_sentinel", None)
+    ws_status = (
+        "OBSERVE_ONLY"
+        if (ws_obj is not None and getattr(settings, "WS_SENTINEL_OBSERVE_ONLY", False))
+        else ("ACTIVE" if ws_obj is not None else "DISABLED_BY_CONFIG")
+    )
     v2_meta = (
         container.db_service.get_v2_analytics_summary(days=30)
         if hasattr(container.db_service, "get_v2_analytics_summary")
@@ -67,6 +79,8 @@ async def get_terminal_state(request: Request, auth_role: str = Depends(verify_a
         "online_learning": online_meta,
         "news": news_meta,
         "shadow_arena": arena_meta,
+        "shadow_arena_status": arena_status,
+        "ws_sentinel_status": ws_status,
         "v2_analytics": v2_meta,
         "resources": res_meta,
     }

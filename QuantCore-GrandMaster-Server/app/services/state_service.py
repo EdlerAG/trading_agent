@@ -26,16 +26,19 @@ class StateService(IService):
         "force_step",
         "daily_starting_equity",
         "peak_equity",
+        "demo_wallet_anchor",
         "last_reset_date",
         "coins",
         "latest_telemetry",
         "last_candle_ts",
         "updated_at",
         "_started_at_unix",
+        "balance_synced",
     )
 
     def __init__(self) -> None:
         self._started_at_unix: float = time.time()
+        self.balance_synced: bool = False
         self.is_paused: bool = False
         self.pause_until: Optional[datetime] = None
         self.risk_profile: str = settings.DEFAULT_RISK_PROFILE
@@ -49,6 +52,7 @@ class StateService(IService):
         self.force_step: bool = False
         self.daily_starting_equity: float = 0.0
         self.peak_equity: float = 0.0
+        self.demo_wallet_anchor: float = 0.0
         self.last_reset_date: Optional[str] = None
         self.coins: Dict[str, CoinStateDTO] = {}
         self.latest_telemetry: Dict[str, Any] = {}
@@ -84,7 +88,12 @@ class StateService(IService):
         self.save_snapshot()
 
     def sync_supported_symbols(self, symbols: Iterable[str]) -> None:
-        self._init_default_coins(symbols)
+        sup_set = {str(s).strip().upper() for s in symbols if str(s).strip()}
+        if sup_set:
+            for existing_sym in list(self.coins.keys()):
+                if existing_sym not in sup_set and abs(float(self.coins[existing_sym].current_pos_qty or 0.0)) <= 1e-12:
+                    self.coins.pop(existing_sym, None)
+        self._init_default_coins(sup_set)
         self.save_snapshot()
 
     def load_snapshot(self) -> None:
@@ -111,6 +120,7 @@ class StateService(IService):
             self.force_step = bool(data.get("force_step", False))
             self.daily_starting_equity = float(data.get("daily_starting_equity", 0.0))
             self.peak_equity = float(data.get("peak_equity", 0.0))
+            self.demo_wallet_anchor = float(data.get("demo_wallet_anchor", 0.0) or 0.0)
             self.last_reset_date = data.get("last_reset_date")
             self.last_candle_ts = str(data.get("last_candle_ts", ""))
             saved_tel = data.get("latest_telemetry")
@@ -181,6 +191,7 @@ class StateService(IService):
             "force_step": self.force_step,
             "daily_starting_equity": round(self.daily_starting_equity, 2),
             "peak_equity": round(self.peak_equity, 2),
+            "demo_wallet_anchor": round(self.demo_wallet_anchor, 4),
             "last_reset_date": self.last_reset_date,
             "last_candle_ts": self.last_candle_ts,
             "latest_telemetry": self.latest_telemetry,
@@ -309,10 +320,13 @@ class StateService(IService):
         raw_cds = self.latest_telemetry.get("stop_cooldowns", {}) or {}
         tot_eq = float(self.latest_telemetry.get("total_equity", 0.0) or 0.0)
 
+        has_live_prices = bool(coin_prices)
         out = []
         for sym, c in self.coins.items():
             d = self._coin_to_dict(c)
             price = float(coin_prices.get(sym, 0.0) or c.entry_price or 0.0)
+            if has_live_prices and price <= 0.0 and abs(float(c.current_pos_qty or 0.0)) <= 1e-12:
+                continue
             notional_signed = float(c.current_pos_qty) * price
             realized_w = (notional_signed / tot_eq) if tot_eq > 1.0 else 0.0
             raw_tw = float(coin_targets.get(sym, 0.0) or 0.0)
@@ -320,12 +334,15 @@ class StateService(IService):
             eff_tw = mod_tw if abs(mod_tw) > 1e-6 else (raw_tw if abs(raw_tw) > 1e-6 else realized_w)
             cd_l = int(raw_cds.get(f"{sym}:1", 0) or 0)
             cd_s = int(raw_cds.get(f"{sym}:-1", 0) or 0)
+            raw_book = str(coin_books.get(sym) or c.dominant_book or "")
+            if abs(float(c.current_pos_qty or 0.0)) > 1e-12 and raw_book in ("", "FLAT"):
+                raw_book = "ORPHAN_RECONCILED"
             d["price"] = price
             d["notional_usdt"] = round(abs(notional_signed), 2)
             d["realized_weight"] = round(realized_w, 4)
             d["unrealized_pnl"] = round(float(coin_upnl.get(sym, 0.0)), 2)
             d["target_weight"] = round(eff_tw, 4)
-            d["sleeve_book"] = str(coin_books.get(sym) or c.dominant_book or "")
+            d["sleeve_book"] = raw_book
             d["factors"] = coin_factors.get(sym) or {}
             d["funding_rate"] = float(coin_funding.get(sym)) if sym in coin_funding and coin_funding.get(sym) is not None else None
             d["s_stop_px"] = float(s_stops.get(sym, 0.0) or 0.0)
@@ -342,6 +359,7 @@ class StateService(IService):
             "orchestrator_mode": self.orchestrator_mode,
             "daily_starting_equity": round(self.daily_starting_equity, 2),
             "peak_equity": round(self.peak_equity, 2),
+            "balance_synced": bool(self.balance_synced),
             "uptime_sec": round(max(0.0, time.time() - self._started_at_unix), 1),
             "last_candle_ts": self.last_candle_ts,
             "updated_at": self.updated_at,

@@ -247,9 +247,21 @@ class Settings:
     ).lower() == "true"
     ENABLE_WS_SENTINEL: bool = os.getenv(
         "ENABLE_WS_SENTINEL",
-        "false" if os.getenv("CARTRIDGE_ENGINE", "v58").strip().lower() in ("v2", "v3", "v4", "v5", "v6", "qv3", "qv3_convex") else "true",
+        "true" if os.getenv("WS_SENTINEL_OBSERVE_ONLY", "true").lower() == "true" else (
+            "false" if os.getenv("CARTRIDGE_ENGINE", "v58").strip().lower() in ("v2", "v3", "v4", "v5", "v6", "qv3", "qv3_convex") else "true"
+        ),
     ).lower() == "true"
+    WS_SENTINEL_OBSERVE_ONLY: bool = os.getenv("WS_SENTINEL_OBSERVE_ONLY", "true").lower() == "true"
+    WS_SENTINEL_SAMPLE_SEC: float = float(os.getenv("WS_SENTINEL_SAMPLE_SEC", "5.0"))
     MAX_MARKET_CACHE_MB: int = int(os.getenv("MAX_MARKET_CACHE_MB", "200"))
+    SL_COOLDOWN_HOURS: int = int(os.getenv("SL_COOLDOWN_HOURS", "48"))
+    NTP_WARN_THRESHOLD_MS: int = int(os.getenv("NTP_WARN_THRESHOLD_MS", "150"))
+    ENABLE_V3_RESEARCH_LAKE: bool = os.getenv("ENABLE_V3_RESEARCH_LAKE", "true").lower() == "true"
+    V3_RESEARCH_LAKE_DIR: str = os.getenv("V3_RESEARCH_LAKE_DIR", os.path.join(BASE_DIR, "data", "v3_research_lake"))
+    MAX_RESEARCH_LAKE_MB: int = int(os.getenv("MAX_RESEARCH_LAKE_MB", "1024"))
+    ENABLE_SMART_MAKER_CHASE: bool = os.getenv("ENABLE_SMART_MAKER_CHASE", "false").lower() == "true"
+    SMART_MAKER_MAX_RETRIES: int = int(os.getenv("SMART_MAKER_MAX_RETRIES", "3"))
+    SMART_MAKER_REQUOTE_SEC: float = float(os.getenv("SMART_MAKER_REQUOTE_SEC", "2.5"))
     MAX_CANDLE_STALENESS_MULT: float = float(os.getenv("MAX_CANDLE_STALENESS_MULT", "1.8"))
     NEUTRALITY_IMBALANCE_LIMIT: float = float(os.getenv("NEUTRALITY_IMBALANCE_LIMIT", "0.05"))
     MAX_NTP_CLOCK_SKEW_MS: int = int(os.getenv("MAX_NTP_CLOCK_SKEW_MS", "1000"))

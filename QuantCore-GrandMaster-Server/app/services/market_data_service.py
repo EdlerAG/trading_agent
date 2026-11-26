@@ -22,7 +22,7 @@ class MarketDataService(IService):
       із локальним кільцевим кешем у пам'яті (< 4 MB RAM на всі 58 монет).
     """
 
-    __slots__ = ("_logger", "_exchange", "_last_synced_ts", "_v3_aux_cache", "_aux_cache_path", "_aux_dirty")
+    __slots__ = ("_logger", "_exchange", "_last_synced_ts", "_v3_aux_cache", "_aux_cache_path", "_aux_dirty", "_unlisted_logged")
 
     def __init__(self, logger: logging.Logger, exchange_service: IExchangeGateway) -> None:
         self._logger = logger
@@ -31,6 +31,7 @@ class MarketDataService(IService):
         self._v3_aux_cache: Dict[str, Tuple[float, Dict[int, Tuple[float, float, float, float, float, float]]]] = {}
         self._aux_cache_path = Path(settings.MARKET_CACHE_DIR) / "v3_aux_cache.json"
         self._aux_dirty: bool = False
+        self._unlisted_logged: set[str] = set()
 
     def _load_disk_aux_cache_sync(self) -> None:
         if not self._aux_cache_path.exists():
@@ -292,40 +293,61 @@ class MarketDataService(IService):
                     )
                     return sym.upper(), df
                 except Exception as e:
-                    self._logger.warning(f"⚠️ [{sym}] Помилка завантаження свічок: {e}")
+                    self._logger.warning(f"⚠️ [{sym}] Помилка завантаження свічок: {type(e).__name__}: {e!r}")
                     return sym.upper(), None
 
-        async def _fetch_funding() -> Dict[str, float]:
+        async def _fetch_funding(syms_target: Tuple[str, ...]) -> Dict[str, float]:
             try:
                 if hasattr(self._exchange, "fetch_funding_rates"):
                     return await asyncio.wait_for(
-                        self._exchange.fetch_funding_rates(symbols),
-                        timeout=10.0,
+                        self._exchange.fetch_funding_rates(syms_target),
+                        timeout=12.0,
                     )
                 return {}
             except Exception as e:
-                self._logger.warning(f"⚠️ Помилка завантаження funding rates: {e}")
+                self._logger.warning(f"⚠️ Помилка завантаження funding rates: {type(e).__name__}: {e!r}")
                 return {}
 
-        async def _fetch_funding_history() -> Dict[str, pd.DataFrame]:
+        async def _fetch_funding_history(syms_target: Tuple[str, ...]) -> Dict[str, pd.DataFrame]:
             fn = getattr(self._exchange, "fetch_funding_history", None)
             # MagicMock-заглушки в тестах не є корутинами -> тихий fallback.
             if not callable(fn) or not inspect.iscoroutinefunction(fn):
                 return {}
             try:
                 hist = await asyncio.wait_for(
-                    fn(symbols, hours=settings.FUNDING_HISTORY_HOURS),
-                    timeout=20.0,
+                    fn(syms_target, hours=settings.FUNDING_HISTORY_HOURS),
+                    timeout=35.0,
                 )
                 return hist if isinstance(hist, dict) else {}
             except Exception as e:
-                self._logger.warning(f"⚠️ Помилка завантаження funding history: {e}")
+                self._logger.warning(f"⚠️ Помилка завантаження funding history: {type(e).__name__}: {e!r}")
                 return {}
 
+        # Відсікаємо пари, які відсутні на поточному стенді біржі (напр. ICPUSDT на Binance Demo), щоб не спамити лог щогодини!
+        fn_listed = getattr(self._exchange, "is_symbol_listed", None)
+        if callable(fn_listed) and not hasattr(self._exchange, "_mock_name"):
+            listed_syms: List[str] = []
+            newly_unlisted: List[str] = []
+            for s_chk in symbols:
+                res_l = fn_listed(s_chk)
+                if res_l is False:
+                    if s_chk.upper() not in self._unlisted_logged:
+                        self._unlisted_logged.add(s_chk.upper())
+                        newly_unlisted.append(s_chk.upper())
+                else:
+                    listed_syms.append(s_chk)
+            if newly_unlisted:
+                self._logger.info(
+                    f"ℹ️ [MarketData] Пари відсутні на поточному стенді біржі й виключені з опитування: {', '.join(newly_unlisted)}"
+                )
+            eff_symbols = tuple(listed_syms)
+        else:
+            eff_symbols = tuple(symbols)
+
         # Паралельне асинхронне виконання запитів до біржі: свічки + фандінг
-        candles_task = asyncio.gather(*[_fetch_single_symbol(sym) for sym in symbols])
-        funding_task = _fetch_funding()
-        history_task = _fetch_funding_history()
+        candles_task = asyncio.gather(*[_fetch_single_symbol(sym) for sym in eff_symbols])
+        funding_task = _fetch_funding(eff_symbols)
+        history_task = _fetch_funding_history(eff_symbols)
 
         candles_results, funding_map, funding_history = await asyncio.gather(
             candles_task, funding_task, history_task
@@ -334,7 +356,7 @@ class MarketDataService(IService):
         # Підвантаження V3 допоміжних каналів тільки коли активне ядро V3 та реальний біржовий шлюз
         v3_aux_by_sym: Dict[str, Dict[int, Tuple[float, float, float, float, float, float]]] = {}
         is_real_gateway = getattr(self._exchange, "_exchange", None) is not None
-        if settings.CARTRIDGE_ENGINE in ("v3", "v4", "v5", "v6") and settings.ENABLE_V3_AUX_CHANNELS and is_real_gateway:
+        if settings.CARTRIDGE_ENGINE in ("v3", "v4", "v5", "v6", "qv3", "qv3_convex") and settings.ENABLE_V3_AUX_CHANNELS and is_real_gateway:
             if not self._v3_aux_cache and self._aux_cache_path.exists():
                 await asyncio.to_thread(self._load_disk_aux_cache_sync)
             aux_sem = asyncio.Semaphore(6)
@@ -343,7 +365,7 @@ class MarketDataService(IService):
                 async with aux_sem:
                     return s.upper(), await self._fetch_v3_aux_for_symbol(s, target_bars=settings.effective_candles_limit)
 
-            for s_k, aux_d in await asyncio.gather(*[_pull_aux(sym) for sym in symbols]):
+            for s_k, aux_d in await asyncio.gather(*[_pull_aux(sym) for sym in eff_symbols]):
                 v3_aux_by_sym[s_k] = aux_d
             if self._aux_dirty:
                 await asyncio.to_thread(self._save_disk_aux_cache_sync)

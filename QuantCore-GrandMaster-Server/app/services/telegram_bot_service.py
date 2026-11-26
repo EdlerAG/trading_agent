@@ -895,11 +895,11 @@ class TelegramBotService(IService):
         while True:
             try:
                 offset = -1 if not self._synced else (self._last_update_id + 1)
-                timeout_val = 0 if not self._synced else 50
+                timeout_val = 0 if not self._synced else 8
                 data = await self._api(
                     "getUpdates",
                     {"offset": offset, "limit": 10, "timeout": timeout_val},
-                    timeout=58.0,
+                    timeout=12.0,
                 )
 
                 if data and data.get("ok"):

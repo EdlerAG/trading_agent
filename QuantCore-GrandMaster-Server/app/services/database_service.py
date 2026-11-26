@@ -17,6 +17,11 @@ except ImportError:
 
 from app.core.config import settings
 from app.core.memory_guard import memory_guard
+from app.core.metrics_math import (
+    compute_equity_bridge_dict,
+    compute_hourly_attribution_step,
+    compute_unified_performance_metrics,
+)
 from app.domain.interfaces import IService
 
 
@@ -69,6 +74,8 @@ class DatabaseService(IService):
             for sql in (
                 "ALTER TABLE trades ADD COLUMN symbol VARCHAR(24) DEFAULT 'BTCUSDT';",
                 "ALTER TABLE trades ADD COLUMN fee_usdt FLOAT DEFAULT 0.0;",
+                "ALTER TABLE trades ADD COLUMN action VARCHAR(24) DEFAULT '';",
+                "ALTER TABLE trades ADD COLUMN is_artifact INTEGER DEFAULT 0;",
             ):
                 try:
                     conn.execute(sql)
@@ -93,6 +100,7 @@ class DatabaseService(IService):
                 "ALTER TABLE equity_snapshots ADD COLUMN total_equity FLOAT DEFAULT 0.0;",
                 "ALTER TABLE equity_snapshots ADD COLUMN gross_leverage FLOAT DEFAULT 0.0;",
                 "ALTER TABLE equity_snapshots ADD COLUMN active_coins INTEGER DEFAULT 0;",
+                "ALTER TABLE equity_snapshots ADD COLUMN is_artifact INTEGER DEFAULT 0;",
             ):
                 try:
                     conn.execute(sql)
@@ -138,7 +146,42 @@ class DatabaseService(IService):
                     weights_a_json TEXT DEFAULT '{}',
                     weights_b_json TEXT DEFAULT '{}',
                     weights_net_json TEXT DEFAULT '{}',
-                    skipped_reasons_json TEXT DEFAULT '{}'
+                    skipped_reasons_json TEXT DEFAULT '{}',
+                    prices_json TEXT DEFAULT '{}'
+                );
+            """)
+            try:
+                conn.execute("ALTER TABLE v2_decisions ADD COLUMN prices_json TEXT DEFAULT '{}';")
+            except Exception:
+                pass
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS v2_income_ledger (
+                    tran_id VARCHAR(64) PRIMARY KEY,
+                    ts_ms BIGINT NOT NULL,
+                    ts_utc DATETIME NOT NULL,
+                    income_type VARCHAR(24) NOT NULL,
+                    symbol VARCHAR(24) DEFAULT '',
+                    income_usdt FLOAT NOT NULL,
+                    info VARCHAR(64) DEFAULT ''
+                );
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_v2_inc_ts ON v2_income_ledger(ts_utc, income_type);")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS v2_hourly_attribution (
+                    candle_ts VARCHAR(32) PRIMARY KEY,
+                    prev_candle_ts VARCHAR(32) DEFAULT '',
+                    equity_prev FLOAT DEFAULT 0.0,
+                    port_ret_1h FLOAT DEFAULT 0.0,
+                    sleeve_a_pnl FLOAT DEFAULT 0.0,
+                    sleeve_b_pnl FLOAT DEFAULT 0.0,
+                    sleeve_c_pnl FLOAT DEFAULT 0.0,
+                    sleeve_d_pnl FLOAT DEFAULT 0.0,
+                    fac_mom_pnl FLOAT DEFAULT 0.0,
+                    fac_carry_pnl FLOAT DEFAULT 0.0,
+                    fac_bab_pnl FLOAT DEFAULT 0.0,
+                    fac_flow_pnl FLOAT DEFAULT 0.0,
+                    fac_spot_pnl FLOAT DEFAULT 0.0,
+                    fac_smart_oi_pnl FLOAT DEFAULT 0.0
                 );
             """)
             conn.execute("""
@@ -227,7 +270,89 @@ class DatabaseService(IService):
                 );
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_arena_ts ON shadow_arena_snapshots(candle_ts);")
+            self._migrate_historical_artifacts_conn(conn)
             conn.commit()
+
+    @staticmethod
+    def _migrate_historical_artifacts_conn(conn: sqlite3.Connection) -> Dict[str, int]:
+        """Ідемпотентно позначає історичні артефакти 21-25.11 (`is_artifact=1`), зберігаючи сирі записи недоторканими."""
+        marked_trades = 0
+        marked_snaps = 0
+        try:
+            # 1. Дублікати стопів із однаковим (symbol, order_id) при непорожньому order_id
+            cur1 = conn.execute("""
+                UPDATE trades SET is_artifact = 1
+                WHERE COALESCE(is_artifact, 0) = 0
+                  AND order_id IS NOT NULL AND order_id != ''
+                  AND (note LIKE '%STOP%' OR note LIKE '%MFE%')
+                  AND id NOT IN (
+                      SELECT MIN(id) FROM trades
+                      WHERE order_id IS NOT NULL AND order_id != ''
+                        AND (note LIKE '%STOP%' OR note LIKE '%MFE%')
+                      GROUP BY symbol, order_id
+                  )
+            """)
+            marked_trades += max(0, cur1.rowcount or 0)
+
+            # 2. Фейкові записи MFE_HARVESTER_TP та старі вхідні дублі за 23.11 13:50..15:10 UTC (коли в V6.1 не існувало TP)
+            cur2 = conn.execute("""
+                UPDATE trades SET is_artifact = 1
+                WHERE COALESCE(is_artifact, 0) = 0
+                  AND timestamp >= '2026-11-23 13:50:00' AND timestamp <= '2026-11-23 15:10:00'
+                  AND (
+                      note = 'MFE_HARVESTER_TP'
+                      OR (symbol = 'SOLUSDT' AND ABS(amount_btc - 0.42) < 1e-6 AND ABS(price - 68.86) < 1e-4)
+                  )
+            """)
+            marked_trades += max(0, cur2.rowcount or 0)
+
+            # 3. Поодинокі $500.00-тики в equity_snapshots після SIGKILL-рестарту (коли сусіди > $508.00)
+            snaps = conn.execute(
+                "SELECT id, timestamp, balance_usdt, total_equity, unrealized_pnl, gross_leverage "
+                "FROM equity_snapshots ORDER BY id ASC"
+            ).fetchall()
+            eq_vals = [
+                float(r["total_equity"]) if (r["total_equity"] and float(r["total_equity"]) > 0)
+                else (float(r["balance_usdt"]) + float(r["unrealized_pnl"] or 0.0))
+                for r in snaps
+            ]
+            art_ids: List[int] = []
+            for idx in range(1, len(snaps)):
+                ev = eq_vals[idx]
+                prv = eq_vals[idx - 1]
+                nxt = eq_vals[idx + 1] if (idx + 1) < len(snaps) else prv
+                ts_s = str(snaps[idx]["timestamp"])
+                g_lev = float(snaps[idx]["gross_leverage"] or 0.0)
+                # Точне скидання в 500.0000 при рестарті без якоря (після стартового снапшота V6.1 2026-11-22 16:02)
+                if abs(ev - 500.0) < 1e-6 and ts_s > "2026-11-22 16:02:00" and (abs(prv - 500.0) > 0.05 or abs(nxt - 500.0) > 0.05):
+                    art_ids.append(int(snaps[idx]["id"]))
+                elif abs(ev - 500.0) < 0.05 and prv > 508.0 and nxt > 508.0:
+                    art_ids.append(int(snaps[idx]["id"]))
+                elif g_lev < 0.01 and abs(ev - 500.0) < 0.05 and prv > 508.0:
+                    art_ids.append(int(snaps[idx]["id"]))
+            if art_ids:
+                q_marks = ",".join("?" for _ in art_ids)
+                cur3 = conn.execute(
+                    f"UPDATE equity_snapshots SET is_artifact = 1 WHERE COALESCE(is_artifact, 0) = 0 AND id IN ({q_marks})",
+                    tuple(art_ids),
+                )
+                marked_snaps += max(0, cur3.rowcount or 0)
+
+            # 4. Видалення мертвих нульових пар V58 (WIFUSDT, RENDERUSDT, ORDIUSDT, ICPUSDT) із таблиці coin_states
+            conn.execute("""
+                DELETE FROM coin_states
+                WHERE symbol IN ('WIFUSDT', 'RENDERUSDT', 'ORDIUSDT', 'ICPUSDT')
+                  AND ABS(COALESCE(position_qty, 0.0)) <= 1e-12
+            """)
+        except Exception:
+            pass
+        return {"marked_trades": marked_trades, "marked_snapshots": marked_snaps}
+
+    def migrate_historical_artifacts(self) -> Dict[str, int]:
+        with self._connect() as conn:
+            res = self._migrate_historical_artifacts_conn(conn)
+            conn.commit()
+            return res
 
     async def shutdown(self) -> None:
         try:
@@ -246,18 +371,30 @@ class DatabaseService(IService):
         pnl: float = 0.0,
         fee: float = 0.0,
         note: str = "",
-    ) -> None:
-        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        action: str = "",
+        timestamp_override: Optional[str] = None,
+    ) -> bool:
+        now_str = str(timestamp_override or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
+        oid = str(order_id or "").strip()
+        sym_u = symbol.upper()
         try:
             with self._connect() as conn:
+                if oid:
+                    dup = conn.execute(
+                        "SELECT id FROM trades WHERE symbol = ? AND order_id = ? AND COALESCE(is_artifact, 0) = 0 LIMIT 1",
+                        (sym_u, oid),
+                    ).fetchone()
+                    if dup is not None and ("STOP" in note.upper() or "CLOSE_" in action.upper()):
+                        return False
                 conn.execute(
-                    "INSERT INTO trades (timestamp, symbol, order_id, side, amount_btc, price, realized_pnl, fee_usdt, note) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (now_str, symbol.upper(), str(order_id or ""), side.upper(), float(amount), float(price), float(pnl), float(fee), note[:115]),
+                    "INSERT INTO trades (timestamp, symbol, order_id, side, action, amount_btc, price, realized_pnl, fee_usdt, note, is_artifact) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                    (now_str, sym_u, oid, side.upper(), str(action or "")[:24], float(amount), float(price), float(pnl), float(fee), note[:115]),
                 )
                 conn.commit()
+                return True
         except Exception:
-            pass
+            return False
 
     def record_snapshot(
         self,
@@ -318,6 +455,13 @@ class DatabaseService(IService):
                             int(c["bars_held"]),
                         ),
                     )
+                if len(coins_radar) >= 5:
+                    active_syms = [str(c["symbol"]).upper() for c in coins_radar]
+                    q_marks = ",".join("?" for _ in active_syms)
+                    conn.execute(
+                        f"DELETE FROM coin_states WHERE ABS(COALESCE(position_qty, 0.0)) <= 1e-12 AND symbol NOT IN ({q_marks})",
+                        tuple(active_syms),
+                    )
                 conn.commit()
         except Exception:
             pass
@@ -327,7 +471,8 @@ class DatabaseService(IService):
         try:
             with self._connect() as conn:
                 row = conn.execute(
-                    "SELECT COALESCE(SUM(realized_pnl - COALESCE(fee_usdt, 0.0)), 0.0) AS dpnl FROM trades WHERE timestamp >= ?",
+                    "SELECT COALESCE(SUM(realized_pnl - COALESCE(fee_usdt, 0.0)), 0.0) AS dpnl "
+                    "FROM trades WHERE COALESCE(is_artifact, 0) = 0 AND timestamp >= ?",
                     (cutoff,),
                 ).fetchone()
                 return float(row["dpnl"]) if row else 0.0
@@ -340,15 +485,17 @@ class DatabaseService(IService):
                 if symbol:
                     rows = conn.execute(
                         "SELECT timestamp, COALESCE(symbol, 'BTCUSDT') AS symbol, UPPER(side) AS side, "
-                        "amount_btc, price, COALESCE(realized_pnl, 0.0) AS pnl, COALESCE(fee_usdt, 0.0) AS fee, "
-                        "COALESCE(note, 'QuantCore') AS note FROM trades WHERE symbol = ? ORDER BY timestamp DESC LIMIT ?",
+                        "COALESCE(action, '') AS action, amount_btc, price, COALESCE(realized_pnl, 0.0) AS pnl, "
+                        "COALESCE(fee_usdt, 0.0) AS fee, COALESCE(note, 'QuantCore') AS note "
+                        "FROM trades WHERE COALESCE(is_artifact, 0) = 0 AND symbol = ? ORDER BY timestamp DESC LIMIT ?",
                         (symbol.upper(), int(limit)),
                     ).fetchall()
                 else:
                     rows = conn.execute(
                         "SELECT timestamp, COALESCE(symbol, 'BTCUSDT') AS symbol, UPPER(side) AS side, "
-                        "amount_btc, price, COALESCE(realized_pnl, 0.0) AS pnl, COALESCE(fee_usdt, 0.0) AS fee, "
-                        "COALESCE(note, 'QuantCore') AS note FROM trades ORDER BY timestamp DESC LIMIT ?",
+                        "COALESCE(action, '') AS action, amount_btc, price, COALESCE(realized_pnl, 0.0) AS pnl, "
+                        "COALESCE(fee_usdt, 0.0) AS fee, COALESCE(note, 'QuantCore') AS note "
+                        "FROM trades WHERE COALESCE(is_artifact, 0) = 0 ORDER BY timestamp DESC LIMIT ?",
                         (int(limit),),
                     ).fetchall()
 
@@ -357,6 +504,7 @@ class DatabaseService(IService):
                         "time": str(r["timestamp"])[:19],
                         "symbol": r["symbol"],
                         "side": r["side"],
+                        "action": r["action"] or r["side"],
                         "amount": round(float(r["amount_btc"]), 4),
                         "price": round(float(r["price"]), 4),
                         "pnl": round(float(r["pnl"]), 2),
@@ -376,7 +524,7 @@ class DatabaseService(IService):
                 rows = conn.execute(
                     "SELECT timestamp, balance_usdt, btc_price, total_equity, unrealized_pnl, "
                     "model_action, COALESCE(gross_leverage, 0.0) AS gross_lev "
-                    "FROM equity_snapshots WHERE balance_usdt > 0 AND timestamp >= ? ORDER BY timestamp ASC",
+                    "FROM equity_snapshots WHERE COALESCE(is_artifact, 0) = 0 AND balance_usdt > 0 AND timestamp >= ? ORDER BY timestamp ASC",
                     (cutoff,),
                 ).fetchall()
 
@@ -384,7 +532,7 @@ class DatabaseService(IService):
                     rows = conn.execute(
                         "SELECT timestamp, balance_usdt, btc_price, total_equity, unrealized_pnl, "
                         "model_action, COALESCE(gross_leverage, 0.0) AS gross_lev "
-                        "FROM equity_snapshots WHERE balance_usdt > 0 ORDER BY timestamp ASC LIMIT 500"
+                        "FROM equity_snapshots WHERE COALESCE(is_artifact, 0) = 0 AND balance_usdt > 0 ORDER BY timestamp ASC LIMIT 500"
                     ).fetchall()
 
                 tr_stats = conn.execute(
@@ -393,9 +541,14 @@ class DatabaseService(IService):
                     "SUM(CASE WHEN realized_pnl != 0 THEN 1 ELSE 0 END) AS closed_cnt, "
                     "COALESCE(SUM(fee_usdt), 0.0) AS tot_fee, "
                     "COALESCE(SUM(realized_pnl - COALESCE(fee_usdt, 0.0)), 0.0) AS net_realized "
-                    "FROM trades WHERE timestamp >= ?",
+                    "FROM trades WHERE COALESCE(is_artifact, 0) = 0 AND timestamp >= ?",
                     (cutoff,),
                 ).fetchone()
+                tr_pnl_rows = conn.execute(
+                    "SELECT realized_pnl - COALESCE(fee_usdt, 0.0) AS net_p FROM trades "
+                    "WHERE COALESCE(is_artifact, 0) = 0 AND realized_pnl != 0 AND timestamp >= ?",
+                    (cutoff,),
+                ).fetchall()
 
             if not rows:
                 return {"ok": True, "series": [], "kpis": {}}
@@ -472,22 +625,18 @@ class DatabaseService(IService):
             total_pnl_pct = float(eq_ret_pct[-1])
             btc_bh_pct = float(btc_ret_pct[-1])
             alpha_pct = total_pnl_pct - btc_bh_pct
-            max_dd = float(np.min(dd_pct))
-
-            if len(eq_arr) > 5:
-                log_rets = np.diff(np.log(np.maximum(eq_arr, 1.0)))
-                std_r = float(np.std(log_rets))
-                bars_per_year = (365.0 * 24.0 * 60.0) / max(1.0, float(settings.CANDLE_INTERVAL_MINUTES))
-                sharpe = float(math.sqrt(bars_per_year) * (float(np.mean(log_rets)) / std_r)) if std_r > 1e-9 else 0.0
-            else:
-                sharpe = 0.0
-
-            calmar = total_pnl_pct / max(1.0, abs(max_dd))
+            closed_pnls = [float(r["net_p"] or 0.0) for r in tr_pnl_rows] if tr_pnl_rows else []
+            perf = compute_unified_performance_metrics(
+                timestamps=[str(r["timestamp"]) for r in rows],
+                equities=[float(x) for x in eq_arr],
+                trade_pnls=closed_pnls,
+            )
+            max_dd = float(perf["max_drawdown_pct"])
+            sharpe = float(perf["sharpe_ratio"])
+            calmar = float(perf["calmar_ratio"])
 
             total_ops = int(tr_stats["cnt"] or 0) if tr_stats else 0
-            closed_cnt = int(tr_stats["closed_cnt"] or 0) if tr_stats else 0
-            wins_cnt = int(tr_stats["wins"] or 0) if tr_stats else 0
-            win_rate = (wins_cnt / closed_cnt * 100.0) if closed_cnt > 0 else 0.0
+            win_rate = float(perf["win_rate_pct"])
             tot_fee = float(tr_stats["tot_fee"] or 0.0) if tr_stats else 0.0
             net_realized = float(tr_stats["net_realized"] or 0.0) if tr_stats else 0.0
 
@@ -502,6 +651,11 @@ class DatabaseService(IService):
                     "btc_price": round(latest_btc, 2),
                     "max_drawdown_pct": round(max_dd, 2),
                     "sharpe_ratio": round(sharpe, 2),
+                    "sharpe_is_provisional": bool(perf["sharpe_is_provisional"]),
+                    "sharpe_label": str(perf["sharpe_label"]),
+                    "sharpe_non_annualized": float(perf["sharpe_non_annualized"]),
+                    "sortino_ratio": float(perf["sortino_ratio"]),
+                    "profit_factor": float(perf["profit_factor"]),
                     "calmar_ratio": round(calmar, 2),
                     "total_ops": total_ops,
                     "win_rate_pct": round(win_rate, 1),
@@ -643,18 +797,25 @@ class DatabaseService(IService):
         if skipped_exec:
             skipped.update(skipped_exec)
 
+        prices_map = extra_telemetry.get("signal_prices") or extra_telemetry.get("prices") or {}
         w_a_store = w_a if not (w_c or w_d or w_e) else {**w_a, "__weights_c__": w_c, "__weights_d__": w_d, "__weights_e__": w_e}
 
+        attr_step: Optional[Dict[str, float]] = None
         try:
             with self._connect() as conn:
+                prev_row = conn.execute(
+                    "SELECT candle_ts, equity, raw_factors_json, weights_a_json, weights_b_json, weights_net_json, prices_json "
+                    "FROM v2_decisions WHERE candle_ts < ? ORDER BY candle_ts DESC, id DESC LIMIT 1",
+                    (str(candle_ts),),
+                ).fetchone()
                 conn.execute(
                     """
                     INSERT INTO v2_decisions (
                         recorded_at, candle_ts, equity, wallet_balance, upnl, tier,
                         gross_b_scale, overlay_scale, btc_trend_200, market_breadth,
                         rebalanced_flag, raw_factors_json, weights_a_json,
-                        weights_b_json, weights_net_json, skipped_reasons_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        weights_b_json, weights_net_json, skipped_reasons_json, prices_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         now_str, str(candle_ts), float(equity), float(wallet_balance), float(upnl),
@@ -664,8 +825,46 @@ class DatabaseService(IService):
                         json.dumps(w_b, separators=(",", ":")),
                         json.dumps(w_net, separators=(",", ":")),
                         json.dumps(skipped, separators=(",", ":")),
+                        json.dumps(prices_map, separators=(",", ":")),
                     ),
                 )
+                if prev_row is not None and prices_map:
+                    prev_prices = json.loads(prev_row["prices_json"] or "{}")
+                    if prev_prices:
+                        prev_wa_raw = json.loads(prev_row["weights_a_json"] or "{}")
+                        prev_wc = prev_wa_raw.pop("__weights_c__", {}) if isinstance(prev_wa_raw, dict) else {}
+                        prev_wd = prev_wa_raw.pop("__weights_d__", {}) if isinstance(prev_wa_raw, dict) else {}
+                        prev_wa_raw.pop("__weights_e__", None)
+                        prev_wb = json.loads(prev_row["weights_b_json"] or "{}")
+                        prev_wn = json.loads(prev_row["weights_net_json"] or "{}")
+                        prev_fac = json.loads(prev_row["raw_factors_json"] or "{}")
+                        attr_step = compute_hourly_attribution_step(
+                            prev_equity=float(prev_row["equity"] or equity),
+                            prev_weights_a=prev_wa_raw,
+                            prev_weights_b=prev_wb,
+                            prev_weights_c=prev_wc,
+                            prev_weights_d=prev_wd,
+                            prev_factors=prev_fac,
+                            prev_prices=prev_prices,
+                            curr_prices=prices_map,
+                            prev_weights_net=prev_wn if isinstance(prev_wn, dict) else None,
+                        )
+                        conn.execute(
+                            """
+                            INSERT OR REPLACE INTO v2_hourly_attribution (
+                                candle_ts, prev_candle_ts, equity_prev, port_ret_1h,
+                                sleeve_a_pnl, sleeve_b_pnl, sleeve_c_pnl, sleeve_d_pnl,
+                                fac_mom_pnl, fac_carry_pnl, fac_bab_pnl, fac_flow_pnl, fac_spot_pnl, fac_smart_oi_pnl
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                str(candle_ts), str(prev_row["candle_ts"]), float(prev_row["equity"] or equity),
+                                attr_step["port_ret_1h"], attr_step["sleeve_a_pnl"], attr_step["sleeve_b_pnl"],
+                                attr_step["sleeve_c_pnl"], attr_step["sleeve_d_pnl"], attr_step["fac_mom_pnl"],
+                                attr_step["fac_carry_pnl"], attr_step["fac_bab_pnl"], attr_step["fac_flow_pnl"],
+                                attr_step["fac_spot_pnl"], attr_step["fac_smart_oi_pnl"],
+                            ),
+                        )
                 conn.commit()
         except Exception:
             pass
@@ -688,8 +887,154 @@ class DatabaseService(IService):
             "weights_e": w_e,
             "weights_net": w_net,
             "factors": factors,
+            "prices": prices_map,
+            "attribution": attr_step or {},
             "skipped": skipped,
         })
+
+    def record_v2_income_ledger(self, events: List[Dict[str, Any]]) -> int:
+        """Зберігає канонічні події Binance fapiPrivateGetIncome (REALIZED_PNL, COMMISSION, FUNDING_FEE) за tranId."""
+        if not events:
+            return 0
+        inserted = 0
+        try:
+            with self._connect() as conn:
+                for ev in events:
+                    tid = str(ev.get("tran_id") or "").strip()
+                    itype = str(ev.get("income_type") or "").strip().upper()
+                    t_ms = int(ev.get("ts_ms") or 0)
+                    if not tid or not itype or t_ms <= 0:
+                        continue
+                    t_str = datetime.fromtimestamp(t_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                    cur = conn.execute(
+                        """
+                        INSERT OR IGNORE INTO v2_income_ledger (tran_id, ts_ms, ts_utc, income_type, symbol, income_usdt, info)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            tid, t_ms, t_str, itype,
+                            str(ev.get("symbol") or "").upper(),
+                            float(ev.get("income_usdt") or 0.0),
+                            str(ev.get("info") or "")[:60],
+                        ),
+                    )
+                    if cur.rowcount and cur.rowcount > 0:
+                        inserted += 1
+                conn.commit()
+        except Exception:
+            pass
+        return inserted
+
+    def compute_equity_bridge(
+        self,
+        actual_equity: float,
+        current_wallet: float,
+        current_upnl: float,
+        demo_anchor: float = 0.0,
+        virtual_cap: float = 0.0,
+        since_ts: str = "2026-11-22 16:00:00",
+    ) -> Dict[str, Any]:
+        """Зводить бухгалтерський баланс рахунку за канонічними таблицями v2_decisions + v2_income_ledger/trades."""
+        try:
+            with self._connect() as conn:
+                d0 = None
+                if demo_anchor > 0.0:
+                    d0 = conn.execute(
+                        "SELECT candle_ts, recorded_at, equity, wallet_balance, upnl FROM v2_decisions "
+                        "WHERE recorded_at >= ? AND ("
+                        "  ABS((wallet_balance + upnl) - ?) < 0.02 "
+                        "  OR ABS(wallet_balance - ?) < 0.02"
+                        ") ORDER BY id ASC LIMIT 1",
+                        (since_ts, float(demo_anchor), float(demo_anchor)),
+                    ).fetchone()
+                if d0 is None:
+                    d0 = conn.execute(
+                        "SELECT candle_ts, recorded_at, equity, wallet_balance, upnl FROM v2_decisions "
+                        "WHERE recorded_at >= ? OR candle_ts >= ? ORDER BY id ASC LIMIT 1",
+                        (since_ts, since_ts),
+                    ).fetchone()
+                if d0 is not None:
+                    start_eq = float(d0["equity"])
+                    w0 = float(d0["wallet_balance"])
+                    u0 = float(d0["upnl"])
+                    rec0 = str(d0["recorded_at"])
+                else:
+                    start_eq = float(virtual_cap if virtual_cap > 0 else actual_equity)
+                    w0 = float(current_wallet)
+                    u0 = float(current_upnl)
+                    rec0 = since_ts
+
+                try:
+                    rec0_ms = int(
+                        datetime.strptime(rec0[:19], "%Y-%m-%d %H:%M:%S")
+                        .replace(tzinfo=timezone.utc)
+                        .timestamp() * 1000
+                    )
+                except Exception:
+                    rec0_ms = 0
+
+                # Перевіряємо наявність точного біржового реєстру v2_income_ledger (відсікаємо події до моменту фіксації w0!)
+                inc_rows = conn.execute(
+                    "SELECT income_type, COALESCE(SUM(income_usdt), 0.0) AS s, COUNT(*) AS c "
+                    "FROM v2_income_ledger WHERE ts_ms > ? GROUP BY income_type",
+                    (rec0_ms,),
+                ).fetchall()
+                inc_map = {str(r["income_type"]): (float(r["s"] or 0.0), int(r["c"] or 0)) for r in inc_rows}
+
+                if sum(v[1] for v in inc_map.values()) > 0:
+                    realized_gross = inc_map.get("REALIZED_PNL", (0.0, 0))[0]
+                    net_funding = inc_map.get("FUNDING_FEE", (0.0, 0))[0]
+                    fees_abs = abs(inc_map.get("COMMISSION", (0.0, 0))[0])
+                    source = "exchange_income_ledger"
+                else:
+                    tr_r = conn.execute(
+                        "SELECT COALESCE(SUM(realized_pnl), 0.0) AS rp, COALESCE(SUM(fee_usdt), 0.0) AS fe "
+                        "FROM trades WHERE COALESCE(is_artifact, 0) = 0 AND timestamp >= ?",
+                        (rec0,),
+                    ).fetchone()
+                    fn_r = conn.execute(
+                        "SELECT COALESCE(SUM(income_usdt), 0.0) AS fn FROM v2_funding_ledger WHERE funding_time >= ?",
+                        (rec0,),
+                    ).fetchone()
+                    realized_gross = float(tr_r["rp"] or 0.0) if tr_r else 0.0
+                    fees_abs = abs(float(tr_r["fe"] or 0.0)) if tr_r else 0.0
+                    net_funding = float(fn_r["fn"] or 0.0) if fn_r else 0.0
+                    source = "trades_and_funding_fallback"
+
+                # На віртуальному демо-ліміті ($500) корекція старт-якоря враховує точний старт d0:
+                if virtual_cap > 0 and demo_anchor > 0 and d0 is not None:
+                    if abs(w0 - float(demo_anchor)) < 0.02:
+                        eff_start_eq = float(virtual_cap)
+                    else:
+                        eff_start_eq = float(virtual_cap) + (w0 + u0 - float(demo_anchor))
+                else:
+                    eff_start_eq = start_eq
+                delta_upnl = float(current_upnl) - u0
+
+                bridge = compute_equity_bridge_dict(
+                    start_equity=eff_start_eq,
+                    actual_equity=float(actual_equity),
+                    realized_pnl_gross=realized_gross,
+                    delta_unrealized_pnl=delta_upnl,
+                    net_funding_usd=net_funding,
+                    total_fees_usd=fees_abs,
+                )
+                bridge["source"] = source
+                bridge["anchor_timestamp"] = rec0
+                return bridge
+        except Exception as e:
+            return {
+                "start_equity": float(actual_equity),
+                "realized_pnl_usd": 0.0,
+                "unrealized_pnl_delta_usd": 0.0,
+                "net_funding_usd": 0.0,
+                "total_fees_usd": 0.0,
+                "expected_equity": float(actual_equity),
+                "actual_equity": float(actual_equity),
+                "accounting_diff_usd": 0.0,
+                "within_tolerance": True,
+                "error": str(e),
+            }
 
     def record_v2_execution(
         self,

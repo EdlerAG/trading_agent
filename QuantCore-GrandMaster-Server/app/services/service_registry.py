@@ -31,7 +31,7 @@ class _NoOpOnlineLearner:
         return {}
 
     def get_summary_dict(self) -> dict:
-        return {"enabled": False}
+        return {"status": "DISABLED_BY_CONFIG", "enabled": False}
 
     def save_state(self) -> None:
         pass
@@ -54,7 +54,7 @@ class _NoOpNewsService:
         return {"macro_sentiment": 0.0, "is_geo_shock": False, "geo_shock_prob": 0.0, "headlines": [], "coin_bias": {}}
 
     def get_cached_info(self) -> dict:
-        return {"enabled": False, "macro_sentiment": 0.0, "is_geo_shock": False, "geo_shock_prob": 0.0, "headlines": []}
+        return {"status": "DISABLED_BY_CONFIG", "enabled": False, "macro_sentiment": 0.0, "is_geo_shock": False, "geo_shock_prob": 0.0, "headlines": []}
 
 
 class ApplicationContainer:
@@ -203,7 +203,10 @@ class ApplicationContainer:
                 await srv.shutdown()
             except Exception:
                 pass
-        await http_pool.close()
+        try:
+            await asyncio.wait_for(http_pool.close(), timeout=2.5)
+        except Exception:
+            pass
         memory_guard.trim_ram()
 
 

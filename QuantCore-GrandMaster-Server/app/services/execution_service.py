@@ -13,6 +13,8 @@ from app.core.config import settings
 from app.core.http_client import http_pool
 from app.core.memory_guard import memory_guard
 from app.domain.interfaces import IService, IExchangeGateway, IOnlineLearner
+from app.domain.schemas import CoinStateDTO
+from app.services.research_lake_service import research_lake
 from app.services.state_service import StateService
 from app.services.database_service import DatabaseService
 from app.cartridges.cartridge_loader import CartridgeLoaderService
@@ -42,6 +44,9 @@ class MultiAssetExecutionOrchestrator(IService):
         "_last_backup_date",
         "_last_daily_report_date",
         "_last_funding_poll_ts",
+        "_last_income_backfill_done",
+        "_last_ntp_alert_ts",
+        "_last_ntp_skew_ms",
         "_demo_wallet_anchor",
     )
 
@@ -73,6 +78,9 @@ class MultiAssetExecutionOrchestrator(IService):
         self._last_backup_date = datetime.now(timezone.utc).date()
         self._last_daily_report_date = datetime.now(timezone.utc).date()
         self._last_funding_poll_ts: float = 0.0
+        self._last_income_backfill_done: bool = False
+        self._last_ntp_alert_ts: float = 0.0
+        self._last_ntp_skew_ms: Optional[int] = None
         self._demo_wallet_anchor: float = 0.0
 
     async def _emit_heartbeat(self, status: str, candle_ts: str, equity: float, active_cnt: int) -> None:
@@ -88,6 +96,8 @@ class MultiAssetExecutionOrchestrator(IService):
                 "candle_ts": candle_ts,
                 "equity": round(float(equity), 2),
                 "active_positions": int(active_cnt),
+                "balance_synced": bool(getattr(self._state, "balance_synced", False)),
+                "ntp_clock_skew_ms": self._last_ntp_skew_ms,
             }
             tmp_p.write_text(json.dumps(payload), encoding="utf-8")
             os.replace(tmp_p, hb_path)
@@ -123,7 +133,16 @@ class MultiAssetExecutionOrchestrator(IService):
         await self._send_alert(f"⚠️ <b>Збій ітерації свічки:</b>\n<code>{err_text[:300]}</code>")
 
     async def init(self) -> None:
-        self._state.sync_supported_symbols(self._cartridges.cartridge.supported_symbols)
+        raw_syms = self._cartridges.cartridge.supported_symbols
+        fn_listed = getattr(self._exchange, "is_symbol_listed", None)
+        if callable(fn_listed) and not hasattr(self._exchange, "_mock_name"):
+            listed_syms = tuple(s for s in raw_syms if fn_listed(s) is not False)
+            for s_all in list(self._state.coins.keys()):
+                if fn_listed(s_all) is False and abs(float(self._state.coins[s_all].current_pos_qty or 0.0)) <= 0.0:
+                    self._state.coins.pop(s_all, None)
+            self._state.sync_supported_symbols(listed_syms)
+        else:
+            self._state.sync_supported_symbols(raw_syms)
 
     async def shutdown(self) -> None:
         pass
@@ -292,11 +311,32 @@ class MultiAssetExecutionOrchestrator(IService):
         if not is_sync_ok or usdt_balance <= 0.0:
             self._logger.warning("⚠️ Тимчасовий збій синхронізації балансу. Пропуск ребалансу без скидання ордерів.")
             return
+        if hasattr(self._state, "balance_synced"):
+            self._state.balance_synced = True
+
+        # Реконсиляція будь-яких реальних біржових позицій, відсутніх у локальному словнику state.coins
+        for ex_sym, ex_pos_obj in (ex_positions or {}).items():
+            if ex_pos_obj is not None and abs(float(ex_pos_obj.contracts_qty or 0.0)) > 1e-12 and ex_sym not in self._state.coins:
+                self._state.coins[ex_sym] = CoinStateDTO(
+                    symbol=ex_sym,
+                    current_pos_qty=float(ex_pos_obj.contracts_qty),
+                    entry_price=float(ex_pos_obj.entry_price or 0.0),
+                    dominant_book="ORPHAN_RECONCILED",
+                )
+                self._logger.warning(
+                    f"⚠️ [{ex_sym}] Знайдено позапанельну біржову позицію {ex_pos_obj.contracts_qty:+.4f} -> приєднано як ORPHAN_RECONCILED."
+                )
 
         if settings.USE_DEMO_TRADING and settings.VIRTUAL_EQUITY_CAP > 0.0:
             raw_demo_eq = float(usdt_balance) + float(total_upnl)
+            persisted_anchor = float(getattr(self._state, "demo_wallet_anchor", 0.0) or 0.0)
+            if self._demo_wallet_anchor <= 0.0 and persisted_anchor > 0.0:
+                self._demo_wallet_anchor = persisted_anchor
             if self._demo_wallet_anchor <= 0.0:
                 self._demo_wallet_anchor = raw_demo_eq
+                if hasattr(self._state, "demo_wallet_anchor"):
+                    self._state.demo_wallet_anchor = raw_demo_eq
+                    self._state.save_snapshot()
             demo_net_delta = raw_demo_eq - self._demo_wallet_anchor
             total_equity = max(10.0, float(settings.VIRTUAL_EQUITY_CAP) + demo_net_delta)
         else:
@@ -321,21 +361,42 @@ class MultiAssetExecutionOrchestrator(IService):
 
             # Якщо біржа закрила позицію по Stop-Loss між свічками — фіксуємо PnL, активуємо 48h кулдаун і сповіщаємо!
             if abs(real_qty) < min_qty and abs(c_st.current_pos_qty) >= min_qty:
-                prev_side = 1 if c_st.current_pos_qty > 0 else -1
+                prev_qty = float(c_st.current_pos_qty)
+                prev_entry_px = float(c_st.entry_price or 0.0)
+                prev_sl_px = float(c_st.active_sl_price or 0.0)
+                prev_bars = max(1, int(c_st.bars_held or 1))
+                prev_side = 1 if prev_qty > 0 else -1
                 if hasattr(cartridge, "register_exchange_stop_hit"):
                     try:
                         cartridge.register_exchange_stop_hit(sym, prev_side)
                         self._logger.info(
                             f"🛡️ [StopCooldown] [{sym}] Зовнішнє закриття позиції (side={prev_side:+d}) -> "
-                            f"48h stop_cooldown зафіксовано у LiveState."
+                            f"{settings.SL_COOLDOWN_HOURS}h stop_cooldown зафіксовано у LiveState."
                         )
                     except Exception as cd_err:
                         self._logger.warning(f"⚠️ [{sym}] Помилка фіксації stop_cooldown: {cd_err}")
                 if hasattr(self._exchange, "sync_exchange_stop_closure"):
-                    sl_info = await self._exchange.sync_exchange_stop_closure(sym)
+                    approx_entry_ms = int((time.time() - (prev_bars + 2) * float(settings.CANDLE_INTERVAL_MINUTES) * 60.0) * 1000)
+                    _sync_sig = inspect.signature(self._exchange.sync_exchange_stop_closure).parameters
+                    if "prev_pos_qty" in _sync_sig:
+                        sl_info = await self._exchange.sync_exchange_stop_closure(
+                            sym, prev_pos_qty=prev_qty, since_ms=approx_entry_ms
+                        )
+                    else:
+                        sl_info = await self._exchange.sync_exchange_stop_closure(sym)
                     if sl_info:
                         closed_q, avg_p, r_pnl = sl_info
-                        if r_pnl >= 0.0 and not is_multi_sleeve_family:
+                        research_lake.record_stop_tp_event(
+                            symbol=sym,
+                            event_type="TP_HIT" if r_pnl > 0.0 else "STOP_HIT",
+                            side="LONG" if prev_side > 0 else "SHORT",
+                            trigger_price=prev_sl_px,
+                            fill_price=avg_p,
+                            qty=closed_q,
+                            realized_pnl=r_pnl,
+                            entry_price=prev_entry_px,
+                        )
+                        if r_pnl > 0.0 and not is_multi_sleeve_family:
                             await self._send_alert(
                                 f"🎯 <b>[{sym}] Фіксація прибутку (Take-Profit / MFE)!</b>\n"
                                 f"• Закрито: <code>{closed_q:.4f}</code> @ <code>${avg_p:,.4f}</code>\n"
@@ -343,7 +404,7 @@ class MultiAssetExecutionOrchestrator(IService):
                             )
                         else:
                             await self._send_alert(
-                                f"🛡️ <b>[{sym}] Спрацював біржовий STOP_MARKET (48h Cooldown активовано)!</b>\n"
+                                f"🛡️ <b>[{sym}] Спрацював біржовий STOP_MARKET ({settings.SL_COOLDOWN_HOURS}h Cooldown активовано)!</b>\n"
                                 f"• Закрито: <code>{closed_q:.4f}</code> @ <code>${avg_p:,.4f}</code>\n"
                                 f"• Фіксований PnL: <b>{r_pnl:+.2f} USDT</b>"
                             )
@@ -352,6 +413,7 @@ class MultiAssetExecutionOrchestrator(IService):
                 c_st.active_sl_price = 0.0
                 c_st.is_breakeven = False
                 c_st.bars_held = 0
+                c_st.dominant_book = ""
             elif abs(real_qty) >= min_qty:
                 if abs(c_st.current_pos_qty) >= min_qty and cur_p > 0 and total_equity > 0:
                     drift_frac = abs(real_qty - c_st.current_pos_qty) * cur_p / total_equity
@@ -369,6 +431,8 @@ class MultiAssetExecutionOrchestrator(IService):
                 c_st.current_pos_qty = real_qty
                 if ex_p and ex_p.entry_price > 0:
                     c_st.entry_price = ex_p.entry_price
+                if getattr(c_st, "dominant_book", "") in ("", "FLAT"):
+                    c_st.dominant_book = "ORPHAN_RECONCILED"
                 if is_new_candle:
                     c_st.bars_held += 1
 
@@ -509,204 +573,289 @@ class MultiAssetExecutionOrchestrator(IService):
                 return None
 
             min_qty, _, _, _, _ = settings.get_symbol_spec(sym)
+            pre_sl_px = float(getattr(c_st, "active_sl_price", 0.0) or 0.0)
+            is_partial_trim_plan = bool(reduce_only and not is_closing_to_cash and not is_flip)
+            sl_handled = False
+            rearm_diag_done = False
 
             if reduce_only or is_closing_to_cash or is_flip:
                 await self._exchange.cancel_symbol_orders(sym)
 
-            ord_kwargs: Dict[str, Any] = {
-                "symbol": sym,
-                "delta_qty": delta_qty,
-                "mark_price": cur_p,
-                "realized_pnl_est": pnl_est,
-                "note": note_str,
-                "reduce_only": reduce_only,
-            }
-            if "maker_first" in _exec_sig_params or _exec_has_varkw:
-                ord_kwargs["maker_first"] = bool(plan.get("maker_first", False))
-            if ("taker_fallback" in _exec_sig_params or _exec_has_varkw) and plan.get("taker_fallback") is not None:
-                ord_kwargs["taker_fallback"] = bool(plan.get("taker_fallback"))
-            if "urgency" in _exec_sig_params and plan.get("urgency"):
-                ord_kwargs["urgency"] = str(plan["urgency"])
-            ord_dto = await self._exchange.execute_smart_rebalance_order(**ord_kwargs)
+            try:
+                ord_kwargs: Dict[str, Any] = {
+                    "symbol": sym,
+                    "delta_qty": delta_qty,
+                    "mark_price": cur_p,
+                    "realized_pnl_est": pnl_est,
+                    "note": note_str,
+                    "reduce_only": reduce_only,
+                }
+                if "maker_first" in _exec_sig_params or _exec_has_varkw:
+                    ord_kwargs["maker_first"] = bool(plan.get("maker_first", False))
+                if ("taker_fallback" in _exec_sig_params or _exec_has_varkw) and plan.get("taker_fallback") is not None:
+                    ord_kwargs["taker_fallback"] = bool(plan.get("taker_fallback"))
+                if "urgency" in _exec_sig_params and plan.get("urgency"):
+                    ord_kwargs["urgency"] = str(plan["urgency"])
+                if "active_sl_price" in _exec_sig_params:
+                    ord_kwargs["active_sl_price"] = pre_sl_px
+                ord_dto = await self._exchange.execute_smart_rebalance_order(**ord_kwargs)
 
-            if ord_dto is None:
-                if is_v2_engine and hasattr(self._db, "record_v2_execution"):
+                if ord_dto is None:
                     diag = self._exchange.get_last_order_diag(sym) if hasattr(self._exchange, "get_last_order_diag") else {}
                     diag = diag if isinstance(diag, dict) else {}
+                    st_diag = str(diag.get("order_status") or "REJECTED")
+                    rearm_diag_done = bool(diag.get("sl_rearmed_after_2022", False))
+                    if is_v2_engine and hasattr(self._db, "record_v2_execution"):
+                        self._db.record_v2_execution(
+                            candle_ts=candle_ts,
+                            symbol=sym,
+                            sleeve_book=sleeve_book_tag,
+                            side="BUY" if delta_qty > 0 else "SELL",
+                            target_qty=abs(float(delta_qty)),
+                            executed_qty=0.0,
+                            signal_close_px=sig_px,
+                            arrival_mid_px=float(diag.get("arrival_mid_px", cur_p) or cur_p),
+                            fill_avg_px=0.0,
+                            spread_bps=float(diag.get("spread_bps", 0.0) or 0.0),
+                            maker_qty=0.0,
+                            taker_qty=0.0,
+                            fee_usdt=0.0,
+                            latency_ms=float(diag.get("latency_ms", 0.0) or 0.0),
+                            order_status=st_diag,
+                        )
+                        research_lake.record_order_lifecycle(
+                            candle_ts=candle_ts,
+                            symbol=sym,
+                            side="BUY" if delta_qty > 0 else "SELL",
+                            sleeve_book=sleeve_book_tag,
+                            signal_price=sig_px,
+                            arrival_bbo_bid=float(diag.get("best_bid", 0.0) or 0.0),
+                            arrival_bbo_ask=float(diag.get("best_ask", 0.0) or 0.0),
+                            limit_placed_price=float(diag.get("limit_placed_price", 0.0) or 0.0),
+                            requotes_count=int(diag.get("requotes_count", 0) or 0),
+                            fill_price=0.0,
+                            maker_qty=0.0,
+                            taker_qty=0.0,
+                            fee_usdt=0.0,
+                            latency_ms=float(diag.get("latency_ms", 0.0) or 0.0),
+                            order_status=st_diag,
+                            fallback_reason=str(diag.get("fallback_reason") or "rejected"),
+                        )
+                    if st_diag == "ALREADY_CLOSED_2022":
+                        c_st.current_pos_qty = 0.0
+                        c_st.entry_price = 0.0
+                        c_st.active_sl_price = 0.0
+                        c_st.is_breakeven = False
+                        c_st.bars_held = 0
+                        sl_handled = True
+                    elif st_diag.startswith("FAILED_2022"):
+                        self._logger.critical(
+                            f"🚨 [{sym}] -2022 Retry НЕ зміг закрити позицію ({st_diag})!"
+                        )
+                        await self._send_alert(
+                            f"🚨 <b>[{sym}] КРИТИЧНО: -2022 Retry не закрив позицію</b>\n"
+                            f"• Статус: <code>{st_diag}</code> | Запит: <code>{delta_qty:+.4f}</code>"
+                        )
+                    self._logger.warning(f"⚠️ [{sym}] Ордер ребалансу не виконано біржею ({st_diag}).")
+                    return None
+
+                diag_ok = self._exchange.get_last_order_diag(sym) if hasattr(self._exchange, "get_last_order_diag") else {}
+                diag_ok = diag_ok if isinstance(diag_ok, dict) else {}
+                rearm_diag_done = bool(diag_ok.get("sl_rearmed_after_2022", False))
+                if is_v2_engine and hasattr(self._db, "record_v2_execution"):
+                    arr_px = float(getattr(ord_dto, "arrival_mid_px", 0.0) or getattr(ord_dto, "arrival_price", 0.0) or cur_p)
+                    mk_q = float(getattr(ord_dto, "maker_qty", 0.0) or 0.0)
+                    tk_q = float(getattr(ord_dto, "taker_qty", 0.0) or 0.0)
+                    if mk_q <= 0.0 and tk_q <= 0.0:
+                        if bool(getattr(ord_dto, "is_maker", False)):
+                            mk_q = float(ord_dto.executed_qty)
+                        else:
+                            tk_q = float(ord_dto.executed_qty)
+                    sp_val = float(getattr(ord_dto, "spread_bps", 0.0) or diag_ok.get("spread_bps", 0.0) or 0.0)
                     self._db.record_v2_execution(
                         candle_ts=candle_ts,
                         symbol=sym,
                         sleeve_book=sleeve_book_tag,
-                        side="BUY" if delta_qty > 0 else "SELL",
+                        side=str(ord_dto.side),
                         target_qty=abs(float(delta_qty)),
-                        executed_qty=0.0,
+                        executed_qty=float(ord_dto.executed_qty),
                         signal_close_px=sig_px,
-                        arrival_mid_px=float(diag.get("arrival_mid_px", cur_p) or cur_p),
-                        fill_avg_px=0.0,
-                        spread_bps=float(diag.get("spread_bps", 0.0) or 0.0),
-                        maker_qty=0.0,
-                        taker_qty=0.0,
-                        fee_usdt=0.0,
-                        latency_ms=float(diag.get("latency_ms", 0.0) or 0.0),
-                        order_status=str(diag.get("order_status") or "REJECTED"),
+                        arrival_mid_px=arr_px,
+                        fill_avg_px=float(ord_dto.avg_price),
+                        spread_bps=sp_val,
+                        maker_qty=mk_q,
+                        taker_qty=tk_q,
+                        fee_usdt=float(getattr(ord_dto, "fee_usdt", 0.0) or 0.0),
+                        latency_ms=float(getattr(ord_dto, "latency_ms", 0.0) or 0.0),
+                        order_status=str(getattr(ord_dto, "order_status", "FILLED") or "FILLED"),
+                        bbo_spread_bps=float(diag_ok.get("bbo_spread_bps", sp_val) or sp_val),
+                        best_bid=float(diag_ok.get("best_bid", 0.0) or 0.0),
+                        best_ask=float(diag_ok.get("best_ask", 0.0) or 0.0),
+                        top5_depth_usd=float(diag_ok.get("top5_depth_usd", 0.0) or 0.0),
                     )
-                self._logger.warning(f"⚠️ [{sym}] Ордер ребалансу не виконано біржею (пропуск до наступної свічки).")
-                return None
+                    research_lake.record_order_lifecycle(
+                        candle_ts=candle_ts,
+                        symbol=sym,
+                        side=str(ord_dto.side),
+                        sleeve_book=sleeve_book_tag,
+                        signal_price=sig_px,
+                        arrival_bbo_bid=float(diag_ok.get("best_bid", 0.0) or 0.0),
+                        arrival_bbo_ask=float(diag_ok.get("best_ask", 0.0) or 0.0),
+                        limit_placed_price=float(diag_ok.get("limit_placed_price", 0.0) or 0.0),
+                        requotes_count=int(diag_ok.get("requotes_count", 0) or 0),
+                        fill_price=float(ord_dto.avg_price),
+                        maker_qty=mk_q,
+                        taker_qty=tk_q,
+                        fee_usdt=float(getattr(ord_dto, "fee_usdt", 0.0) or 0.0),
+                        latency_ms=float(getattr(ord_dto, "latency_ms", 0.0) or 0.0),
+                        order_status=str(getattr(ord_dto, "order_status", "FILLED") or "FILLED"),
+                        fallback_reason=str(diag_ok.get("fallback_reason") or ""),
+                    )
 
-            if is_v2_engine and hasattr(self._db, "record_v2_execution"):
-                arr_px = float(getattr(ord_dto, "arrival_mid_px", 0.0) or getattr(ord_dto, "arrival_price", 0.0) or cur_p)
-                mk_q = float(getattr(ord_dto, "maker_qty", 0.0) or 0.0)
-                tk_q = float(getattr(ord_dto, "taker_qty", 0.0) or 0.0)
-                if mk_q <= 0.0 and tk_q <= 0.0:
-                    # Для mock/зовнішніх шлюзів без розбивки maker_qty/taker_qty
-                    if bool(getattr(ord_dto, "is_maker", False)):
-                        mk_q = float(ord_dto.executed_qty)
-                    else:
-                        tk_q = float(ord_dto.executed_qty)
-                diag_ok = self._exchange.get_last_order_diag(sym) if hasattr(self._exchange, "get_last_order_diag") else {}
-                diag_ok = diag_ok if isinstance(diag_ok, dict) else {}
-                sp_val = float(getattr(ord_dto, "spread_bps", 0.0) or diag_ok.get("spread_bps", 0.0) or 0.0)
-                self._db.record_v2_execution(
-                    candle_ts=candle_ts,
-                    symbol=sym,
-                    sleeve_book=sleeve_book_tag,
-                    side=str(ord_dto.side),
-                    target_qty=abs(float(delta_qty)),
-                    executed_qty=float(ord_dto.executed_qty),
-                    signal_close_px=sig_px,
-                    arrival_mid_px=arr_px,
-                    fill_avg_px=float(ord_dto.avg_price),
-                    spread_bps=sp_val,
-                    maker_qty=mk_q,
-                    taker_qty=tk_q,
-                    fee_usdt=float(getattr(ord_dto, "fee_usdt", 0.0) or 0.0),
-                    latency_ms=float(getattr(ord_dto, "latency_ms", 0.0) or 0.0),
-                    order_status=str(getattr(ord_dto, "order_status", "FILLED") or "FILLED"),
-                    bbo_spread_bps=float(diag_ok.get("bbo_spread_bps", sp_val) or sp_val),
-                    best_bid=float(diag_ok.get("best_bid", 0.0) or 0.0),
-                    best_ask=float(diag_ok.get("best_ask", 0.0) or 0.0),
-                    top5_depth_usd=float(diag_ok.get("top5_depth_usd", 0.0) or 0.0),
-                )
+                old_qty = c_st.current_pos_qty
+                signed_exec = ord_dto.executed_qty if ord_dto.side == "BUY" else -ord_dto.executed_qty
+                rem_qty = old_qty + signed_exec
+                new_pos_qty = 0.0 if abs(rem_qty) < min_qty else rem_qty
 
-            old_qty = c_st.current_pos_qty
-            signed_exec = ord_dto.executed_qty if ord_dto.side == "BUY" else -ord_dto.executed_qty
-            rem_qty = old_qty + signed_exec
-            new_pos_qty = 0.0 if abs(rem_qty) < min_qty else rem_qty
-
-            if abs(new_pos_qty) >= min_qty:
-                if is_opening_from_cash or is_flip:
-                    c_st.entry_price = ord_dto.avg_price
-                    c_st.bars_held = 1
-                    c_st.is_breakeven = False
-                elif (old_qty * signed_exec) > 0.0 and c_st.entry_price > 0.0:
-                    c_st.entry_price = (
-                        (abs(old_qty) * c_st.entry_price) + (ord_dto.executed_qty * ord_dto.avg_price)
-                    ) / max(1e-8, abs(new_pos_qty))
-
-                c_st.current_pos_qty = new_pos_qty
-                dom_b = str(plan.get("dominant_book", getattr(c_st, "dominant_book", "")) or "")
-                sl_mult = float(plan.get("sl_atr_mult", getattr(c_st, "sl_atr_mult", 0.0)) or 0.0)
-                tp_mult = float(plan.get("tp_atr_mult", getattr(c_st, "tp_atr_mult", 0.0)) or 0.0)
-                c_st.dominant_book = dom_b
-                c_st.sl_atr_mult = sl_mult
-                c_st.tp_atr_mult = tp_mult
-
-                # Legacy V2 (sl_mult <= 0) не ставить стоп; V3..V6 ставлять реальний біржовий STOP_MARKET (4.8 ATR шорти / 12.0 ATR лонги)!
-                if dom_b == "V2_MOMENTUM" and sl_mult <= 0.0:
-                    c_st.active_sl_price = 0.0
-                    sl_note = "SL: None (Model-Exit)"
-                else:
-                    if c_st.is_breakeven and c_st.entry_price > 0.0:
-                        raw_sl = (
-                            c_st.entry_price * (1.0 + settings.BREAKEVEN_BUFFER_PCT)
-                            if new_pos_qty > 0
-                            else c_st.entry_price * (1.0 - settings.BREAKEVEN_BUFFER_PCT)
-                        )
-                    else:
-                        eff_sl_mult = sl_mult if sl_mult > 0.0 else settings.EMERGENCY_SL_ATR_MULT
-                        sl_dist = eff_sl_mult * cur_atr
-                        raw_sl = (c_st.entry_price - sl_dist) if new_pos_qty > 0 else (c_st.entry_price + sl_dist)
-
-                    sl_p = self._exchange.safe_price(sym, raw_sl)
-                    fn_sl_ex = getattr(self._exchange, "place_or_update_stop_loss_ex", None)
-                    if callable(fn_sl_ex) and inspect.iscoroutinefunction(fn_sl_ex):
-                        sl_ok, sl_reason = await fn_sl_ex(sym, new_pos_qty, sl_p)
-                    else:
-                        sl_ok_raw = await self._exchange.place_or_update_stop_loss(sym, new_pos_qty, sl_p)
-                        sl_ok = bool(sl_ok_raw) if isinstance(sl_ok_raw, bool) else True
-                        sl_reason = "OK" if sl_ok else "SL_FAILED"
-
-                    if sl_ok:
-                        c_st.active_sl_price = sl_p
-                        sl_note = f"SL: <code>${sl_p:,.2f}</code>"
-                    else:
-                        # ЗАХИСТ ВІД -2021 ТА ГОЛОЇ ПОЗИЦІЇ (SL: None ЗАБОРОНЕНО!):
-                        # Негайно закриваємо позицію через reduceOnly=True і ставимо 48h stop_cooldown!
-                        c_st.active_sl_price = 0.0
-                        pos_side_dir = 1 if new_pos_qty > 0 else -1
-                        self._logger.error(
-                            f"🚨 [{sym}] Відмова STOP_MARKET @ ${sl_p} ({sl_reason})! "
-                            f"Виконуємо негайне аварійне закриття {new_pos_qty:+.4f} через reduceOnly=True + 48h cooldown!"
-                        )
-                        em_dto = await self._exchange.execute_smart_rebalance_order(
-                            symbol=sym,
-                            delta_qty=-new_pos_qty,
-                            mark_price=cur_p,
-                            realized_pnl_est=0.0,
-                            note=f"EMERGENCY_EXIT_{sl_reason}",
-                            reduce_only=True,
-                        )
-                        c_st.current_pos_qty = 0.0
-                        c_st.entry_price = 0.0
+                if abs(new_pos_qty) >= min_qty:
+                    if is_opening_from_cash or is_flip:
+                        c_st.entry_price = ord_dto.avg_price
+                        c_st.bars_held = 1
                         c_st.is_breakeven = False
-                        c_st.bars_held = 0
-                        c_st.dominant_book = ""
-                        c_st.sl_atr_mult = 0.0
-                        c_st.tp_atr_mult = 0.0
-                        if hasattr(cartridge, "register_exchange_stop_hit"):
-                            try:
-                                cartridge.register_exchange_stop_hit(sym, pos_side_dir)
-                            except Exception as cd_e:
-                                self._logger.warning(f"⚠️ [{sym}] Помилка запису stop_cooldown після -2021: {cd_e}")
-                        em_px = em_dto.avg_price if em_dto is not None else cur_p
-                        return (
-                            f"🚨 <b>{sym}</b>: <code>STOP_MARKET</code> відхилено (<code>{sl_reason}</code>) -> "
-                            f"позицію негайно закрито через <code>reduceOnly</code> @ <code>${em_px:,.4f}</code> + 48h Cooldown!"
-                        )
+                    elif (old_qty * signed_exec) > 0.0 and c_st.entry_price > 0.0:
+                        c_st.entry_price = (
+                            (abs(old_qty) * c_st.entry_price) + (ord_dto.executed_qty * ord_dto.avg_price)
+                        ) / max(1e-8, abs(new_pos_qty))
 
-                # Book-Aware Take-Profit: B1/B2/B5/V2 hold-books exit via model/rebalance, NOT tight 1.35 ATR TP
-                is_mean_rev_book = dom_b in ("B1_STATARB", "B2_CARRY_BASIS", "B5_KALMAN_PAIRS", "V2_MOMENTUM")
-                if is_mean_rev_book and tp_mult <= 0.0:
-                    tp_note = "TP: Model-Exit"
+                    c_st.current_pos_qty = new_pos_qty
+                    dom_b = str(plan.get("dominant_book", getattr(c_st, "dominant_book", "")) or "")
+                    sl_mult = float(plan.get("sl_atr_mult", getattr(c_st, "sl_atr_mult", 0.0)) or 0.0)
+                    tp_mult = float(plan.get("tp_atr_mult", getattr(c_st, "tp_atr_mult", 0.0)) or 0.0)
+                    c_st.dominant_book = dom_b
+                    c_st.sl_atr_mult = sl_mult
+                    c_st.tp_atr_mult = tp_mult
+
+                    # Legacy V2 (sl_mult <= 0) не ставить стоп; V3..V6 ставлять реальний біржовий STOP_MARKET (4.8 ATR шорти / 12.0 ATR лонги)!
+                    if dom_b == "V2_MOMENTUM" and sl_mult <= 0.0:
+                        c_st.active_sl_price = 0.0
+                        sl_note = "SL: None (Model-Exit)"
+                        sl_handled = True
+                    else:
+                        if c_st.is_breakeven and c_st.entry_price > 0.0:
+                            raw_sl = (
+                                c_st.entry_price * (1.0 + settings.BREAKEVEN_BUFFER_PCT)
+                                if new_pos_qty > 0
+                                else c_st.entry_price * (1.0 - settings.BREAKEVEN_BUFFER_PCT)
+                            )
+                        else:
+                            eff_sl_mult = sl_mult if sl_mult > 0.0 else settings.EMERGENCY_SL_ATR_MULT
+                            sl_dist = eff_sl_mult * cur_atr
+                            raw_sl = (c_st.entry_price - sl_dist) if new_pos_qty > 0 else (c_st.entry_price + sl_dist)
+
+                        sl_p = self._exchange.safe_price(sym, raw_sl)
+                        fn_sl_ex = getattr(self._exchange, "place_or_update_stop_loss_ex", None)
+                        if callable(fn_sl_ex) and inspect.iscoroutinefunction(fn_sl_ex):
+                            sl_ok, sl_reason = await fn_sl_ex(sym, new_pos_qty, sl_p)
+                        else:
+                            sl_ok_raw = await self._exchange.place_or_update_stop_loss(sym, new_pos_qty, sl_p)
+                            sl_ok = bool(sl_ok_raw) if isinstance(sl_ok_raw, bool) else True
+                            sl_reason = "OK" if sl_ok else "SL_FAILED"
+
+                        if sl_ok:
+                            c_st.active_sl_price = sl_p
+                            sl_note = f"SL: <code>${sl_p:,.2f}</code>"
+                            sl_handled = True
+                        else:
+                            # ЗАХИСТ ВІД -2021 ТА ГОЛОЇ ПОЗИЦІЇ (SL: None ЗАБОРОНЕНО!):
+                            c_st.active_sl_price = 0.0
+                            pos_side_dir = 1 if new_pos_qty > 0 else -1
+                            self._logger.error(
+                                f"🚨 [{sym}] Відмова STOP_MARKET @ ${sl_p} ({sl_reason})! "
+                                f"Виконуємо негайне аварійне закриття {new_pos_qty:+.4f} через reduceOnly=True + 48h cooldown!"
+                            )
+                            em_dto = await self._exchange.execute_smart_rebalance_order(
+                                symbol=sym,
+                                delta_qty=-new_pos_qty,
+                                mark_price=cur_p,
+                                realized_pnl_est=0.0,
+                                note=f"EMERGENCY_EXIT_{sl_reason}",
+                                reduce_only=True,
+                            )
+                            c_st.current_pos_qty = 0.0
+                            c_st.entry_price = 0.0
+                            c_st.is_breakeven = False
+                            c_st.bars_held = 0
+                            c_st.dominant_book = ""
+                            c_st.sl_atr_mult = 0.0
+                            c_st.tp_atr_mult = 0.0
+                            sl_handled = True
+                            if hasattr(cartridge, "register_exchange_stop_hit"):
+                                try:
+                                    cartridge.register_exchange_stop_hit(sym, pos_side_dir)
+                                except Exception as cd_e:
+                                    self._logger.warning(f"⚠️ [{sym}] Помилка запису stop_cooldown після -2021: {cd_e}")
+                            em_px = em_dto.avg_price if em_dto is not None else cur_p
+                            return (
+                                f"🚨 <b>{sym}</b>: <code>STOP_MARKET</code> відхилено (<code>{sl_reason}</code>) -> "
+                                f"позицію негайно закрито через <code>reduceOnly</code> @ <code>${em_px:,.4f}</code> + 48h Cooldown!"
+                            )
+
+                    # Book-Aware Take-Profit
+                    is_mean_rev_book = dom_b in ("B1_STATARB", "B2_CARRY_BASIS", "B5_KALMAN_PAIRS", "V2_MOMENTUM")
+                    if is_mean_rev_book and tp_mult <= 0.0:
+                        tp_note = "TP: Model-Exit"
+                    else:
+                        eff_tp_mult = tp_mult if tp_mult > 0.0 else settings.SUB_CANDLE_MFE_ATR_MULT
+                        tp_dist = eff_tp_mult * cur_atr
+                        raw_tp = (c_st.entry_price + tp_dist) if new_pos_qty > 0 else (c_st.entry_price - tp_dist)
+                        tp_p = self._exchange.safe_price(sym, raw_tp)
+                        if hasattr(self._exchange, "place_or_update_take_profit"):
+                            await self._exchange.place_or_update_take_profit(sym, new_pos_qty, tp_p)
+                        tp_note = f"TP: <code>${tp_p:,.2f}</code>"
+
+                    icon = "🟢" if ord_dto.side == "BUY" else "🔴"
+                    return (
+                        f"{icon} <b>{sym}</b>: {ord_dto.side} <code>{ord_dto.executed_qty}</code> @ <code>${ord_dto.avg_price:,.2f}</code> "
+                        f"➔ <b>{desired_w:+.2f}x</b> ({sl_note} | {tp_note})"
+                    )
                 else:
-                    eff_tp_mult = tp_mult if tp_mult > 0.0 else settings.SUB_CANDLE_MFE_ATR_MULT
-                    tp_dist = eff_tp_mult * cur_atr
-                    raw_tp = (c_st.entry_price + tp_dist) if new_pos_qty > 0 else (c_st.entry_price - tp_dist)
-                    tp_p = self._exchange.safe_price(sym, raw_tp)
-                    if hasattr(self._exchange, "place_or_update_take_profit"):
-                        await self._exchange.place_or_update_take_profit(sym, new_pos_qty, tp_p)
-                    tp_note = f"TP: <code>${tp_p:,.2f}</code>"
-
-                icon = "🟢" if ord_dto.side == "BUY" else "🔴"
-                return (
-                    f"{icon} <b>{sym}</b>: {ord_dto.side} <code>{ord_dto.executed_qty}</code> @ <code>${ord_dto.avg_price:,.2f}</code> "
-                    f"➔ <b>{desired_w:+.2f}x</b> ({sl_note} | {tp_note})"
-                )
-            else:
-                c_st.current_pos_qty = 0.0
-                c_st.entry_price = 0.0
-                c_st.active_sl_price = 0.0
-                c_st.is_breakeven = False
-                c_st.bars_held = 0
-                c_st.dominant_book = ""
-                c_st.sl_atr_mult = 0.0
-                c_st.tp_atr_mult = 0.0
-                if hasattr(self._exchange, "cancel_symbol_orders"):
-                    await self._exchange.cancel_symbol_orders(sym)
-                return f"⚪ <b>{sym}</b>: Вихід у КЕШ @ <code>${ord_dto.avg_price:,.2f}</code> (PnL: <b>{pnl_est:+.2f}$</b>)"
+                    c_st.current_pos_qty = 0.0
+                    c_st.entry_price = 0.0
+                    c_st.active_sl_price = 0.0
+                    c_st.is_breakeven = False
+                    c_st.bars_held = 0
+                    c_st.dominant_book = ""
+                    c_st.sl_atr_mult = 0.0
+                    c_st.tp_atr_mult = 0.0
+                    sl_handled = True
+                    if hasattr(self._exchange, "cancel_symbol_orders"):
+                        await self._exchange.cancel_symbol_orders(sym)
+                    return f"⚪ <b>{sym}</b>: Вихід у КЕШ @ <code>${ord_dto.avg_price:,.2f}</code> (PnL: <b>{pnl_est:+.2f}$</b>)"
+            finally:
+                rem_after = float(getattr(c_st, "current_pos_qty", 0.0) or 0.0)
+                if is_partial_trim_plan and (not sl_handled) and (not rearm_diag_done) and pre_sl_px > 0.0 and abs(rem_after) >= min_qty:
+                    fn_sl_fin = getattr(self._exchange, "place_or_update_stop_loss_ex", None)
+                    try:
+                        if callable(fn_sl_fin) and inspect.iscoroutinefunction(fn_sl_fin):
+                            ok_fin, _ = await fn_sl_fin(sym, rem_after, pre_sl_px)
+                        else:
+                            r_fin = await self._exchange.place_or_update_stop_loss(sym, rem_after, pre_sl_px)
+                            ok_fin = bool(r_fin) if isinstance(r_fin, bool) else True
+                        if ok_fin:
+                            c_st.active_sl_price = pre_sl_px
+                            self._logger.info(
+                                f"🛡️ [{sym}] [FinallyGuard] Перевиставлено STOP_MARKET @ ${pre_sl_px:,.4f} на залишок {rem_after:+.4f}."
+                            )
+                    except Exception as fin_e:
+                        self._logger.error(f"🚨 [{sym}] Помилка [FinallyGuard] STOP_MARKET: {fin_e}")
 
         phase_a_plans: List[Dict[str, Any]] = []
         phase_b_plans: List[Dict[str, Any]] = []
+        active_cooldowns_ms: Dict[str, int] = extra_tel.get("stop_cooldowns") or {}
+        try:
+            now_cd_ms = int(pd.Timestamp(candle_ts).tz_localize("UTC").value // 10 ** 6) if "T" not in candle_ts and "+" not in candle_ts else int(pd.Timestamp(candle_ts).value // 10 ** 6)
+        except Exception:
+            now_cd_ms = int(time.time() * 1000)
 
         for sym, target_dto in portfolio_dto.targets.items():
             c_st = self._state.coins.get(sym)
@@ -797,6 +946,23 @@ class MultiAssetExecutionOrchestrator(IService):
             else:
                 desired_w = target_dto.desired_weight
 
+            # Єдиний передторговий гейт Post-Stop Cooldown за ключем (symbol, side):
+            # блокує ТІЛЬКИ новий вхід / нарощування у бік стопа і ніколи не блокує reduceOnly чи протилежний напрямок!
+            if abs(desired_w) >= settings.CASH_ZONE_THRESHOLD and active_cooldowns_ms:
+                tgt_side_cd = 1 if desired_w > 0 else -1
+                cd_until_ms = int(active_cooldowns_ms.get(f"{sym}:{tgt_side_cd}", 0) or 0)
+                is_new_or_add_in_cd_dir = (
+                    (tgt_side_cd > 0 and c_st.current_pos_qty <= 0.0)
+                    or (tgt_side_cd < 0 and c_st.current_pos_qty >= 0.0)
+                )
+                if cd_until_ms > now_cd_ms and is_new_or_add_in_cd_dir:
+                    desired_w = 0.0
+                    skipped_exec[sym] = "cooldown_active"
+                    unblk_str = datetime.fromtimestamp(cd_until_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                    self._logger.info(
+                        f"🛡️ [PreTrade Cooldown Gate] {sym} (side={tgt_side_cd:+d}) заблоковано до {unblk_str} (протилежний бік та reduceOnly дозволені)."
+                    )
+
             is_v2_book = is_v2_engine or (c_st.dominant_book == "V2_MOMENTUM")
             is_closing_to_cash = abs(desired_w) < settings.CASH_ZONE_THRESHOLD
             is_opening_from_cash = abs(cur_weight) < settings.CASH_ZONE_THRESHOLD and abs(desired_w) >= settings.CASH_ZONE_THRESHOLD
@@ -848,7 +1014,7 @@ class MultiAssetExecutionOrchestrator(IService):
                     target_qty = -target_qty
                 delta_qty = target_qty - c_st.current_pos_qty
 
-                if is_v2_book:
+                if is_v2_book and not is_flip:
                     v2_min_delta_usd = max(6.0, 0.016 * total_equity)
                     v2_rel_thresh_usd = 0.24 * abs(c_st.current_pos_qty) * cur_p
                     if abs(delta_qty) * cur_p < max(v2_min_delta_usd, v2_rel_thresh_usd):
@@ -1076,17 +1242,15 @@ class MultiAssetExecutionOrchestrator(IService):
                             if abs(c_trim.current_pos_qty) < min_q_t:
                                 c_trim.current_pos_qty = 0.0
 
-        # 5b-clean. Очищення осиротілих звичайних та умовних Algo/Trigger SL ордерів на закритих парах
-        fn_orphan = getattr(self._exchange, "cleanup_orphan_orders", None)
-        if (phase_a_plans or phase_b_plans) and callable(fn_orphan) and inspect.iscoroutinefunction(fn_orphan):
-            try:
-                pos_now_clean = {s: float(c.current_pos_qty) for s, c in self._state.coins.items()}
-                touched_syms = tuple({p["sym"] for p in phase_a_plans} | {p["sym"] for p in phase_b_plans})
-                cleaned_n = await fn_orphan(pos_now_clean, candidate_symbols=touched_syms)
-                if cleaned_n > 0:
-                    self._logger.info(f"🧹 [OrphanSLGuard] Скасовано {cleaned_n} залишкових умовних/лімітних ордерів.")
-            except Exception as cl_err:
-                self._logger.debug(f"[OrphanSLGuard] Skipped: {cl_err}")
+        # 5b-clean. Post-Rebalance Reconciliation Watchdog (Orphan Sweeper + Naked SL Check + Zombie Position Check)
+        await self._run_post_rebalance_watchdog(
+            active_syms=active_syms,
+            coin_targets_map=coin_targets_map,
+            coin_prices=coin_prices,
+            phase_a_plans=phase_a_plans,
+            phase_b_plans=phase_b_plans,
+            executed_orders_summary=executed_orders_summary,
+        )
 
         # 5b-legacy. Pillar 7: Margin-Backed Stink-Bids & VWAP Dip Sniper (ВИКЛЮЧНО для V58; у V2/V3 вимкнено для Zero Skew!)
         rem_lev_budget = max(0.0, self._state.max_portfolio_lev - portfolio_dto.total_gross_leverage)
@@ -1103,25 +1267,59 @@ class MultiAssetExecutionOrchestrator(IService):
                     if self._ws_sentinel is not None:
                         self._ws_sentinel.register_stink_bid(top_sym, stink_qty, stink_p, t_info.atr_14, order_id=stink_ord_id)
 
-        # 5c. Трек A: Повна телеметрія та аудит-логи Testnet V2 (v2_decisions, v2_funding_ledger, v2_market_micro)
+        # 5c. Трек A: Повна телеметрія та аудит-логи Testnet V2 (v2_decisions, v2_income_ledger, v2_funding_ledger, v2_market_micro)
+        eq_bridge: Dict[str, Any] = {}
         if is_v2_engine:
             if hasattr(self._db, "record_v2_decision") and (is_new_candle or force_recalc):
+                extra_tel_with_px = dict(extra_tel)
+                if not extra_tel_with_px.get("signal_prices"):
+                    extra_tel_with_px["signal_prices"] = {s: round(float(p), 6) for s, p in coin_prices.items() if p > 0}
                 self._db.record_v2_decision(
                     candle_ts=candle_ts,
                     equity=total_equity,
                     wallet_balance=usdt_balance,
                     upnl=total_upnl,
-                    extra_telemetry=extra_tel,
+                    extra_telemetry=extra_tel_with_px,
                     skipped_exec=skipped_exec,
+                )
+                research_lake.record_bar_features(
+                    candle_ts=candle_ts,
+                    prices=coin_prices,
+                    factors=extra_tel_with_px.get("factor_scores") or extra_tel_with_px.get("factors") or {},
+                    funding_rates=funding_rates_map or {},
+                    regime=str(extra_tel_with_px.get("regime_label") or f"T{extra_tel_with_px.get('tier', 1)}"),
+                    breadth=float(portfolio_dto.market_breadth),
+                    dispersion=float(extra_tel_with_px.get("cs_dispersion", 0.0) or 0.0),
+                    btc_trend=float(extra_tel_with_px.get("btc_trend", 0.0) or 0.0),
+                    weights_net=extra_tel_with_px.get("weights_net") or {},
                 )
 
             now_wall = time.time()
+            should_poll_ledger = is_new_candle or force_recalc or (now_wall - self._last_funding_poll_ts) >= 3300.0
+            fn_income_all = getattr(self._exchange, "fetch_account_income_ledger", None)
+            if (
+                should_poll_ledger
+                and callable(fn_income_all)
+                and inspect.iscoroutinefunction(fn_income_all)
+                and hasattr(self._db, "record_v2_income_ledger")
+            ):
+                try:
+                    # При першому старті підтягуємо весь канонічний реєстр від старту епохи V6.1 (2026-11-22 16:00 UTC)
+                    epoch_v61_ms = int(datetime(2026, 11, 22, 16, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
+                    inc_since_ms = epoch_v61_ms if not self._last_income_backfill_done else int((now_wall - 48 * 3600.0) * 1000)
+                    inc_events = await fn_income_all(since_ms=inc_since_ms)
+                    if inc_events is not None:
+                        self._db.record_v2_income_ledger(inc_events)
+                        self._last_income_backfill_done = True
+                except Exception as ie:
+                    self._logger.debug(f"[V2] Помилка опитування income ledger: {ie}")
+
             fn_income = getattr(self._exchange, "fetch_funding_income", None)
             if (
-                callable(fn_income)
+                should_poll_ledger
+                and callable(fn_income)
                 and inspect.iscoroutinefunction(fn_income)
                 and hasattr(self._db, "record_v2_funding_batch")
-                and (is_new_candle or (now_wall - self._last_funding_poll_ts) >= 3300.0)
             ):
                 try:
                     since_ms = int((now_wall - 48 * 3600.0) * 1000)
@@ -1132,6 +1330,33 @@ class MultiAssetExecutionOrchestrator(IService):
                     self._last_funding_poll_ts = now_wall
                 except Exception as fe:
                     self._logger.debug(f"[V2] Помилка опитування funding income: {fe}")
+
+            if hasattr(self._db, "compute_equity_bridge"):
+                try:
+                    eq_bridge = self._db.compute_equity_bridge(
+                        actual_equity=total_equity,
+                        current_wallet=usdt_balance,
+                        current_upnl=total_upnl,
+                        demo_anchor=self._demo_wallet_anchor,
+                        virtual_cap=float(settings.VIRTUAL_EQUITY_CAP) if settings.USE_DEMO_TRADING else 0.0,
+                    )
+                    acc_diff = float(eq_bridge.get("accounting_diff_usd", 0.0) or 0.0)
+                    tol_usd = float(getattr(settings, "ACCOUNTING_DRIFT_TOL_USD", 0.05))
+                    drift_alert_usd = float(getattr(settings, "ACCOUNTING_DRIFT_ALERT_USD", 0.50))
+                    exp_eq = float(eq_bridge.get("expected_equity", total_equity))
+                    if abs(acc_diff) > tol_usd:
+                        self._logger.warning(
+                            f"⚠️ [ACCOUNTING_DRIFT] actual=${total_equity:.4f} vs expected=${exp_eq:.4f} "
+                            f"(diff=${acc_diff:+.4f} > ${tol_usd:.2f})"
+                        )
+                    if abs(acc_diff) > drift_alert_usd:
+                        await self._send_alert(
+                            f"⚠️ <b>[ACCOUNTING_DRIFT Alert]</b>\n"
+                            f"• Actual Equity: <code>${total_equity:.4f}</code> vs Expected: <code>${exp_eq:.4f}</code>\n"
+                            f"• Розбіжність: <b><code>${acc_diff:+.4f}</code></b> (&gt; ${drift_alert_usd:.2f})"
+                        )
+                except Exception as ebe:
+                    self._logger.debug(f"[V2] Помилка розрахунку Equity Bridge: {ebe}")
 
             fn_micro = getattr(self._exchange, "fetch_market_microstructure", None)
             micro_snap: Dict[str, Dict[str, float]] = {}
@@ -1150,6 +1375,28 @@ class MultiAssetExecutionOrchestrator(IService):
                     self._logger.debug(f"[V2] Помилка збору market_micro: {me}")
         else:
             micro_snap = {}
+
+        # Перевірка синхронізації годинника NTP з Binance Futures API (поріг попередження 150 мс)
+        fn_ntp = getattr(self._exchange, "measure_ntp_skew_ms", None)
+        if callable(fn_ntp) and inspect.iscoroutinefunction(fn_ntp):
+            try:
+                ntp_ms = await fn_ntp()
+                if ntp_ms is not None:
+                    self._last_ntp_skew_ms = int(ntp_ms)
+                    warn_ms = int(getattr(settings, "NTP_WARN_THRESHOLD_MS", 150))
+                    if abs(self._last_ntp_skew_ms) > warn_ms:
+                        self._logger.warning(
+                            f"⏰ [NTP_CLOCK_SKEW] Розбіжність системного часу з Binance API: {self._last_ntp_skew_ms:+d} ms (> {warn_ms} ms)!"
+                        )
+                        if (time.time() - self._last_ntp_alert_ts) >= 21600.0:
+                            self._last_ntp_alert_ts = time.time()
+                            await self._send_alert(
+                                f"⏰ <b>[NTP Clock Skew Warning]</b>\n"
+                                f"• Розбіжність годинника сервера з Binance: <b>{self._last_ntp_skew_ms:+d} ms</b> (&gt; {warn_ms} ms).\n"
+                                f"• Перевірте демон <code>chronyd</code> для захисту від помилки <code>-1021</code>!"
+                            )
+            except Exception:
+                pass
 
         # 5d. Shadow Arena: паралельне оцінювання 6 моделей/тірів на тих самих живих свічках і спредах!
         arena_board: List[Dict[str, Any]] = []
@@ -1224,13 +1471,15 @@ class MultiAssetExecutionOrchestrator(IService):
             "skipped_exec": skipped_exec,
             "skipped_counts": skipped_counts,
             "shadow_arena": arena_board,
+            "equity_bridge": eq_bridge,
+            "ntp_clock_skew_ms": self._last_ntp_skew_ms,
         }
         self._state.save_snapshot()
 
         radar_list = self._state.get_coins_radar_list()
         self._db.upsert_coin_states(radar_list)
 
-        if is_new_candle or force_recalc:
+        if (is_new_candle or force_recalc) and bool(getattr(self._state, "balance_synced", True)):
             btc_c = self._state.coins.get("BTCUSDT")
             use_vcap = bool(settings.USE_DEMO_TRADING and settings.VIRTUAL_EQUITY_CAP > 0.0)
             snap_bal = float(total_equity) if use_vcap else float(usdt_balance)
@@ -1278,3 +1527,137 @@ class MultiAssetExecutionOrchestrator(IService):
                 f"• <b>Топ-Лідер:</b> <code>{self._state.latest_telemetry['top_leader']}</code>"
             )
             await self._send_alert(alert_txt)
+
+    async def _run_post_rebalance_watchdog(
+        self,
+        active_syms: Any,
+        coin_targets_map: Dict[str, float],
+        coin_prices: Dict[str, float],
+        phase_a_plans: List[Dict[str, Any]],
+        phase_b_plans: List[Dict[str, Any]],
+        executed_orders_summary: List[str],
+    ) -> None:
+        """Post-Rebalance Reconciliation Watchdog:
+        1) Orphan Sweeper: чистить відкриті ордери при нульовій позиції на біржі.
+        2) Zombie Position Check: при target_weight==0 і відкритій позиції — 1 спроба MARKET reduceOnly + CRITICAL алерт.
+        3) Naked Position Check: перевіряє наявність активного STOP_MARKET для відкритих позицій і перевиставляє за active_sl_price.
+        """
+        fn_orphan = getattr(self._exchange, "cleanup_orphan_orders", None)
+        if (phase_a_plans or phase_b_plans) and callable(fn_orphan) and inspect.iscoroutinefunction(fn_orphan):
+            try:
+                pos_now_clean = {s: float(c.current_pos_qty) for s, c in self._state.coins.items()}
+                touched_syms = tuple({p["sym"] for p in phase_a_plans} | {p["sym"] for p in phase_b_plans})
+                cleaned_n = await fn_orphan(pos_now_clean, candidate_symbols=touched_syms)
+                if cleaned_n > 0:
+                    self._logger.info(f"🧹 [OrphanSLGuard] Скасовано {cleaned_n} залишкових умовних/лімітних ордерів.")
+            except Exception as cl_err:
+                self._logger.debug(f"[OrphanSLGuard] Skipped: {cl_err}")
+
+        fn_open_all = getattr(self._exchange, "fetch_all_open_orders_by_symbol", None)
+        fn_snap = getattr(self._exchange, "fetch_account_snapshot", None)
+        if not (callable(fn_open_all) and inspect.iscoroutinefunction(fn_open_all) and callable(fn_snap) and inspect.iscoroutinefunction(fn_snap)):
+            return
+
+        syms_tuple = tuple(active_syms or ())
+        if not syms_tuple:
+            return
+        try:
+            _, _, live_pos_map, snap_ok = await fn_snap(syms_tuple)
+            if not snap_ok or not isinstance(live_pos_map, dict):
+                return
+            open_orders_map = await fn_open_all(syms_tuple)
+            if not isinstance(open_orders_map, dict):
+                open_orders_map = {}
+        except Exception as wd_err:
+            self._logger.debug(f"[Watchdog] Пропуск звірки через помилку REST: {wd_err}")
+            return
+
+        alerts: List[str] = []
+        for sym in syms_tuple:
+            p_dto = live_pos_map.get(sym)
+            live_qty = float(getattr(p_dto, "contracts_qty", 0.0) or 0.0) if p_dto is not None else 0.0
+            min_q, _, _, _, _ = settings.get_symbol_spec(sym)
+            c_st = self._state.coins.get(sym)
+            sym_orders = open_orders_map.get(sym) or []
+
+            # 1. Orphan Sweeper
+            if abs(live_qty) < min_q:
+                if sym_orders and hasattr(self._exchange, "cancel_symbol_orders"):
+                    await self._exchange.cancel_symbol_orders(sym)
+                    self._logger.info(
+                        f"🧹 [OrphanSweeper] {sym}: позиція=0, скасовано {len(sym_orders)} ордерів-сиріт."
+                    )
+                continue
+
+            if c_st is not None:
+                c_st.current_pos_qty = live_qty
+
+            # 2. Zombie Position Check (target_weight == 0, але позиція досі на біржі)
+            tgt_w = coin_targets_map.get(sym)
+            if tgt_w is not None and abs(float(tgt_w)) < settings.CASH_ZONE_THRESHOLD:
+                cur_px = float(coin_prices.get(sym, 0.0) or (getattr(p_dto, "mark_price", 0.0) if p_dto else 0.0) or 0.0)
+                self._logger.critical(
+                    f"🚨 [ZombiePositionCheck] {sym}: target_weight=0, але на біржі лишилася позиція {live_qty:+.4f}! "
+                    f"Запускаємо 1 примусове закриття MARKET reduceOnly."
+                )
+                if hasattr(self._exchange, "cancel_symbol_orders"):
+                    await self._exchange.cancel_symbol_orders(sym)
+                z_dto = await self._exchange.execute_smart_rebalance_order(
+                    symbol=sym,
+                    delta_qty=-live_qty,
+                    mark_price=cur_px,
+                    realized_pnl_est=0.0,
+                    note="ZOMBIE_WATCHDOG_FORCE_CLOSE",
+                    reduce_only=True,
+                    maker_first=False,
+                    taker_fallback=True,
+                )
+                if z_dto is not None and z_dto.executed_qty >= (abs(live_qty) - min_q * 0.5):
+                    live_qty = 0.0
+                    if c_st is not None:
+                        c_st.current_pos_qty = 0.0
+                        c_st.entry_price = 0.0
+                        c_st.active_sl_price = 0.0
+                    executed_orders_summary.append(
+                        f"🧹 <b>{sym}</b>: Watchdog примусово закрив завислу позицію @ <code>${z_dto.avg_price:,.4f}</code>"
+                    )
+                    alerts.append(f"• <b>{sym}</b> (Zombie): примусово закрито <code>{z_dto.executed_qty}</code> @ <code>${z_dto.avg_price:,.4f}</code>")
+                    continue
+                if z_dto is not None:
+                    signed_z = z_dto.executed_qty if z_dto.side == "BUY" else -z_dto.executed_qty
+                    live_qty += signed_z
+                    if c_st is not None:
+                        c_st.current_pos_qty = live_qty
+                alerts.append(f"• <b>{sym}</b> (Zombie CRITICAL): НЕ вдалося закрити <code>{live_qty:+.4f}</code>!")
+
+            # 3. Naked Position Check (позиція відкрита, перевіряємо активний STOP_MARKET)
+            if abs(live_qty) >= min_q and c_st is not None:
+                has_stop = any(
+                    str(o.get("type") or (o.get("info") or {}).get("origType") or (o.get("info") or {}).get("orderType") or "").lower()
+                    in ("stop_market", "stop")
+                    for o in sym_orders
+                    if isinstance(o, dict)
+                )
+                if not has_stop:
+                    sl_px = float(getattr(c_st, "active_sl_price", 0.0) or 0.0)
+                    if sl_px > 0.0:
+                        fn_sl_ex = getattr(self._exchange, "place_or_update_stop_loss_ex", None)
+                        sl_ok = False
+                        if callable(fn_sl_ex) and inspect.iscoroutinefunction(fn_sl_ex):
+                            sl_ok, _ = await fn_sl_ex(sym, live_qty, sl_px)
+                        elif hasattr(self._exchange, "place_or_update_stop_loss"):
+                            r_sl = await self._exchange.place_or_update_stop_loss(sym, live_qty, sl_px)
+                            sl_ok = bool(r_sl) if isinstance(r_sl, bool) else True
+                        if sl_ok:
+                            self._logger.warning(
+                                f"🛡️ [NakedPositionCheck] {sym}: перевиставлено відсутній STOP_MARKET @ ${sl_px:,.4f} ({live_qty:+.4f})."
+                            )
+                            alerts.append(f"• <b>{sym}</b> (Naked SL): перевиставлено <code>STOP_MARKET @ ${sl_px:,.4f}</code>")
+                        else:
+                            self._logger.critical(
+                                f"🚨 [NakedPositionCheck] {sym}: позиція {live_qty:+.4f} БЕЗ STOP_MARKET, перевиставлення @ ${sl_px:,.4f} не вдалося!"
+                            )
+                            alerts.append(f"• <b>{sym}</b> (Naked CRITICAL): <code>{live_qty:+.4f}</code> без SL!")
+
+        if alerts:
+            await self._send_alert("🛡️ <b>[Reconciliation Watchdog]</b>\n" + "\n".join(alerts))
