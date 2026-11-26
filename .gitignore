@@ -31,6 +31,9 @@ data_1h/
 Prepearing/
 quant_v2/
 quant_v3/
+archive/
+docs/
+AGENTS.md
 tests/
 QuantCore-GrandMaster-Server/app/cartridges/v2_multi_sleeve_cartridge.py
 QuantCore-GrandMaster-Server/app/cartridges/v58_grand_master_cartridge.py

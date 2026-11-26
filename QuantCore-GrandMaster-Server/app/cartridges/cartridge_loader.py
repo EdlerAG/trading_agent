@@ -47,9 +47,8 @@ class CartridgeLoaderService(IService):
     def cartridge(self) -> IAlphaCartridge:
         if self._active_cartridge is None:
             if settings.CARTRIDGE_ENGINE in ("qv3", "qv3_convex"):
-                self._active_cartridge = self._make_qv3_cartridge()
-                self._active_filename = "qv3_convex"
-            elif settings.CARTRIDGE_ENGINE in ("v2", "v3", "v4", "v5", "v6"):
+                raise RuntimeError("qv3_convex заархівовано в archive/quant_v3_experimental; використовуйте CARTRIDGE_ENGINE=v6 (quant_v2)")
+            if settings.CARTRIDGE_ENGINE in ("v2", "v3", "v4", "v5", "v6"):
                 self._active_cartridge = self._make_v2_cartridge(settings.CARTRIDGE_ENGINE)
                 self._active_filename = f"{settings.CARTRIDGE_ENGINE}_multi_sleeve"
             else:
@@ -61,18 +60,6 @@ class CartridgeLoaderService(IService):
                     bundle={"symbols": list(settings.DEFAULT_SYMBOLS), "assets": {}},
                 )
         return self._active_cartridge
-
-    @staticmethod
-    def _make_qv3_cartridge() -> IAlphaCartridge:
-        from app.cartridges.qv3_convex_cartridge import QV3ConvexCartridge
-        state_path = os.path.join(settings.STORAGE_DIR, "v3_live_state.json")
-        env_syms_raw = os.getenv("ACTIVE_SYMBOLS", "").strip()
-        explicit_syms = (
-            tuple(s.strip().upper() for s in env_syms_raw.split(",") if s.strip())
-            if env_syms_raw
-            else None
-        )
-        return QV3ConvexCartridge(symbols=explicit_syms, state_path=state_path)
 
     @staticmethod
     def _make_v2_cartridge(engine_ver: str = "v2") -> IAlphaCartridge:
@@ -96,14 +83,7 @@ class CartridgeLoaderService(IService):
                     shutil.move(src, dst)
 
         if settings.CARTRIDGE_ENGINE in ("qv3", "qv3_convex"):
-            self._active_cartridge = self._make_qv3_cartridge()
-            self._active_filename = "qv3_convex"
-            self._logger.info(
-                "✅ Активовано QV3 Convex Growth (%d пар). Валюти: %s",
-                len(self._active_cartridge.supported_symbols),
-                ", ".join(self._active_cartridge.supported_symbols[:16]) + ("..." if len(self._active_cartridge.supported_symbols) > 16 else ""),
-            )
-            return
+            raise RuntimeError("qv3_convex заархівовано в archive/quant_v3_experimental; використовуйте CARTRIDGE_ENGINE=v6 (quant_v2)")
 
         if settings.CARTRIDGE_ENGINE in ("v2", "v3", "v4", "v5", "v6"):
             self._active_cartridge = self._make_v2_cartridge(settings.CARTRIDGE_ENGINE)
