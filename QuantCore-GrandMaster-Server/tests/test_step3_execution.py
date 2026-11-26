@@ -809,6 +809,28 @@ class TestStep3Execution(unittest.TestCase):
         self.assertEqual(st1, "OK")
         self.mock_ccxt.cancel_order.assert_called_once_with("1000000304073863", "XRP/USDT:USDT", params={"trigger": True})
 
+        # Bulk fapiPrivateGetOpenAlgoOrders за 1 REST-запит повертає CONDITIONAL STOP_MARKET для всіх монет
+        class _FakeBinanceBulkEx:
+            def fetch_open_orders(self, sym=None, params=None):
+                return []
+
+            def fapiPrivateGetOpenAlgoOrders(self):
+                return [{
+                    "algoId": 1000000304412671,
+                    "clientAlgoId": "qc6_XRPUSDT_BR_1",
+                    "algoType": "CONDITIONAL",
+                    "orderType": "STOP_MARKET",
+                    "symbol": "XRPUSDT",
+                    "side": "BUY",
+                    "triggerPrice": "0.9623",
+                }]
+
+        self.exchange_service._exchange = _FakeBinanceBulkEx()
+        bulk_map = self.exchange_service._fetch_all_open_orders_by_symbol_sync(("XRPUSDT", "SOLUSDT"))
+        self.assertEqual(len(bulk_map["XRPUSDT"]), 1)
+        self.assertEqual(self.exchange_service._extract_order_type(bulk_map["XRPUSDT"][0]), "stop_market")
+        self.assertEqual(len(bulk_map["SOLUSDT"]), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

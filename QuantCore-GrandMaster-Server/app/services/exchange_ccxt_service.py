@@ -1889,13 +1889,37 @@ class ExchangeCcxtService(IExchangeGateway):
             return {}
         out: Dict[str, List[Dict[str, Any]]] = {s.upper(): [] for s in symbols}
         bulk_ok = True
+        has_bulk_algo_api = hasattr(self._exchange, "fapiPrivateGetOpenAlgoOrders") and not hasattr(self._exchange, "_mock_name")
+
         for is_trig in (False, True):
             try:
-                raw_ords = (
-                    self._exchange.fetch_open_orders(None, params={"trigger": True})
-                    if is_trig
-                    else self._exchange.fetch_open_orders(None)
-                )
+                if is_trig and has_bulk_algo_api:
+                    # CCXT fetch_open_orders(None, params={'trigger': True}) повертає [] без symbol на Binance USD-M,
+                    # тоді як fapiPrivateGetOpenAlgoOrders() повертає всі умовні STOP_MARKET/TP за 1 REST-запит!
+                    algo_raw = self._exchange.fapiPrivateGetOpenAlgoOrders()
+                    if isinstance(algo_raw, dict):
+                        algo_raw = algo_raw.get("orders") or []
+                    raw_ords = []
+                    for r in (algo_raw or []):
+                        if not isinstance(r, dict):
+                            continue
+                        trig_px = float(r.get("triggerPrice") or r.get("stopPrice") or 0.0)
+                        raw_ords.append({
+                            "id": str(r.get("algoId") or r.get("orderId") or ""),
+                            "symbol": str(r.get("symbol") or ""),
+                            "type": str(r.get("orderType") or r.get("origType") or r.get("type") or "").lower(),
+                            "side": str(r.get("side") or "").lower(),
+                            "stopPrice": trig_px,
+                            "triggerPrice": trig_px,
+                            "clientOrderId": str(r.get("clientAlgoId") or r.get("clientOrderId") or ""),
+                            "info": r,
+                        })
+                else:
+                    raw_ords = (
+                        self._exchange.fetch_open_orders(None, params={"trigger": True})
+                        if is_trig
+                        else self._exchange.fetch_open_orders(None)
+                    )
             except TypeError:
                 if is_trig:
                     continue
@@ -1913,7 +1937,7 @@ class ExchangeCcxtService(IExchangeGateway):
             for o in raw_ords:
                 if not isinstance(o, dict):
                     continue
-                c_sym = ccxt_to_symbol(str(o.get("symbol") or ""))
+                c_sym = ccxt_to_symbol(str(o.get("symbol") or (o.get("info") or {}).get("symbol") or ""))
                 if c_sym in out:
                     out[c_sym].append(o)
 
