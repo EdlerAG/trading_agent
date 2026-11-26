@@ -259,9 +259,19 @@ class Settings:
     ENABLE_V3_RESEARCH_LAKE: bool = os.getenv("ENABLE_V3_RESEARCH_LAKE", "true").lower() == "true"
     V3_RESEARCH_LAKE_DIR: str = os.getenv("V3_RESEARCH_LAKE_DIR", os.path.join(BASE_DIR, "data", "v3_research_lake"))
     MAX_RESEARCH_LAKE_MB: int = int(os.getenv("MAX_RESEARCH_LAKE_MB", "1024"))
-    ENABLE_SMART_MAKER_CHASE: bool = os.getenv("ENABLE_SMART_MAKER_CHASE", "false").lower() == "true"
-    SMART_MAKER_MAX_RETRIES: int = int(os.getenv("SMART_MAKER_MAX_RETRIES", "3"))
+    SMART_MAKER_CHASE_ENABLED: bool = os.getenv(
+        "SMART_MAKER_CHASE_ENABLED",
+        os.getenv("ENABLE_SMART_MAKER_CHASE", "false"),
+    ).lower() in ("1", "true", "yes")
+    ENABLE_SMART_MAKER_CHASE: bool = SMART_MAKER_CHASE_ENABLED
+    SMART_MAKER_MAX_ATTEMPTS: int = int(os.getenv("SMART_MAKER_MAX_ATTEMPTS", os.getenv("SMART_MAKER_MAX_RETRIES", "3")))
+    SMART_MAKER_MAX_RETRIES: int = SMART_MAKER_MAX_ATTEMPTS
+    SMART_MAKER_POLL_SEC: float = float(os.getenv("SMART_MAKER_POLL_SEC", "12.0"))
     SMART_MAKER_REQUOTE_SEC: float = float(os.getenv("SMART_MAKER_REQUOTE_SEC", "2.5"))
+    SMART_MAKER_REPRICE_BPS: float = float(os.getenv("SMART_MAKER_REPRICE_BPS", "3.0"))
+    SMART_MAKER_MAX_DRIFT_BPS: float = float(os.getenv("SMART_MAKER_MAX_DRIFT_BPS", "25.0"))
+    SMART_MAKER_MIN_NOTIONAL_USD: float = float(os.getenv("SMART_MAKER_MIN_NOTIONAL_USD", "15.0"))
+    SMART_MAKER_CONCURRENCY: int = max(1, int(os.getenv("SMART_MAKER_CONCURRENCY", "4")))
     MAX_CANDLE_STALENESS_MULT: float = float(os.getenv("MAX_CANDLE_STALENESS_MULT", "1.8"))
     NEUTRALITY_IMBALANCE_LIMIT: float = float(os.getenv("NEUTRALITY_IMBALANCE_LIMIT", "0.05"))
     MAX_NTP_CLOCK_SKEW_MS: int = int(os.getenv("MAX_NTP_CLOCK_SKEW_MS", "1000"))

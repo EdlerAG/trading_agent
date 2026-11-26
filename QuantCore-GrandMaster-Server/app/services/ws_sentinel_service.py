@@ -229,6 +229,9 @@ class WebSocketSentinelService(IService):
         for sym, c in self._state.coins.items():
             if abs(c.current_pos_qty) <= 0.0 or c.entry_price <= 0.0:
                 continue
+            fn_chasing = getattr(self._exchange, "is_symbol_chasing", None)
+            if callable(fn_chasing) and fn_chasing(sym) is True:
+                continue
             if getattr(c, "dominant_book", "") in ("B1_STATARB", "B2_CARRY_BASIS", "B5_KALMAN_PAIRS", "V2_MOMENTUM"):
                 # V3 Catastrophic Short-Squeeze Tail-Cut (+5.2 * ATR_24) тільки для шорт-ніг
                 if c.current_pos_qty < 0 and settings.CARTRIDGE_ENGINE in ("v3", "v4", "v5") and settings.V3_SHORT_SQUEEZE_ATR_MULT > 0:

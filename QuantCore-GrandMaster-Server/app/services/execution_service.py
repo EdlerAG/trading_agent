@@ -15,6 +15,7 @@ from app.core.memory_guard import memory_guard
 from app.domain.interfaces import IService, IExchangeGateway, IOnlineLearner
 from app.domain.schemas import CoinStateDTO
 from app.services.research_lake_service import research_lake
+from app.services.smart_maker_executor import compute_effective_fee_and_is_bps
 from app.services.state_service import StateService
 from app.services.database_service import DatabaseService
 from app.cartridges.cartridge_loader import CartridgeLoaderService
@@ -536,8 +537,12 @@ class MultiAssetExecutionOrchestrator(IService):
             cart_nm in ("v2_multi_sleeve", "v3_multi_sleeve", "v4_multi_sleeve", "v5_multi_sleeve", "v6_multi_sleeve", "qv3_convex")
             or settings.CARTRIDGE_ENGINE in ("v2", "v3", "v4", "v5", "v6", "qv3", "qv3_convex")
         )
-        # Legacy v2 використовує пасивний maker_first; V3..V6 та QV3 використовують швидкий Protected Limit IOC без зависань postOnly!
+        # Legacy v2 використовує пасивний maker_first; V3..V6 використовують Protected Limit IOC або V6.2-B Smart Maker (лише для планових ребалансів!)
         use_legacy_v2_maker = (cart_nm == "v2_multi_sleeve" and settings.CARTRIDGE_ENGINE not in ("v3", "v4", "v5", "v6", "qv3", "qv3_convex"))
+        smart_maker_allowed_in_cycle = bool(
+            (getattr(settings, "SMART_MAKER_CHASE_ENABLED", False) or getattr(settings, "ENABLE_SMART_MAKER_CHASE", False))
+            and not bool(geo_shock_active)
+        )
         extra_tel = portfolio_dto.extra_telemetry or {}
         sleeve_books_map: Dict[str, str] = extra_tel.get("sleeve_books") or {}
         signal_prices_map: Dict[str, float] = extra_tel.get("signal_prices") or extra_tel.get("prices") or {}
@@ -575,12 +580,22 @@ class MultiAssetExecutionOrchestrator(IService):
                 return None
 
             min_qty, _, _, _, _ = settings.get_symbol_spec(sym)
+            if bool(plan.get("is_flip_leg2", False)):
+                # Захист 2-ї ноги перевороту: відкриваємо нову сторону лише якщо 1-ша нога у Фазі 1 реально закрила стару позицію в 0!
+                if abs(c_st.current_pos_qty) >= min_qty and (c_st.current_pos_qty * delta_qty) < 0.0:
+                    self._logger.warning(
+                        f"⚠️ [{sym}] Пропуск 2-ї ноги перевороту ({delta_qty:+.4f}): стара позиція {c_st.current_pos_qty:+.4f} ще не закрита."
+                    )
+                    return None
+
             pre_sl_px = float(getattr(c_st, "active_sl_price", 0.0) or 0.0)
             is_partial_trim_plan = bool(reduce_only and not is_closing_to_cash and not is_flip)
+            plan_uses_smart_maker = bool(plan.get("allow_smart_maker", False))
             sl_handled = False
             rearm_diag_done = False
 
-            if reduce_only or is_closing_to_cash or is_flip:
+            # У режимі V6.2-B Smart Maker НЕ знімаємо STOP_MARKET заздалегідь перед пасивним очікуванням (SmartMakerExecutor зніме його лише при -2022)
+            if (reduce_only or is_closing_to_cash or is_flip) and not plan_uses_smart_maker:
                 await self._exchange.cancel_symbol_orders(sym)
 
             try:
@@ -600,6 +615,8 @@ class MultiAssetExecutionOrchestrator(IService):
                     ord_kwargs["urgency"] = str(plan["urgency"])
                 if "active_sl_price" in _exec_sig_params:
                     ord_kwargs["active_sl_price"] = pre_sl_px
+                if ("allow_smart_maker" in _exec_sig_params) or (_exec_has_varkw and plan_uses_smart_maker):
+                    ord_kwargs["allow_smart_maker"] = plan_uses_smart_maker
                 ord_dto = await self._exchange.execute_smart_rebalance_order(**ord_kwargs)
 
                 if ord_dto is None:
@@ -607,6 +624,7 @@ class MultiAssetExecutionOrchestrator(IService):
                     diag = diag if isinstance(diag, dict) else {}
                     st_diag = str(diag.get("order_status") or "REJECTED")
                     rearm_diag_done = bool(diag.get("sl_rearmed_after_2022", False))
+                    arr_mid_fail = float(diag.get("arrival_mid", diag.get("arrival_mid_px", cur_p)) or cur_p)
                     if is_v2_engine and hasattr(self._db, "record_v2_execution"):
                         self._db.record_v2_execution(
                             candle_ts=candle_ts,
@@ -616,7 +634,7 @@ class MultiAssetExecutionOrchestrator(IService):
                             target_qty=abs(float(delta_qty)),
                             executed_qty=0.0,
                             signal_close_px=sig_px,
-                            arrival_mid_px=float(diag.get("arrival_mid_px", cur_p) or cur_p),
+                            arrival_mid_px=arr_mid_fail,
                             fill_avg_px=0.0,
                             spread_bps=float(diag.get("spread_bps", 0.0) or 0.0),
                             maker_qty=0.0,
@@ -630,15 +648,27 @@ class MultiAssetExecutionOrchestrator(IService):
                             symbol=sym,
                             side="BUY" if delta_qty > 0 else "SELL",
                             sleeve_book=sleeve_book_tag,
+                            exec_mode=str(diag.get("exec_mode") or ("smart_maker" if plan_uses_smart_maker else "market_direct")),
                             signal_price=sig_px,
-                            arrival_bbo_bid=float(diag.get("best_bid", 0.0) or 0.0),
-                            arrival_bbo_ask=float(diag.get("best_ask", 0.0) or 0.0),
+                            arrival_bbo_bid=float(diag.get("best_bid", diag.get("arrival_bid", 0.0)) or 0.0),
+                            arrival_bbo_ask=float(diag.get("best_ask", diag.get("arrival_ask", 0.0)) or 0.0),
+                            arrival_mid=arr_mid_fail,
                             limit_placed_price=float(diag.get("limit_placed_price", 0.0) or 0.0),
                             requotes_count=int(diag.get("requotes_count", 0) or 0),
+                            chase_attempts=int(diag.get("chase_attempts", 0) or 0),
+                            cancel_count=int(diag.get("cancel_count", 0) or 0),
+                            post_only_rejects_5022=int(diag.get("post_only_rejects_5022", 0) or 0),
+                            drift_abort=bool(diag.get("drift_abort", False)),
                             fill_price=0.0,
+                            avg_fill_price=0.0,
                             maker_qty=0.0,
                             taker_qty=0.0,
+                            maker_filled_qty=0.0,
+                            taker_filled_qty=0.0,
+                            maker_fill_ratio=0.0,
                             fee_usdt=0.0,
+                            effective_fee_bps=0.0,
+                            implementation_shortfall_bps=0.0,
                             latency_ms=float(diag.get("latency_ms", 0.0) or 0.0),
                             order_status=st_diag,
                             fallback_reason=str(diag.get("fallback_reason") or "rejected"),
@@ -665,7 +695,12 @@ class MultiAssetExecutionOrchestrator(IService):
                 diag_ok = diag_ok if isinstance(diag_ok, dict) else {}
                 rearm_diag_done = bool(diag_ok.get("sl_rearmed_after_2022", False))
                 if is_v2_engine and hasattr(self._db, "record_v2_execution"):
-                    arr_px = float(getattr(ord_dto, "arrival_mid_px", 0.0) or getattr(ord_dto, "arrival_price", 0.0) or cur_p)
+                    arr_px = float(
+                        diag_ok.get("arrival_mid")
+                        or getattr(ord_dto, "arrival_mid_px", 0.0)
+                        or getattr(ord_dto, "arrival_price", 0.0)
+                        or cur_p
+                    )
                     mk_q = float(getattr(ord_dto, "maker_qty", 0.0) or 0.0)
                     tk_q = float(getattr(ord_dto, "taker_qty", 0.0) or 0.0)
                     if mk_q <= 0.0 and tk_q <= 0.0:
@@ -673,6 +708,28 @@ class MultiAssetExecutionOrchestrator(IService):
                             mk_q = float(ord_dto.executed_qty)
                         else:
                             tk_q = float(ord_dto.executed_qty)
+                    tot_exec_q = max(mk_q + tk_q, float(ord_dto.executed_qty or 0.0))
+                    mk_ratio_ok = round(float(mk_q / tot_exec_q), 4) if tot_exec_q > 0 else 0.0
+                    raw_fee_u = float(getattr(ord_dto, "fee_usdt", 0.0) or 0.0)
+                    calc_fee_u, eff_fee_bps_ok, is_bps_ok = compute_effective_fee_and_is_bps(
+                        side=str(ord_dto.side),
+                        arrival_mid=arr_px,
+                        avg_fill_price=float(ord_dto.avg_price),
+                        maker_filled_qty=mk_q,
+                        taker_filled_qty=tk_q,
+                        explicit_fee_usdt=raw_fee_u,
+                        has_complete_explicit_fee=bool(raw_fee_u > 0.0),
+                    )
+                    eff_fee_bps_final = float(diag_ok.get("effective_fee_bps", eff_fee_bps_ok) or eff_fee_bps_ok)
+                    is_bps_final = (
+                        float(diag_ok["implementation_shortfall_bps"])
+                        if "implementation_shortfall_bps" in diag_ok
+                        else is_bps_ok
+                    )
+                    exec_mode_ok = str(
+                        diag_ok.get("exec_mode")
+                        or ("smart_maker" if (mk_q > 0 and tk_q <= 1e-12) else ("market_fallback" if getattr(ord_dto, "maker_fallback_used", False) else "market_direct"))
+                    )
                     sp_val = float(getattr(ord_dto, "spread_bps", 0.0) or diag_ok.get("spread_bps", 0.0) or 0.0)
                     self._db.record_v2_execution(
                         candle_ts=candle_ts,
@@ -687,7 +744,7 @@ class MultiAssetExecutionOrchestrator(IService):
                         spread_bps=sp_val,
                         maker_qty=mk_q,
                         taker_qty=tk_q,
-                        fee_usdt=float(getattr(ord_dto, "fee_usdt", 0.0) or 0.0),
+                        fee_usdt=raw_fee_u if raw_fee_u > 0.0 else calc_fee_u,
                         latency_ms=float(getattr(ord_dto, "latency_ms", 0.0) or 0.0),
                         order_status=str(getattr(ord_dto, "order_status", "FILLED") or "FILLED"),
                         bbo_spread_bps=float(diag_ok.get("bbo_spread_bps", sp_val) or sp_val),
@@ -700,15 +757,27 @@ class MultiAssetExecutionOrchestrator(IService):
                         symbol=sym,
                         side=str(ord_dto.side),
                         sleeve_book=sleeve_book_tag,
+                        exec_mode=exec_mode_ok,
                         signal_price=sig_px,
-                        arrival_bbo_bid=float(diag_ok.get("best_bid", 0.0) or 0.0),
-                        arrival_bbo_ask=float(diag_ok.get("best_ask", 0.0) or 0.0),
+                        arrival_bbo_bid=float(diag_ok.get("best_bid", diag_ok.get("arrival_bid", 0.0)) or 0.0),
+                        arrival_bbo_ask=float(diag_ok.get("best_ask", diag_ok.get("arrival_ask", 0.0)) or 0.0),
+                        arrival_mid=arr_px,
                         limit_placed_price=float(diag_ok.get("limit_placed_price", 0.0) or 0.0),
                         requotes_count=int(diag_ok.get("requotes_count", 0) or 0),
+                        chase_attempts=int(diag_ok.get("chase_attempts", 0) or 0),
+                        cancel_count=int(diag_ok.get("cancel_count", 0) or 0),
+                        post_only_rejects_5022=int(diag_ok.get("post_only_rejects_5022", 0) or 0),
+                        drift_abort=bool(diag_ok.get("drift_abort", False)),
                         fill_price=float(ord_dto.avg_price),
+                        avg_fill_price=float(ord_dto.avg_price),
                         maker_qty=mk_q,
                         taker_qty=tk_q,
-                        fee_usdt=float(getattr(ord_dto, "fee_usdt", 0.0) or 0.0),
+                        maker_filled_qty=mk_q,
+                        taker_filled_qty=tk_q,
+                        maker_fill_ratio=float(diag_ok.get("maker_fill_ratio", mk_ratio_ok)),
+                        fee_usdt=raw_fee_u if raw_fee_u > 0.0 else calc_fee_u,
+                        effective_fee_bps=eff_fee_bps_final,
+                        implementation_shortfall_bps=is_bps_final,
                         latency_ms=float(getattr(ord_dto, "latency_ms", 0.0) or 0.0),
                         order_status=str(getattr(ord_dto, "order_status", "FILLED") or "FILLED"),
                         fallback_reason=str(diag_ok.get("fallback_reason") or ""),
@@ -1004,6 +1073,7 @@ class MultiAssetExecutionOrchestrator(IService):
                     "tp_atr_mult": c_st.tp_atr_mult,
                     "maker_first": use_legacy_v2_maker,
                     "taker_fallback": True if is_v2_book else None,
+                    "allow_smart_maker": smart_maker_allowed_in_cycle,
                 })
             else:
                 target_usdt = total_equity * desired_w
@@ -1054,6 +1124,7 @@ class MultiAssetExecutionOrchestrator(IService):
                         "tp_atr_mult": c_st.tp_atr_mult,
                         "maker_first": is_v2_book,
                         "taker_fallback": True if is_v2_book else None,
+                        "allow_smart_maker": smart_maker_allowed_in_cycle,
                     })
                 else:
                     pnl_est = 0.0
@@ -1071,32 +1142,83 @@ class MultiAssetExecutionOrchestrator(IService):
                                 continue
                             if earns_heavy:
                                 urg_val = "high"
-                    phase_b_plans.append({
-                        "sym": sym,
-                        "delta_qty": delta_qty,
-                        "cur_p": cur_p,
-                        "cur_atr": cur_atr,
-                        "pnl_est": pnl_est,
-                        "note_str": note_str,
-                        "reduce_only": False,
-                        "desired_w": desired_w,
-                        "is_closing_to_cash": False,
-                        "is_opening_from_cash": is_opening_from_cash,
-                        "is_flip": is_flip,
-                        "dominant_book": c_st.dominant_book,
-                        "sleeve_book": s_book_lbl,
-                        "sl_atr_mult": c_st.sl_atr_mult,
-                        "tp_atr_mult": c_st.tp_atr_mult,
-                        "maker_first": (
-                            use_legacy_v2_maker
-                            or (
-                                c_st.dominant_book in ("B1_STATARB", "B2_CARRY_BASIS", "B5_KALMAN_PAIRS")
-                                and not is_flip
-                            )
-                        ),
-                        "taker_fallback": True if is_v2_book else None,
-                        "urgency": urg_val,
-                    })
+
+                    has_existing_opposite = bool(is_flip and abs(c_st.current_pos_qty) >= min_qty and (c_st.current_pos_qty * target_qty) < 0.0)
+                    if has_existing_opposite:
+                        # Двофазний переворот (Long <-> Short):
+                        # 1-ша нога у Фазі 1: закриття старої позиції в 0 (reduceOnly=True, вивільнення маржі)
+                        phase_a_plans.append({
+                            "sym": sym,
+                            "delta_qty": -c_st.current_pos_qty,
+                            "cur_p": cur_p,
+                            "cur_atr": cur_atr,
+                            "pnl_est": coin_upnl.get(sym, 0.0),
+                            "note_str": f"Flip Leg1 Close ({s_book_lbl})",
+                            "reduce_only": True,
+                            "desired_w": 0.0,
+                            "is_closing_to_cash": True,
+                            "is_opening_from_cash": False,
+                            "is_flip": False,
+                            "is_flip_leg1": True,
+                            "dominant_book": c_st.dominant_book,
+                            "sleeve_book": s_book_lbl,
+                            "sl_atr_mult": c_st.sl_atr_mult,
+                            "tp_atr_mult": c_st.tp_atr_mult,
+                            "maker_first": use_legacy_v2_maker,
+                            "taker_fallback": True if is_v2_book else None,
+                            "allow_smart_maker": smart_maker_allowed_in_cycle,
+                        })
+                        # 2-га нога у Фазі 2: відкриття нової сторони з 0 (reduceOnly=False)
+                        phase_b_plans.append({
+                            "sym": sym,
+                            "delta_qty": target_qty,
+                            "cur_p": cur_p,
+                            "cur_atr": cur_atr,
+                            "pnl_est": 0.0,
+                            "note_str": note_str,
+                            "reduce_only": False,
+                            "desired_w": desired_w,
+                            "is_closing_to_cash": False,
+                            "is_opening_from_cash": True,
+                            "is_flip": True,
+                            "is_flip_leg2": True,
+                            "dominant_book": c_st.dominant_book,
+                            "sleeve_book": s_book_lbl,
+                            "sl_atr_mult": c_st.sl_atr_mult,
+                            "tp_atr_mult": c_st.tp_atr_mult,
+                            "maker_first": use_legacy_v2_maker,
+                            "taker_fallback": True if is_v2_book else None,
+                            "urgency": urg_val,
+                            "allow_smart_maker": smart_maker_allowed_in_cycle,
+                        })
+                    else:
+                        phase_b_plans.append({
+                            "sym": sym,
+                            "delta_qty": delta_qty,
+                            "cur_p": cur_p,
+                            "cur_atr": cur_atr,
+                            "pnl_est": pnl_est,
+                            "note_str": note_str,
+                            "reduce_only": False,
+                            "desired_w": desired_w,
+                            "is_closing_to_cash": False,
+                            "is_opening_from_cash": is_opening_from_cash,
+                            "is_flip": is_flip,
+                            "dominant_book": c_st.dominant_book,
+                            "sleeve_book": s_book_lbl,
+                            "sl_atr_mult": c_st.sl_atr_mult,
+                            "tp_atr_mult": c_st.tp_atr_mult,
+                            "maker_first": (
+                                use_legacy_v2_maker
+                                or (
+                                    c_st.dominant_book in ("B1_STATARB", "B2_CARRY_BASIS", "B5_KALMAN_PAIRS")
+                                    and not is_flip
+                                )
+                            ),
+                            "taker_fallback": True if is_v2_book else None,
+                            "urgency": urg_val,
+                            "allow_smart_maker": smart_maker_allowed_in_cycle,
+                        })
 
         # 5a-pre. Pre-Dispatch Spread Filter + Симетричне масштабування нейтральності ДО відправки ордерів!
         fn_micro_pre = getattr(self._exchange, "fetch_market_microstructure", None)
@@ -1173,11 +1295,17 @@ class MultiAssetExecutionOrchestrator(IService):
             except Exception as sp_err:
                 self._logger.debug(f"[Pre-Spread Filter] Skipped: {sp_err}")
 
-        # --- ДВОФАЗНА ПАРАЛЕЛЬНА ДИСПЕТЧЕРИЗАЦІЯ ---
-        # Фаза А: Паралельне закриття / скорочення позицій (миттєве вивільнення USDT)
+        # --- ДВОФАЗНА ПАРАЛЕЛЬНА ДИСПЕТЧЕРИЗАЦІЯ (з обмеженням конкурентності SMART_MAKER_CONCURRENCY) ---
+        phase_sem = asyncio.Semaphore(max(1, int(getattr(settings, "SMART_MAKER_CONCURRENCY", 4))))
+
+        async def _execute_bounded_plan(p: Dict[str, Any]) -> Optional[str]:
+            async with phase_sem:
+                return await _execute_single_order_plan(p)
+
+        # Фаза 1 (А): Усі закриття в 0, скорочення (trim, reduceOnly=True) та 1-ша нога переворотів (вивільнення маржі)
         if phase_a_plans:
             results_a = await asyncio.gather(
-                *[_execute_single_order_plan(p) for p in phase_a_plans],
+                *[_execute_bounded_plan(p) for p in phase_a_plans],
                 return_exceptions=True,
             )
             for res in results_a:
@@ -1186,10 +1314,10 @@ class MultiAssetExecutionOrchestrator(IService):
                 elif isinstance(res, Exception):
                     self._logger.error(f"❌ Помилка ордера Фази А: {res}")
 
-        # Фаза Б: Паралельне відкриття нових або нарощування позицій на звільнену маржу
+        # Фаза 2 (Б): Усі нові входи, добори та 2-га нога переворотів (reduceOnly=False) — строго після завершення Фази 1!
         if phase_b_plans:
             results_b = await asyncio.gather(
-                *[_execute_single_order_plan(p) for p in phase_b_plans],
+                *[_execute_bounded_plan(p) for p in phase_b_plans],
                 return_exceptions=True,
             )
             for res in results_b:
@@ -1601,8 +1729,11 @@ class MultiAssetExecutionOrchestrator(IService):
             if isinstance(p, dict) and not bool(p.get("reduce_only", False))
         }
 
+        fn_chasing_wd = getattr(self._exchange, "is_symbol_chasing", None)
         alerts: List[str] = []
         for sym in syms_tuple:
+            if callable(fn_chasing_wd) and fn_chasing_wd(sym) is True:
+                continue
             p_dto = live_pos_map.get(sym)
             live_qty = float(getattr(p_dto, "contracts_qty", 0.0) or 0.0) if p_dto is not None else 0.0
             min_q, _, _, _, _ = settings.get_symbol_spec(sym)

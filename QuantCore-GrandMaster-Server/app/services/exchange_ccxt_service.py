@@ -15,6 +15,12 @@ from app.core.config import settings, symbol_to_ccxt, ccxt_to_symbol
 from app.domain.interfaces import IExchangeGateway
 from app.domain.schemas import ExchangePositionDTO, OrderExecutionDTO
 from app.services.database_service import DatabaseService
+from app.services.smart_maker_executor import (
+    CcxtSmartMakerAdapter,
+    SmartMakerConfig,
+    SmartMakerExecutor,
+    compute_effective_fee_and_is_bps,
+)
 
 
 class ExchangeCcxtService(IExchangeGateway):
@@ -27,6 +33,7 @@ class ExchangeCcxtService(IExchangeGateway):
     __slots__ = (
         "_logger", "_db", "_exchange", "_candles_cache",
         "_funding_hist_cache", "_oi_cache", "_depth_cache", "_last_order_diag",
+        "_active_chase_symbols", "_smart_maker",
     )
 
     def __init__(self, logger: logging.Logger, db_service: DatabaseService) -> None:
@@ -38,6 +45,19 @@ class ExchangeCcxtService(IExchangeGateway):
         self._oi_cache: Dict[str, Tuple[float, float]] = {}
         self._depth_cache: Dict[str, Tuple[float, float]] = {}
         self._last_order_diag: Dict[str, Dict[str, Any]] = {}
+        self._active_chase_symbols: set[str] = set()
+        self._smart_maker = SmartMakerExecutor(
+            adapter=CcxtSmartMakerAdapter(self),
+            logger=logger,
+            active_chase_symbols=self._active_chase_symbols,
+        )
+
+    @property
+    def active_chase_symbols(self) -> set[str]:
+        return self._active_chase_symbols
+
+    def is_symbol_chasing(self, symbol: str) -> bool:
+        return ccxt_to_symbol(symbol) in self._active_chase_symbols
 
     def get_last_order_diag(self, symbol: str) -> Dict[str, Any]:
         return dict(self._last_order_diag.get(ccxt_to_symbol(symbol), {}))
@@ -990,7 +1010,50 @@ class ExchangeCcxtService(IExchangeGateway):
         taker_fallback: Optional[bool] = None,
         urgency: str = "normal",
         active_sl_price: float = 0.0,
+        allow_smart_maker: bool = False,
     ) -> Optional[OrderExecutionDTO]:
+        sm_cfg = SmartMakerConfig.from_settings(settings)
+        if allow_smart_maker and sm_cfg.enabled:
+            clean_sym = ccxt_to_symbol(symbol)
+            ccxt_sym = symbol_to_ccxt(clean_sym)
+            if self._exchange is None:
+                return None
+            if not self._is_listed_market(ccxt_sym):
+                self._last_order_diag[clean_sym] = {
+                    "exec_mode": "smart_maker",
+                    "arrival_mid": float(mark_price),
+                    "arrival_mid_px": float(mark_price),
+                    "spread_bps": 0.0,
+                    "latency_ms": 0.0,
+                    "order_status": "UNLISTED_ON_DEMO",
+                }
+                return None
+            res = await self._smart_maker.execute_smart_maker_order(
+                symbol=clean_sym,
+                delta_qty=delta_qty,
+                mark_price=mark_price,
+                realized_pnl_est=realized_pnl_est,
+                note=note,
+                reduce_only=reduce_only,
+                active_sl_price=active_sl_price,
+                force_market=False,
+                cfg=sm_cfg,
+            )
+            self._last_order_diag[clean_sym] = res.telemetry.to_diag_dict()
+            if res.dto is not None and self._db is not None:
+                await asyncio.to_thread(
+                    self._db.record_trade,
+                    symbol=clean_sym,
+                    side=res.dto.side.lower(),
+                    amount=res.dto.executed_qty,
+                    price=res.dto.avg_price,
+                    order_id=str(res.dto.order_id or ""),
+                    pnl=realized_pnl_est,
+                    fee=res.dto.fee_usdt,
+                    note=note,
+                )
+            return res.dto
+
         return await asyncio.to_thread(
             self._execute_smart_order_sync,
             symbol,
@@ -1301,10 +1364,9 @@ class ExchangeCcxtService(IExchangeGateway):
                     time.sleep(2.0)  # TWAP-lite інтервал 2 с між траншами
 
                 t_rem = tranche_qty
-                # 3. Адаптивний BBO Chaser виконується якщо maker_first=True АБО увімкнено ENABLE_SMART_MAKER_CHASE (до 3 спроб по 2.5с)
-                smart_chase_on = bool(getattr(settings, "ENABLE_SMART_MAKER_CHASE", False)) and not reduce_only
-                eff_maker_mode = bool(maker_first or smart_chase_on)
-                n_max_chase = int(getattr(settings, "SMART_MAKER_MAX_RETRIES", 3)) if smart_chase_on else (2 if maker_first else 0)
+                # 3. Легасі maker_first (V2/V58); V6.2-B Smart Maker делегується окремо в SmartMakerExecutor
+                eff_maker_mode = bool(maker_first)
+                n_max_chase = 2 if maker_first else 0
                 chaser_iters = tuple(range(1, n_max_chase + 1))
                 requotes_done = 0
                 last_limit_placed = 0.0
@@ -1389,10 +1451,7 @@ class ExchangeCcxtService(IExchangeGateway):
                         t0 = time.time()
                         iter_filled = False
 
-                        if smart_chase_on:
-                            wait_lim = float(getattr(settings, "SMART_MAKER_REQUOTE_SEC", 2.5))
-                            poll_sec = 0.45
-                        elif eff_maker_mode and taker_fallback is True:
+                        if eff_maker_mode and taker_fallback is True:
                             wait_lim = float(settings.V3_URGENT_MAKER_WAIT_SEC if urgency == "high" else settings.V2_MAKER_WAIT_SEC)
                             poll_sec = 0.45
                         else:
@@ -1530,9 +1589,36 @@ class ExchangeCcxtService(IExchangeGateway):
             is_maker_flag = bool(total_maker_filled > 0.0 and total_market_filled <= 1e-12)
             fb_used_flag = bool(total_market_filled > 1e-12)
             status_str = "FILLED" if tot_qty >= (amount - min_qty * 0.5) else "PARTIAL"
+            mk_ratio_val = round(float(total_maker_filled / tot_qty), 4) if tot_qty > 0 else 0.0
+            exec_mode_val = (
+                "smart_maker"
+                if is_maker_flag
+                else ("market_fallback" if (eff_maker_mode and fb_used_flag) else "market_direct")
+            )
+            _, eff_fee_bps_val, is_bps_val = compute_effective_fee_and_is_bps(
+                side=side.upper(),
+                arrival_mid=float(arrival_mid),
+                avg_fill_price=float(avg_p),
+                maker_filled_qty=float(total_maker_filled),
+                taker_filled_qty=float(total_market_filled),
+                explicit_fee_usdt=float(total_fee),
+                has_complete_explicit_fee=bool(total_fee > 0.0),
+            )
 
             self._last_order_diag[clean_sym] = {
+                "exec_mode": exec_mode_val,
+                "arrival_mid": float(arrival_mid),
                 "arrival_mid_px": float(arrival_mid),
+                "avg_fill_price": float(avg_p),
+                "maker_filled_qty": round(float(total_maker_filled), 8),
+                "taker_filled_qty": round(float(total_market_filled), 8),
+                "maker_fill_ratio": mk_ratio_val,
+                "chase_attempts": int(requotes_done + (1 if last_limit_placed > 0 else 0)),
+                "cancel_count": int(requotes_done + (1 if (eff_maker_mode and fb_used_flag) else 0)),
+                "post_only_rejects_5022": 0,
+                "drift_abort": False,
+                "effective_fee_bps": eff_fee_bps_val,
+                "implementation_shortfall_bps": is_bps_val,
                 "spread_bps": spread_bps_val,
                 "bbo_spread_bps": spread_bps_val,
                 "best_bid": float(best_bid),
@@ -1809,6 +1895,8 @@ class ExchangeCcxtService(IExchangeGateway):
         canceled_cnt = 0
         for s in syms_to_check:
             clean = ccxt_to_symbol(s)
+            if self.is_symbol_chasing(clean):
+                continue
             ccxt_s = symbol_to_ccxt(clean)
             try:
                 open_ords = self._exchange.fetch_open_orders(ccxt_s)
@@ -1982,6 +2070,8 @@ class ExchangeCcxtService(IExchangeGateway):
         cleaned = 0
         for s in syms:
             clean = ccxt_to_symbol(s)
+            if self.is_symbol_chasing(clean):
+                continue
             min_q, _, _, _, _ = settings.get_symbol_spec(clean)
             if abs(float(active_positions.get(clean, 0.0) or 0.0)) >= min_q:
                 continue

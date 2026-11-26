@@ -831,6 +831,49 @@ class TestStep3Execution(unittest.TestCase):
         self.assertEqual(self.exchange_service._extract_order_type(bulk_map["XRPUSDT"][0]), "stop_market")
         self.assertEqual(len(bulk_map["SOLUSDT"]), 0)
 
+    def test_v62b_exchange_smart_maker_delegation_l1_ticker_and_min_notional_bypass(self):
+        """V6.2-B інтеграція: дефолт SMART_MAKER_CHASE_ENABLED=False; при увімкненні використовує L1 ticker (0 fetch_order_book), GTX postOnly та поріг $15."""
+        from app.core.config import settings
+        self.assertFalse(settings.SMART_MAKER_CHASE_ENABLED)
+
+        self.mock_ccxt.fetch_ticker = MagicMock(return_value={"bid": 99.95, "ask": 100.05})
+        self.mock_ccxt.fetch_order_book = MagicMock(side_effect=AssertionError("fetch_order_book must NOT be called by SmartMakerExecutor!"))
+        self.mock_ccxt.create_order = MagicMock(return_value={
+            "id": "gtx_sol_1", "status": "closed", "filled": 0.5, "average": 99.95,
+        })
+        self.mock_ccxt.create_market_order = MagicMock(return_value={
+            "id": "mkt_sol_small", "status": "closed", "filled": 0.1, "average": 100.05,
+        })
+
+        orig_sm = settings.SMART_MAKER_CHASE_ENABLED
+        object.__setattr__(settings, "SMART_MAKER_CHASE_ENABLED", True)
+        try:
+            # 1) Ордер $50 (>= $15) з allow_smart_maker=True -> GTX postOnly без fetch_order_book!
+            dto_big = asyncio.run(self.exchange_service.execute_smart_rebalance_order(
+                symbol="SOLUSDT", delta_qty=0.5, mark_price=100.0, note="SM entry", reduce_only=False, allow_smart_maker=True,
+            ))
+            self.assertIsNotNone(dto_big)
+            self.assertTrue(dto_big.is_maker)
+            _, c_kw = self.mock_ccxt.create_order.call_args
+            self.assertEqual(c_kw["params"]["timeInForce"], "GTX")
+            self.assertTrue(c_kw["params"]["postOnly"])
+            diag_big = self.exchange_service.get_last_order_diag("SOLUSDT")
+            self.assertEqual(diag_big["exec_mode"], "smart_maker")
+            self.assertAlmostEqual(diag_big["implementation_shortfall_bps"], -3.0, places=3)
+
+            # 2) Малий вхід $10 (< $15 SMART_MAKER_MIN_NOTIONAL_USD, але >= $5 minNotional) -> прямий MARKET без chase!
+            self.mock_ccxt.create_order.reset_mock()
+            dto_small = asyncio.run(self.exchange_service.execute_smart_rebalance_order(
+                symbol="SOLUSDT", delta_qty=0.1, mark_price=100.0, note="Small entry", reduce_only=False, allow_smart_maker=True,
+            ))
+            self.assertIsNotNone(dto_small)
+            self.mock_ccxt.create_order.assert_not_called()
+            self.mock_ccxt.create_market_order.assert_called_once()
+            diag_small = self.exchange_service.get_last_order_diag("SOLUSDT")
+            self.assertEqual(diag_small["exec_mode"], "market_direct")
+        finally:
+            object.__setattr__(settings, "SMART_MAKER_CHASE_ENABLED", orig_sm)
+
 
 if __name__ == "__main__":
     unittest.main()

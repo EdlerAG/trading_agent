@@ -34,7 +34,7 @@ quant_v3/
 archive/
 docs/
 AGENTS.md
-tests/
+/tests/
 QuantCore-GrandMaster-Server/app/cartridges/v2_multi_sleeve_cartridge.py
 QuantCore-GrandMaster-Server/app/cartridges/v58_grand_master_cartridge.py
 QuantCore-GrandMaster-Server/app/cartridges/qv3_convex_cartridge.py
@@ -44,6 +44,7 @@ QuantCore-GrandMaster-Server/tests/test_v2_cartridge.py
 QuantCore-GrandMaster-Server/tests/test_v58_pipeline.py
 QuantCore-GrandMaster-Server/tests/test_step4_data_channels.py
 QuantCore-GrandMaster-Server/tests/test_portal_and_qv3.py
+QuantCore-GrandMaster-Server/tests/test_v61_audit_and_infra.py
 QuantCore-GrandMaster-Server/storage/*.db*
 QuantCore-GrandMaster-Server/storage/*.json
 QuantCore-GrandMaster-Server/storage/*.log
