@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import AsyncMock, MagicMock, patch
+
+SERVER_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if SERVER_ROOT not in sys.path:
+    sys.path.insert(0, SERVER_ROOT)
 
 from app.core.config import settings
 from app.domain.schemas import CoinStateDTO, CoinTargetDTO, ExchangePositionDTO, OrderExecutionDTO, PortfolioTargetDTO
