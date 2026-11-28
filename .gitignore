@@ -57,3 +57,4 @@ QuantCore-GrandMaster-Server/storage/cartridges/*.joblib
 .vscode/
 server_analytics/
 QuantCore-GrandMaster-Server/data/
+quant_v4_collector/
