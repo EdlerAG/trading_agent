@@ -833,8 +833,10 @@ class TestStep3Execution(unittest.TestCase):
 
     def test_v62b_exchange_smart_maker_delegation_l1_ticker_and_min_notional_bypass(self):
         """V6.2-B інтеграція: дефолт SMART_MAKER_CHASE_ENABLED=False; при увімкненні використовує L1 ticker (0 fetch_order_book), GTX postOnly та поріг $15."""
+        import os
         from app.core.config import settings
-        self.assertFalse(settings.SMART_MAKER_CHASE_ENABLED)
+        if os.getenv("SMART_MAKER_CHASE_ENABLED", "false").lower() not in ("1", "true", "yes"):
+            self.assertFalse(settings.SMART_MAKER_CHASE_ENABLED)
 
         self.mock_ccxt.fetch_ticker = MagicMock(return_value={"bid": 99.95, "ask": 100.05})
         self.mock_ccxt.fetch_order_book = MagicMock(side_effect=AssertionError("fetch_order_book must NOT be called by SmartMakerExecutor!"))
@@ -846,7 +848,9 @@ class TestStep3Execution(unittest.TestCase):
         })
 
         orig_sm = settings.SMART_MAKER_CHASE_ENABLED
+        orig_min_not = settings.SMART_MAKER_MIN_NOTIONAL_USD
         object.__setattr__(settings, "SMART_MAKER_CHASE_ENABLED", True)
+        object.__setattr__(settings, "SMART_MAKER_MIN_NOTIONAL_USD", 15.0)
         try:
             # 1) Ордер $50 (>= $15) з allow_smart_maker=True -> GTX postOnly без fetch_order_book!
             dto_big = asyncio.run(self.exchange_service.execute_smart_rebalance_order(
@@ -863,7 +867,9 @@ class TestStep3Execution(unittest.TestCase):
 
             # 2) Малий вхід $10 (< $15 SMART_MAKER_MIN_NOTIONAL_USD, але >= $5 minNotional) -> прямий MARKET без chase!
             self.mock_ccxt.create_order.reset_mock()
-            dto_small = asyncio.run(self.exchange_service.execute_smart_rebalance_order(
+            dto_small = asyncio.run(self.exchange_service.execute_smart_maker_rebalance_order(
+                symbol="SOLUSDT", delta_qty=0.1, mark_price=100.0, note="Small entry", reduce_only=False, allow_smart_maker=True,
+            ) if hasattr(self.exchange_service, "execute_smart_maker_rebalance_order") else self.exchange_service.execute_smart_rebalance_order(
                 symbol="SOLUSDT", delta_qty=0.1, mark_price=100.0, note="Small entry", reduce_only=False, allow_smart_maker=True,
             ))
             self.assertIsNotNone(dto_small)
@@ -873,6 +879,7 @@ class TestStep3Execution(unittest.TestCase):
             self.assertEqual(diag_small["exec_mode"], "market_direct")
         finally:
             object.__setattr__(settings, "SMART_MAKER_CHASE_ENABLED", orig_sm)
+            object.__setattr__(settings, "SMART_MAKER_MIN_NOTIONAL_USD", orig_min_not)
 
 
 if __name__ == "__main__":
